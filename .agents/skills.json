@@ -1,0 +1,19 @@
+{
+  "entries": [
+    {
+      "path": ".agents/skills"
+    },
+    {
+      "path": ".agents/common/skills"
+    },
+    {
+      "path": ".agents/agents/developer-agent/skills"
+    },
+    {
+      "path": ".agents/agents/reviewer-agent/skills"
+    },
+    {
+      "path": ".agents/agents/system-architect-agent/skills"
+    }
+  ]
+}

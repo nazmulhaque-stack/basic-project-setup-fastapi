@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "workflow_name": "SeniorBackendDevelopmentPipeline",
+  "version": "1.0.0",
+  "description": "Multi-agent orchestration state machine for FastAPI, SQLAlchemy Async, Redis Cluster, and K8s deployment",
+  "agents": [
+    {
+      "id": "system-architect-agent",
+      "role": "System Architect & DevOps Lead",
+      "responsibilities": [
+        "Infrastructure and Kubernetes manifests",
+        "High-performance caching strategy (Redis Cluster)",
+        "Database schema review and migration planning",
+        "Nginx reverse proxy and kernel sysctl tuning"
+      ]
+    },
+    {
+      "id": "developer-agent",
+      "role": "Senior Backend Developer",
+      "responsibilities": [
+        "Feature implementation adhering to Repository Pattern",
+        "Service layer business logic and domain lifecycle hooks",
+        "FastAPI endpoint handlers and Pydantic schemas",
+        "Unit and integration test authoring (pytest-asyncio)"
+      ]
+    },
+    {
+      "id": "reviewer-agent",
+      "role": "Senior Code Reviewer & Security Auditor",
+      "responsibilities": [
+        "Clean architecture and SOLID compliance audit",
+        "Cryptographic PII verification (AES-256-GCM + blind index)",
+        "Zero N+1 query and cache invalidation race checks",
+        "Linting, test execution, and merge approval"
+      ]
+    }
+  ],
+  "states": {
+    "TASK_SPECIFICATION": {
+      "initial": true,
+      "actor": "system-architect-agent",
+      "action": "Analyze requirement, draft Architectural Decision Record (ADR), specify schemas and database boundaries.",
+      "on_success": "IMPLEMENTATION"
+    },
+    "IMPLEMENTATION": {
+      "actor": "developer-agent",
+      "action": "Write domain code, implement repository methods, pluggable hooks, schemas, and unit tests.",
+      "on_success": "STATIC_VERIFICATION"
+    },
+    "STATIC_VERIFICATION": {
+      "actor": "developer-agent",
+      "action": "Run run_linter.sh, compile bytecode, and execute local pytest suite.",
+      "transitions": {
+        "passed": "CODE_REVIEW",
+        "failed": "IMPLEMENTATION"
+      }
+    },
+    "CODE_REVIEW": {
+      "actor": "reviewer-agent",
+      "action": "Perform architectural audit, security inspection, and output CodeReviewReport.",
+      "transitions": {
+        "APPROVED": "GIT_COMMIT_PREPARATION",
+        "CHANGES_REQUESTED": "IMPLEMENTATION",
+        "BLOCKED": "TASK_SPECIFICATION"
+      }
+    },
+    "GIT_COMMIT_PREPARATION": {
+      "actor": "developer-agent",
+      "action": "Invoke git_helper.py to check for secret leaks, verify clean staging, and execute conventional commit.",
+      "on_success": "DEPLOYMENT_READINESS"
+    },
+    "DEPLOYMENT_READINESS": {
+      "actor": "system-architect-agent",
+      "action": "Verify Docker multi-stage build, K8s liveness/readiness probes, and Nginx reverse proxy configuration.",
+      "terminal": true
+    }
+  }
+}

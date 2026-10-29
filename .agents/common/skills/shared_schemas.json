@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentSharedSchemas",
+  "description": "Central schema definitions for inter-agent communication, code review reporting, and task payloads",
+  "definitions": {
+    "TaskExecutionPayload": {
+      "type": "object",
+      "required": ["task_id", "title", "assigned_to", "priority", "description"],
+      "properties": {
+        "task_id": { "type": "string" },
+        "title": { "type": "string" },
+        "assigned_to": {
+          "type": "string",
+          "enum": ["developer-agent", "reviewer-agent", "system-architect-agent"]
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+        },
+        "description": { "type": "string" },
+        "affected_components": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "CodeReviewReport": {
+      "type": "object",
+      "required": ["review_id", "status", "score", "summary", "checklist", "findings"],
+      "properties": {
+        "review_id": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["APPROVED", "CHANGES_REQUESTED", "BLOCKED"]
+        },
+        "score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "summary": { "type": "string" },
+        "checklist": {
+          "type": "object",
+          "required": [
+            "clean_architecture_compliance",
+            "security_and_pii_handling",
+            "redis_cache_efficiency",
+            "test_coverage_passed",
+            "no_secret_leaks"
+          ],
+          "properties": {
+            "clean_architecture_compliance": { "type": "boolean" },
+            "security_and_pii_handling": { "type": "boolean" },
+            "redis_cache_efficiency": { "type": "boolean" },
+            "test_coverage_passed": { "type": "boolean" },
+            "no_secret_leaks": { "type": "boolean" }
+          }
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["severity", "file_path", "line_number", "rule_violation", "suggestion"],
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+              },
+              "file_path": { "type": "string" },
+              "line_number": { "type": "integer" },
+              "rule_violation": { "type": "string" },
+              "suggestion": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "ArchitecturalDecisionRecord": {
+      "type": "object",
+      "required": ["adr_id", "title", "status", "context", "decision", "consequences"],
+      "properties": {
+        "adr_id": { "type": "string" },
+        "title": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["PROPOSED", "ACCEPTED", "SUPERSEDED", "REJECTED"]
+        },
+        "context": { "type": "string" },
+        "decision": { "type": "string" },
+        "consequences": {
+          "type": "object",
+          "properties": {
+            "positive": { "type": "array", "items": { "type": "string" } },
+            "negative": { "type": "array", "items": { "type": "string" } },
+            "risks": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

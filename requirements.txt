@@ -1,0 +1,12 @@
+# Versions this project was built and tested with (Oct 2026)
+fastapi[standard]==0.162.0
+sqlalchemy[asyncio]==2.1.6
+pydantic==2.14.1
+pydantic-settings==2.16.2
+aiomysql==0.3.2
+
+# tests
+pytest>=8
+pytest-asyncio==1.4.1
+httpx>=0.28
+aiosqlite>=0.21
