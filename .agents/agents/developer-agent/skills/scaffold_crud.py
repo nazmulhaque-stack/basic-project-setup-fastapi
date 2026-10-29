@@ -201,75 +201,34 @@ class {class_name}Service(BaseService[{class_name}, {class_name}Create, {class_n
     delete_{lower_name} = BaseService.delete_by_id
 '''
 
-    # 5. Endpoint Template
-    endpoint_code = f'''"""FastAPI endpoints for {class_name}."""
+    # 5. Dynamic CRUDRouter Template (Zero explicit boilerplate)
+    endpoint_code = f'''"""FastAPI dynamic CRUD router for {class_name}."""
 
-from typing import Annotated, Union
-import uuid
-
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.exceptions import ConflictError
-from app.db.session import get_db
-from app.schemas.{lower_name} import {class_name}Create, {class_name}Read, {class_name}Update
+from app.api.crud_router import CRUDRouter
+from app.api.deps import provide
+from app.models.{lower_name} import {class_name}
+from app.schemas.{lower_name} import (
+    {class_name}Create,
+    {class_name}Read,
+    {class_name}Update,
+)
 from app.services.{lower_name} import {class_name}Service
 
-router = APIRouter(prefix="/{plural_name}", tags=["{class_name}s"])
+get_{lower_name}_service = provide({class_name}Service, cache_prefix="{plural_name}")
 
+router = CRUDRouter(
+    model={class_name},
+    service=get_{lower_name}_service,
+    create_schema={class_name}Create,
+    update_schema={class_name}Update,
+    read_schema={class_name}Read,
+    prefix="/{plural_name}",
+    tags=["{class_name}s"],
+    filter_fields={{"name": ["eq", "icontains"]}},
+    sort_fields=["id", "created_at"],
+)
 
-def get_{lower_name}_service(db: Annotated[AsyncSession, Depends(get_db)]) -> {class_name}Service:
-    return {class_name}Service(db)
-
-
-ServiceDep = Annotated[{class_name}Service, Depends(get_{lower_name}_service)]
-
-
-@router.post("/", response_model={class_name}Read, status_code=status.HTTP_201_CREATED)
-async def create_{lower_name}(data: {class_name}Create, service: ServiceDep):
-    try:
-        return await service.create(data)
-    except (ValueError, ConflictError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@router.get("/", response_model=list[{class_name}Read])
-async def get_{plural_name}(
-    service: ServiceDep,
-    limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    offset: Annotated[int, Query(ge=0)] = 0,
-):
-    return await service.get_all(limit, offset)
-
-
-@router.get("/{{{lower_name}_id}}", response_model={class_name}Read)
-async def get_{lower_name}({lower_name}_id: Union[uuid.UUID, int], service: ServiceDep):
-    entity = await service.get({lower_name}_id)
-    if entity is None:
-        raise HTTPException(status_code=404, detail="{class_name} not found")
-    return entity
-
-
-@router.patch("/{{{lower_name}_id}}", response_model={class_name}Read)
-async def update_{lower_name}(
-    {lower_name}_id: Union[uuid.UUID, int],
-    data: {class_name}Update,
-    service: ServiceDep,
-):
-    try:
-        updated = await service.update({lower_name}_id, data)
-    except (ValueError, ConflictError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if updated is None:
-        raise HTTPException(status_code=404, detail="{class_name} not found")
-    return updated
-
-
-@router.delete("/{{{lower_name}_id}}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_{lower_name}({lower_name}_id: Union[uuid.UUID, int], service: ServiceDep):
-    deleted = await service.delete({lower_name}_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="{class_name} not found")
+__all__ = ["router", "get_{lower_name}_service"]
 '''
 
     targets = [
@@ -277,7 +236,7 @@ async def delete_{lower_name}({lower_name}_id: Union[uuid.UUID, int], service: S
         (PROJECT_ROOT / f"app/schemas/{lower_name}.py", schema_code),
         (PROJECT_ROOT / f"app/repositories/{lower_name}.py", repo_code),
         (PROJECT_ROOT / f"app/services/{lower_name}.py", service_code),
-        (PROJECT_ROOT / f"app/api/v1/endpoints/{lower_name}.py", endpoint_code),
+        (PROJECT_ROOT / f"app/api/v1/{plural_name}.py", endpoint_code),
     ]
 
     for path, content in targets:

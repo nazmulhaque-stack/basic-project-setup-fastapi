@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fastapi-backend-config
+  labels:
+    app: fastapi-backend
+    tier: api
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  WORKERS: "4"
+  # Redis Cluster & Cache Configuration
+  REDIS_PREFIX: "office_demo"
+  CACHE_ITEM_TTL: "300"
+  CACHE_LIST_TTL: "120"
+  CACHE_NEGATIVE_TTL: "30"
+  CACHE_LOCK_TTL_MS: "5000"
+  # Rate Limiter
+  RATE_LIMIT_GLOBAL_ENABLED: "true"
+  RATE_LIMIT_DEFAULT_REQUESTS: "100"
+  RATE_LIMIT_DEFAULT_WINDOW: "60"
+  RATE_LIMIT_FAIL_OPEN: "true"

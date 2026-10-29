@@ -19,4 +19,6 @@ python3 .agents/agents/system-architect-agent/skills/verify_infrastructure.py
 2. **Nginx**: Rate limiting zones, reverse proxy buffering, client body size.
 3. **Gunicorn**: Uvicorn worker class selection, dynamic concurrency calculation ($2 \times \text{vCPU} + 1$).
 4. **Linux Sysctl**: High-concurrency socket queues (`somaxconn = 65535`), `tcp_tw_reuse`.
-5. **Kubernetes (deploy/k8s/)**: Deployment, Service, Ingress, HPA, and ConfigMap verification.
+5. **PgBouncer**: Transaction pooling mode (`pool_mode = transaction`) and statement cache compatibility.
+6. **Docker Compose**: Full local cluster verification (PostgreSQL, PgBouncer, Redis 7 Cluster, Elasticsearch 8, FastAPI, Nginx).
+7. **Kubernetes (deploy/k8s/)**: Deployment, Service, Ingress, HPA, and ConfigMap verification.

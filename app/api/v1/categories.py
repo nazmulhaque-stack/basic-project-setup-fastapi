@@ -1,9 +1,9 @@
-"""Categories: 100% generated CRUD. No endpoint code written by hand."""
+"""Categories: 100% generated CRUD using CRUDRouter."""
 
 from app.api.crud_router import CRUDRouter
 from app.api.deps import get_category_service
-from app.models import Category
-from app.schemas import CategoryCreate, CategoryRead, CategoryUpdate
+from app.models.category import Category
+from app.schemas.category import CategoryCreate, CategoryRead, CategoryUpdate
 
 router = CRUDRouter(
     model=Category,
@@ -19,3 +19,5 @@ router = CRUDRouter(
     },
     sort_fields=["id", "name", "created_at"],
 )
+
+__all__ = ["router", "get_category_service"]

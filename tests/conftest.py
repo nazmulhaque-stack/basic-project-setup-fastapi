@@ -1,93 +1,97 @@
-"""Test setup: a fresh database per test, wired in by overriding get_session.
+"""Pytest configuration and shared test fixtures."""
 
-Default: SQLite file per test (fast, nothing to install). Foreign keys are switched on
-so constraint behaviour matches MySQL/InnoDB.
-
-Against real MySQL/MariaDB (use an EMPTY, throwaway database - tables are dropped):
-    TEST_DATABASE_URL="mysql+aiomysql://user:pass@localhost:3306/app_test" pytest
-"""
-
-import os
-from collections.abc import AsyncIterator
-
+from typing import Any, Dict, List, Optional
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
-from app.core.database import get_session
-from app.main import create_app
-from app.models import Base
+from app.core.security import CryptoService
 
-TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+# Stable 32-byte test keys (64 hex characters)
+TEST_KEY_V1: bytes = bytes.fromhex("1111111111111111111111111111111111111111111111111111111111111111")
+TEST_KEY_V2: bytes = bytes.fromhex("2222222222222222222222222222222222222222222222222222222222222222")
+TEST_BLIND_KEY: bytes = bytes.fromhex("9999999999999999999999999999999999999999999999999999999999999999")
 
 
 @pytest.fixture
-async def session_factory(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    if TEST_DATABASE_URL:
-        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
-    else:
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+def test_crypto_service() -> CryptoService:
+    """Fixture providing CryptoService configured with multiple versions for key rotation tests."""
+    keys: Dict[int, bytes] = {
+        1: TEST_KEY_V1,
+        2: TEST_KEY_V2,
+    }
+    return CryptoService(keys=keys, active_version=2, blind_index_key=TEST_BLIND_KEY)
 
-        @event.listens_for(engine.sync_engine, "connect")
-        def _enable_sqlite_fks(dbapi_conn, _):  # noqa: ANN001
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
+class MockRedisAsync:
+    """In-memory async mock simulating Redis Cluster operations for tests."""
+
+    def __init__(self) -> None:
+        self.store: Dict[str, bytes | str] = {}
+        self.ttls: Dict[str, int] = {}
+        self.scripts: Dict[str, str] = {}
+        self.rate_counters: Dict[str, int] = {}
+
+    async def get(self, key: str) -> Optional[bytes]:
+        val: Optional[bytes | str] = self.store.get(key)
+        if isinstance(val, str):
+            return val.encode("utf-8")
+        return val
+
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        ex: Optional[int] = None,
+        px: Optional[int] = None,
+        nx: bool = False,
+    ) -> bool:
+        if nx and key in self.store:
+            return False
+        self.store[key] = value if isinstance(value, (bytes, bytearray)) else str(value).encode("utf-8")
+        if ex:
+            self.ttls[key] = ex
+        return True
+
+    async def delete(self, *keys: str) -> int:
+        count: int = 0
+        for k in keys:
+            if k in self.store:
+                del self.store[k]
+                self.ttls.pop(k, None)
+                count += 1
+        return count
+
+    async def incr(self, key: str) -> int:
+        cur: int = int(self.store.get(key, b"1"))
+        cur += 1
+        self.store[key] = str(cur).encode("utf-8")
+        return cur
+
+    async def script_load(self, script: str) -> str:
+        sha: str = f"sha_{len(self.scripts) + 1}"
+        self.scripts[sha] = script
+        return sha
+
+    async def evalsha(self, sha: str, numkeys: int, *args: Any) -> List[int]:
+        # Simulates rate limiter Lua script execution
+        key: str = str(args[0])
+        _limit: int = int(args[1])
+        window: int = int(args[2])
+        cur: int = self.rate_counters.get(key, 0) + 1
+        self.rate_counters[key] = cur
+        ttl: int = window
+        return [cur, ttl]
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> List[int]:
+        return await self.evalsha("mock", numkeys, *args)
+
+    async def ping(self) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        self.store.clear()
 
 
 @pytest.fixture
-async def session(session_factory) -> AsyncIterator[AsyncSession]:
-    async with session_factory() as s:
-        yield s
-
-
-@pytest.fixture
-async def client(session_factory) -> AsyncIterator[AsyncClient]:
-    app = create_app()
-
-    async def _test_session() -> AsyncIterator[AsyncSession]:
-        async with session_factory() as s:
-            try:
-                yield s
-            except Exception:
-                await s.rollback()
-                raise
-
-    app.dependency_overrides[get_session] = _test_session
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test/api/v1") as c:
-        yield c
-
-
-@pytest.fixture
-async def category(client) -> dict:
-    r = await client.post("/categories", json={"name": "Smartphones"})
-    assert r.status_code == 201, r.text
-    return r.json()
-
-
-@pytest.fixture
-async def products(client, category) -> list[dict]:
-    rows = [
-        {"name": "Galaxy A55", "sku": "sam-a55", "price": "38999.00", "stock": 12},
-        {"name": "Galaxy S24", "sku": "sam-s24", "price": "99999.00", "stock": 3},
-        {"name": "Redmi Note 13", "sku": "xia-rn13", "price": "24999.50", "stock": 0},
-        {"name": "iPhone 15", "sku": "app-ip15", "price": "129999.00", "stock": 7},
-        {"name": "Pixel 8a", "sku": "goo-p8a", "price": "54999.00", "stock": 2},
-    ]
-    out = []
-    for row in rows:
-        r = await client.post("/products", json={**row, "category_id": category["id"]})
-        assert r.status_code == 201, r.text
-        out.append(r.json())
-    return out
+def mock_redis() -> MockRedisAsync:
+    """Fixture providing isolated MockRedisAsync instance."""
+    return MockRedisAsync()

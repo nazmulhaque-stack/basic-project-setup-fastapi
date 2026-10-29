@@ -82,7 +82,30 @@ def verify_infrastructure() -> int:
     else:
         warnings.append("deploy/sysctl.conf not found!")
 
-    # 5. Check Kubernetes manifests
+    # 5. Check PgBouncer Config
+    pgbouncer_ini = PROJECT_ROOT / "deploy/pgbouncer.ini"
+    if pgbouncer_ini.exists():
+        content = pgbouncer_ini.read_text(encoding="utf-8")
+        if "pool_mode = transaction" in content:
+            print("✓ PgBouncer: Transaction pooling mode configured.")
+            checks_passed += 1
+        if "statement_cache_size" in content:
+            print("✓ PgBouncer: Statement cache parameters handled.")
+            checks_passed += 1
+    else:
+        warnings.append("deploy/pgbouncer.ini not found!")
+
+    # 6. Check Docker Compose Stack
+    docker_compose = PROJECT_ROOT / "deploy/docker-compose.yml"
+    if docker_compose.exists():
+        content = docker_compose.read_text(encoding="utf-8")
+        if "pgbouncer" in content and "redis" in content and "elasticsearch" in content:
+            print("✓ Docker Compose: PgBouncer, Redis Cluster & Elasticsearch services declared.")
+            checks_passed += 1
+    else:
+        warnings.append("deploy/docker-compose.yml not found!")
+
+    # 7. Check Kubernetes manifests
     k8s_dir = PROJECT_ROOT / "deploy/k8s"
     if k8s_dir.exists():
         k8s_files = list(k8s_dir.glob("*.yaml"))

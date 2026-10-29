@@ -1,12 +1,19 @@
-# Versions this project was built and tested with (Oct 2026)
-fastapi[standard]==0.162.0
-sqlalchemy[asyncio]==2.1.6
-pydantic==2.14.1
-pydantic-settings==2.16.2
-aiomysql==0.3.2
-
-# tests
-pytest>=8
-pytest-asyncio==1.4.1
-httpx>=0.28
-aiosqlite>=0.21
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+gunicorn==23.0.0
+uvloop==0.21.0
+httptools==0.6.4
+sqlalchemy[asyncio]==2.0.38
+asyncpg==0.30.0
+asyncmy==0.2.9
+redis==5.2.1
+pydantic==2.10.6
+pydantic-settings==2.7.1
+orjson==3.10.15
+cryptography==44.0.1
+email-validator==2.2.0
+httpx==0.28.1
+pytest==8.3.4
+pytest-asyncio==0.25.3
+elasticsearch>=8.12.0
+aiosqlite>=0.20.0

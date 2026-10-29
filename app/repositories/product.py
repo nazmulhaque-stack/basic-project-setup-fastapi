@@ -1,24 +1,27 @@
 from collections.abc import Sequence
-
+from typing import Optional, Union
+import uuid
 from sqlalchemy import select, update
-from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Product
-from app.repositories.base import SQLAlchemyRepository
+from app.models.product import Product
+from app.repositories.base import BaseRepository
 
 
-class ProductRepository(SQLAlchemyRepository[Product]):
-    """Generic CRUD inherited + model-specific queries added below."""
+class ProductRepository(BaseRepository[Product, uuid.UUID]):
+    """Concrete repository for Product domain entity extending BaseRepository."""
 
-    async def get_with_category(self, product_id: int) -> Product | None:
-        # Explicit eager load: relationships are lazy="raise", so this is the only way in.
-        return await self.get(product_id, options=[selectinload(Product.category)])
+    def __init__(self, db: AsyncSession) -> None:
+        super().__init__(model=Product, db=db)
 
-    async def change_stock_atomic(self, product_id: int, delta: int) -> bool:
-        """UPDATE ... SET stock = stock + :delta WHERE stock + :delta >= 0.
+    async def get_by_sku(self, sku: str) -> Optional[Product]:
+        """Finds product by unique SKU."""
+        stmt = select(Product).where(Product.sku == sku)
+        return await self.db.scalar(stmt)
 
-        One atomic statement: two concurrent requests can never oversell, unlike
-        read -> modify in Python -> write. Returns False if the guard blocked it.
+    async def change_stock_atomic(self, product_id: Union[uuid.UUID, int, str], delta: int) -> bool:
+        """Atomically updates inventory stock without race conditions:
+        UPDATE products SET stock = stock + delta WHERE id = :id AND stock + delta >= 0.
         """
         stmt = (
             update(Product)
@@ -26,14 +29,24 @@ class ProductRepository(SQLAlchemyRepository[Product]):
             .values(stock=Product.stock + delta)
             .execution_options(synchronize_session=False)
         )
-        result = await self.session.execute(stmt)
-        return bool(result.rowcount == 1)  # type: ignore[attr-defined]
+        result = await self.db.execute(stmt)
+        return bool(getattr(result, "rowcount", 0) == 1)
 
-    async def low_stock(self, threshold: int, limit: int = 50) -> Sequence[Product]:
+    async def low_stock(self, threshold: int = 5, limit: int = 50) -> Sequence[Product]:
+        """Fetches active products with inventory stock under or equal to threshold."""
         stmt = (
             select(Product)
             .where(Product.is_active.is_(True), Product.stock <= threshold)
             .order_by(Product.stock.asc(), Product.id.asc())
             .limit(limit)
         )
-        return (await self.session.scalars(stmt)).all()
+        return (await self.db.scalars(stmt)).all()
+
+    async def get_with_category(self, product_id: Union[uuid.UUID, int, str]) -> Optional[Product]:
+        """Eagerly loads product with its associated category using selectinload (since relations are lazy='raise')."""
+        from sqlalchemy.orm import selectinload
+        return await self.get(product_id, options=[selectinload(Product.category_rel)])
+
+
+__all__ = ["ProductRepository"]
+

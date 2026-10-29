@@ -1,15 +1,23 @@
-"""Shared Pydantic v2 building blocks: base schemas, generic Page[T], partial-model factory."""
+"""Shared Pydantic v2 building blocks: base schemas, generic Page[T], partial-model factory, and cursor tokens."""
 
-import copy
-import math
+import base64
 from collections.abc import Sequence
+import copy
 from datetime import UTC, datetime
-from typing import Any, Generic, TypeVar
+import math
+from typing import Any, Generic, List, Optional, Tuple, TypeVar
+import uuid
 
+from fastapi import HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 T = TypeVar("T")
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+# ------------------------------------------------------------------------------
+# Core Pydantic v2 Base Schemas
+# ------------------------------------------------------------------------------
 
 
 class BaseSchema(BaseModel):
@@ -27,21 +35,28 @@ class InputSchema(BaseSchema):
 class ReadSchema(BaseSchema):
     """Base for responses of models that use IdMixin + TimestampMixin."""
 
-    id: int
+    id: Any
     created_at: datetime
-    updated_at: datetime
+    updated_at: Optional[datetime] = None
 
-    @field_validator("created_at", "updated_at")
+    @field_validator("created_at", "updated_at", mode="before")
     @classmethod
-    def _assume_utc(cls, value: datetime) -> datetime:
+    def _assume_utc(cls, value: Any) -> Any:
         """DB stores UTC without tz info; label it so JSON says ...Z, not local time."""
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+        return value
+
+
+# ------------------------------------------------------------------------------
+# Pagination Models: Offset Page[T] + Keyset PageResponse[T]
+# ------------------------------------------------------------------------------
 
 
 class Page(BaseModel, Generic[T]):
-    """Generic paginated response: Page[ProductRead], Page[CategoryRead], ..."""
+    """Generic offset-paginated response: Page[ProductRead], Page[UserRead], ..."""
 
-    items: list[T]
+    items: List[T]
     total: int = Field(ge=0)
     page: int = Field(ge=1)
     size: int = Field(ge=1)
@@ -61,15 +76,29 @@ class Page(BaseModel, Generic[T]):
         )
 
 
+class PageResponse(BaseModel, Generic[T]):
+    """Generic cursor-paginated container for ultra-high-throughput keyset seeks."""
+
+    items: List[T]
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Opaque base64 cursor token to retrieve the next contiguous page",
+    )
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+# ------------------------------------------------------------------------------
+# Dynamic Partial Schema Factory (for PATCH endpoints)
+# ------------------------------------------------------------------------------
+
+
 def make_partial(schema: type[SchemaT], *, name: str | None = None) -> type[SchemaT]:
-    """Build a PATCH schema from a create schema, dynamically.
+    """Build a PATCH schema from a create schema dynamically.
 
     Every field becomes optional (default None) but KEEPS its type and constraints:
       * omitted field         -> not in model_dump(exclude_unset=True) -> untouched
       * {"name": "x"}         -> validated with the original rules (min_length, gt, ...)
       * {"name": null}        -> 422 if the original field was not nullable
-    Pydantic does not validate defaults, so `default=None` is safe for non-nullable types.
-    Subclassing `schema` keeps its config (extra="forbid") and its field validators.
     """
     fields: dict[str, Any] = {}
     for field_name, field_info in schema.model_fields.items():
@@ -84,3 +113,66 @@ def make_partial(schema: type[SchemaT], *, name: str | None = None) -> type[Sche
         __module__=schema.__module__,
         **fields,
     )
+
+
+# ------------------------------------------------------------------------------
+# Keyset Cursor Utilities
+# ------------------------------------------------------------------------------
+
+
+def encode_cursor(created_at: datetime, item_id: Any) -> str:
+    """Encodes order timestamp/value and item ID into an opaque, URL-safe Base64 token."""
+    raw: str = f"{created_at.isoformat()}|{item_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor_str: str) -> Tuple[datetime, uuid.UUID]:
+    """Decodes opaque Base64 token back to (datetime, uuid)."""
+    clean: str = cursor_str.strip()
+    missing_padding: int = len(clean) % 4
+    if missing_padding:
+        clean += "=" * (4 - missing_padding)
+    try:
+        raw: str = base64.urlsafe_b64decode(clean.encode("ascii")).decode("utf-8")
+        iso_ts: str
+        uid_str: str
+        iso_ts, uid_str = raw.split("|", 1)
+        return datetime.fromisoformat(iso_ts), uuid.UUID(uid_str)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid pagination cursor token: {exc}",
+        ) from exc
+
+
+# ------------------------------------------------------------------------------
+# Error Envelopes
+# ------------------------------------------------------------------------------
+
+
+class ErrorDetail(BaseModel):
+    """Uniform error detail structure."""
+
+    code: str = Field(..., description="Machine-readable error classification code")
+    message: str = Field(..., description="Human-readable explanation of the error")
+    request_id: Optional[str] = Field(default=None, description="Unique correlation ID for tracing")
+
+
+class ErrorResponse(BaseModel):
+    """Standardized root error envelope."""
+
+    error: ErrorDetail
+
+
+__all__ = [
+    "BaseSchema",
+    "InputSchema",
+    "ReadSchema",
+    "Page",
+    "PageResponse",
+    "make_partial",
+    "encode_cursor",
+    "decode_cursor",
+    "ErrorDetail",
+    "ErrorResponse",
+]

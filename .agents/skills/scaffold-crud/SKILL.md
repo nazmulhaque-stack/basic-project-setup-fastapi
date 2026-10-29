@@ -31,4 +31,4 @@ python3 .agents/agents/developer-agent/skills/scaffold_crud.py \
 2. `app/schemas/<model>.py`
 3. `app/repositories/<model>.py`
 4. `app/services/<model>.py` (Inherits from `BaseService`)
-5. `app/api/v1/endpoints/<model>.py`
+5. `app/api/v1/<model_plural>.py` (Dynamic `CRUDRouter`, zero manual handlers)

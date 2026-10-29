@@ -11,13 +11,27 @@
    - Implement `to_read_schema` for decryption and masking.
    - Implement `to_cache_dict` for Redis serialization.
    - Do not override `create`, `get`, `update`, `delete` unless altering the core transaction boundary.
+   - Polymorphic cache handling via `NullCache` ensures seamless execution across cached and non-cached environments.
 
 3. **Transaction Boundaries**:
-   - Services execute `await self.db.commit()` on successful mutations and `await self.db.rollback()` on exceptions.
-   - Repositories must NEVER call `commit()` or `rollback()`.
-   - Always catch `IntegrityError` in services and re-raise as `ConflictError`.
+   - Unit of work transaction lifecycle is managed at the request boundary (`get_db` commit on success, rollback on error).
+   - Repositories must NEVER call `commit()` or `rollback()`. They only execute `await session.flush()`.
+   - Always catch `IntegrityError` and handle domain violations cleanly.
 
-4. **Exception Handling**:
+4. **Database Connection Multiplexing (PgBouncer)**:
+   - Must configure `statement_cache_size: 0` and `prepared_statement_cache_size: 0` in `connect_args` for `asyncpg`.
+   - Never rely on server-level prepared statements or transaction-persisting session state.
+
+5. **CQRS & Elasticsearch 8 Integration**:
+   - PostgreSQL is the primary source of truth for all writes.
+   - Elasticsearch asynchronously indexes documents for fast full-text fuzzy queries, faceted searches, and autocomplete.
+   - Always provide graceful fallback (`NullElasticsearch`) when Elasticsearch is disabled or unreachable.
+
+6. **Keyset Cursor Pagination**:
+   - All high-volume list endpoints must use composite keyset seek `(created_at, id)` instead of deep SQL offset scanning.
+   - Keyset queries run in $O(\log N)$ time, preventing database memory exhaustion.
+
+7. **Exception Handling**:
    - Do not raise `fastapi.HTTPException` in services or repositories.
-   - Raise explicit domain exceptions: `NotFoundError`, `ConflictError`, `ValidationError`.
-   - Map domain exceptions to HTTP status codes at the router layer.
+   - Raise explicit domain exceptions: `NotFoundError`, `ConflictError`, `BusinessRuleError`, `ValidationError`.
+   - Map domain exceptions to HTTP status codes at the router layer or via global exception handlers.
