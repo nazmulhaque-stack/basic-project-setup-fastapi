@@ -21,6 +21,7 @@ router = CRUDRouter(
     sort_fields=["id", "name", "email", "role", "created_at"],
 )
 
+
 __all__ = [
     "router",
     "get_user_service",

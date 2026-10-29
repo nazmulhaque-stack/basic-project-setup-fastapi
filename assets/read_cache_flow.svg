@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 780" width="100%" height="100%" style="background:#0b1120; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <defs>
+    <linearGradient id="bgGrad3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1120" />
+      <stop offset="100%" stop-color="#070d18" />
+    </linearGradient>
+    <linearGradient id="hitGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#059669" />
+      <stop offset="100%" stop-color="#047857" />
+    </linearGradient>
+    <linearGradient id="missGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d97706" />
+      <stop offset="100%" stop-color="#b45309" />
+    </linearGradient>
+    <linearGradient id="lockGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c3aed" />
+      <stop offset="100%" stop-color="#6d28d9" />
+    </linearGradient>
+    <marker id="rc-arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#38bdf8" />
+    </marker>
+  </defs>
+
+  <rect width="1300" height="780" fill="url(#bgGrad3)" />
+
+  <!-- Header -->
+  <g transform="translate(50, 45)">
+    <text x="0" y="0" fill="#38bdf8" font-size="22" font-weight="800" letter-spacing="1">⚡ CACHE-ASIDE READ PATH &amp; STAMPEDE MUTEX PROTECTION</text>
+    <text x="0" y="24" fill="#94a3b8" font-size="12" font-weight="500">Execution decision tree for GET /api/v1/users/{id} protecting database from thunderous herds</text>
+  </g>
+
+  <!-- Step 1: Client Request -->
+  <g transform="translate(50, 100)">
+    <rect width="1200" height="60" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-width="1.5" />
+    <text x="25" y="35" fill="#ffffff" font-size="14" font-weight="700">1. Client Request:</text>
+    <text x="160" y="35" fill="#38bdf8" font-size="14" font-family="monospace">GET /api/v1/users/{id}</text>
+    <text x="450" y="35" fill="#94a3b8" font-size="12">──► CRUDRouter ──► UserService.get_by_id(id) ──► DynamicRedisCache.get_item(id)</text>
+  </g>
+
+  <!-- Arrow down to decision -->
+  <path d="M 650 160 L 650 195" stroke="#38bdf8" stroke-width="2" marker-end="url(#rc-arrow)" />
+
+  <!-- Decision Fork: 3 Outcomes -->
+  <!-- Box 1: Cache Hit -->
+  <g transform="translate(50, 205)">
+    <rect width="370" height="230" rx="8" fill="url(#hitGrad)" stroke="#34d399" stroke-width="1.5" />
+    <text x="20" y="32" fill="#ffffff" font-size="15" font-weight="800">✅ OUTCOME A: CACHE HIT</text>
+    <text x="20" y="60" fill="#d1fae5" font-size="12">• Key: cache:users:item:{id}</text>
+    <text x="20" y="85" fill="#d1fae5" font-size="12">• Payload deserialized from JSON</text>
+    <text x="20" y="110" fill="#d1fae5" font-size="12">• Latency: &lt; 0.8ms</text>
+    <text x="20" y="135" fill="#d1fae5" font-size="12">• Database Queries: EXACTLY 0</text>
+    <text x="20" y="160" fill="#d1fae5" font-size="12">• Validated into UserRead schema</text>
+    <rect x="20" y="180" width="330" height="32" rx="4" fill="#064e3b" />
+    <text x="35" y="202" fill="#86efac" font-size="12" font-weight="700">HTTP 200 OK (ORJSONResponse)</text>
+  </g>
+
+  <!-- Box 2: Negative Cache Hit -->
+  <g transform="translate(465, 205)">
+    <rect width="370" height="230" rx="8" fill="#1e1b4b" stroke="#f43f5e" stroke-width="1.5" />
+    <text x="20" y="32" fill="#f43f5e" font-size="15" font-weight="800">🛡️ OUTCOME B: NEGATIVE HIT</text>
+    <text x="20" y="60" fill="#fecdd3" font-size="12">• Key holds {"__not_found__": true}</text>
+    <text x="20" y="85" fill="#fecdd3" font-size="12">• TTL: Short window (30 seconds)</text>
+    <text x="20" y="110" fill="#fecdd3" font-size="12">• Prevents DB Penetration Attacks</text>
+    <text x="20" y="135" fill="#fecdd3" font-size="12">• Database Queries: EXACTLY 0</text>
+    <text x="20" y="160" fill="#fecdd3" font-size="12">• Raises NotFoundError immediately</text>
+    <rect x="20" y="180" width="330" height="32" rx="4" fill="#881337" />
+    <text x="35" y="202" fill="#fca5a5" font-size="12" font-weight="700">HTTP 404 Not Found (&lt; 0.5ms)</text>
+  </g>
+
+  <!-- Box 3: Cache Miss -->
+  <g transform="translate(880, 205)">
+    <rect width="370" height="230" rx="8" fill="url(#missGrad)" stroke="#fbbf24" stroke-width="1.5" />
+    <text x="20" y="32" fill="#ffffff" font-size="15" font-weight="800">⚡ OUTCOME C: CACHE MISS</text>
+    <text x="20" y="60" fill="#fef3c7" font-size="12">• Key not present in Redis Cluster</text>
+    <text x="20" y="85" fill="#fef3c7" font-size="12">• Distributed Stampede Mutex Activated</text>
+    <text x="20" y="110" fill="#fef3c7" font-size="12">• Lock Key: cache:users:lock:{id}</text>
+    <text x="20" y="135" fill="#fef3c7" font-size="12">• Redis: SET NX PX 5000</text>
+    <text x="20" y="160" fill="#fef3c7" font-size="12">• Only ONE worker queries PostgreSQL!</text>
+    <rect x="20" y="180" width="330" height="32" rx="4" fill="#78350f" />
+    <text x="35" y="202" fill="#fde68a" font-size="12" font-weight="700">Acquire Mutex Lock</text>
+  </g>
+
+  <!-- Stampede Mutex Sub-Process -->
+  <path d="M 1065 435 L 1065 480" stroke="#fbbf24" stroke-width="2" marker-end="url(#rc-arrow)" />
+
+  <g transform="translate(50, 490)">
+    <rect width="1200" height="220" rx="8" fill="url(#lockGrad)" stroke="#c4b5fd" stroke-width="1.5" />
+    <text x="25" y="32" fill="#ffffff" font-size="14" font-weight="800">🔒 DISTRIBUTED STAMPEDE MUTEX EXECUTION (10,000 CONCURRENT MISSES ON SAME ID)</text>
+
+    <!-- Worker A (Winner) -->
+    <g transform="translate(25, 52)">
+      <rect width="550" height="145" rx="6" fill="#1e1b4b" stroke="#a78bfa" stroke-width="1" />
+      <text x="20" y="25" fill="#c4b5fd" font-size="13" font-weight="700">Worker Process A (Acquired Lock)</text>
+      <text x="20" y="50" fill="#e2e8f0" font-size="11">1. Queries PostgreSQL 16 via PgBouncer: await repo.get(id)</text>
+      <text x="20" y="72" fill="#e2e8f0" font-size="11">2. If Not Found: writes {"__not_found__": true} (TTL 30s) ──► raises 404</text>
+      <text x="20" y="94" fill="#e2e8f0" font-size="11">3. If Found: serializes with PII masking via to_cache_dict()</text>
+      <text x="20" y="116" fill="#e2e8f0" font-size="11">4. Writes to Redis with ±10% Jitter (TTL 270-330s to prevent synchronized expiration)</text>
+      <text x="20" y="136" fill="#a78bfa" font-size="11" font-weight="600">5. Releases Lock atomically via owner-verified Lua DEL</text>
+    </g>
+
+    <!-- Workers B..N (Backoff) -->
+    <g transform="translate(620, 52)">
+      <rect width="550" height="145" rx="6" fill="#1e1b4b" stroke="#a78bfa" stroke-width="1" />
+      <text x="20" y="25" fill="#fca5a5" font-size="13" font-weight="700">Workers B, C, ... N (Lock Contenders - Backed Off)</text>
+      <text x="20" y="50" fill="#e2e8f0" font-size="11">1. Lock busy: SET NX failed</text>
+      <text x="20" y="72" fill="#e2e8f0" font-size="11">2. Workers DO NOT touch PostgreSQL (0 database connections consumed!)</text>
+      <text x="20" y="94" fill="#e2e8f0" font-size="11">3. Non-blocking sleep: await asyncio.sleep(0.05) (50ms)</text>
+      <text x="20" y="116" fill="#e2e8f0" font-size="11">4. Re-reads Redis: key is now populated by Worker A!</text>
+      <text x="20" y="136" fill="#86efac" font-size="11" font-weight="600">5. Returns populated data immediately without hitting PostgreSQL</text>
+    </g>
+  </g>
+
+  <!-- Footer -->
+  <text x="50" y="750" fill="#64748b" font-size="11" font-weight="500">Zero Database Thrashing • Sub-millisecond Negative Caching • Dynamic TTL Jitter (270s - 330s)</text>
+</svg>

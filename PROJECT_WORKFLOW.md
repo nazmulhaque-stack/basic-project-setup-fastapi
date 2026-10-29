@@ -1,21 +1,56 @@
 # 📖 End-to-End Execution Flow & Developer Implementation Guide
 
-This document provides a comprehensive, function-by-function guide to the architecture:
-1. **[Part 1: User Request Execution Lifecycle](#part-1-user-request-execution-lifecycle)** — The complete, step-by-step path of an incoming HTTP request from client arrival through the network, kernel, proxy, middleware, security, service layer, repository, database multiplexer, cache, and back to the client response.
-2. **[Part 2: Developer Implementation Workflow](#part-2-developer-implementation-workflow)** — A practical, deep guide for developers on how to add a new entity, CRUD operation, or custom endpoint from scratch, detailing every file and function to create or modify.
+Comprehensive architectural execution trace and complete developer implementation guide for the **FastAPI High-Performance 100k Concurrency Backend Architecture**.
+
+> 🏛️ **System Architecture & Infrastructure Specifications**: For hardware sizing math, 100,000 connection budget proofs, Docker/Kubernetes manifests, and benchmark commands, see [README.md](file:///home/nazmul/Downloads/fastapi-repo-pattern/README.md).
+
+---
+
+## 📑 Table of Contents
+
+1. **[Part 1: User Request Execution Lifecycle](#part-1-user-request-execution-lifecycle)** — The complete, step-by-step path of incoming HTTP requests across all primary operational modes:
+   - [1.1 Complete Write Path: `POST /api/v1/users`](#11-complete-write-path-post-apiv1users) (AES-256-GCM AEAD, blind index, cache invalidation)
+   - [1.2 Complete Read Path: `GET /api/v1/users/{id}`](#12-complete-read-path-get-apiv1usersid) (Distributed mutex locking, negative caching)
+   - [1.3 Keyset Cursor Pagination Path: `GET /api/v1/users`](#13-keyset-cursor-pagination-path-get-apiv1users) ($O(\log N)$ composite seek)
+   - [1.4 Elasticsearch Search & Async Logging Lifecycle](#14-elasticsearch-search--async-logging-lifecycle) (CQRS full-text search and non-blocking log buffer)
+   - [1.5 Relational & Nested Query Execution Lifecycle](#15-relational--nested-query-execution-lifecycle) (`selectinload` eager loading vs $N+1$ query prevention)
+2. **[Part 2: Developer Implementation Workflow](#part-2-developer-implementation-workflow)** — A practical, deep guide for developers on building features:
+   - [2.1 File Modification Checklist](#21-file-modification-checklist)
+   - [2.2 In-Depth Step-by-Step Code Examples](#22-in-depth-step-by-step-code-examples)
+   - [2.3 Unit of Work & Multi-Repository Transactions](#23-unit-of-work--multi-repository-transactions)
+   - [2.4 Writing Automated Tests](#24-writing-automated-tests-teststest_orderspy)
+   - [2.5 Nested Tables & Entity Relationships Guide (Category in Product)](#25-nested-tables--entity-relationships-guide-category-in-product)
+     - [2.5.1 The `lazy="raise"` Rule in Async SQLAlchemy](#251-the-lazyraise-rule-in-async-sqlalchemy)
+     - [2.5.2 Step 1: Model Definition with Foreign Keys & Relationships](#252-step-1-model-definition-with-foreign-keys--relationships)
+     - [2.5.3 Step 2: Nested Pydantic Schemas (Embedded DTOs & Validation)](#253-step-2-nested-pydantic-schemas-embedded-dtos--validation)
+     - [2.5.4 Step 3: Repository Eager Loading (`selectinload` vs `joinedload`)](#254-step-3-repository-eager-loading-selectinload-vs-joinedload)
+     - [2.5.5 Step 4: Service Layer Validation & Cross-Entity Cache Invalidation](#255-step-4-service-layer-validation--cross-entity-cache-invalidation)
+     - [2.5.6 Step 5: Dynamic CRUDRouter & Custom Nested Endpoints](#256-step-5-dynamic-crudrouter--custom-nested-endpoints)
+     - [2.5.7 Step 6: Database Migrations with Alembic](#257-step-6-database-migrations-with-alembic)
+     - [2.5.8 Step 7: Testing Relationships & Preventing N+1 Regressions](#258-step-7-testing-relationships--preventing-n1-regressions)
 
 ---
 
 # Part 1: User Request Execution Lifecycle
 
-This section tracks the execution flow across two primary operations:
+This section tracks the execution flow across five primary operations:
 - **Write Path**: `POST /api/v1/users` (Registration with AES-256-GCM encryption, blind indexing, and cache invalidation)
 - **Read Path**: `GET /api/v1/users/{id}` (Cache-aside with stampede mutex locks and negative caching)
 - **Keyset Pagination Path**: `GET /api/v1/users?limit=50&cursor=...` ($O(\log N)$ B-Tree cursor seek)
+- **Elasticsearch Search & Ingestion Path**: `GET /api/v1/products/search?q=...` & Background Ingestion Buffer
+- **Nested Relational Path**: `GET /api/v1/products/{id}/detail` (Eager loading `category_rel` via `selectinload`)
+
+<p align="center">
+  <img src="assets/architecture.png" alt="FastAPI High-Performance 100k Concurrency Architecture" width="100%" />
+</p>
 
 ---
 
 ## 1.1 Complete Write Path: `POST /api/v1/users`
+
+<p align="center">
+  <img src="assets/sequence_flow.png" alt="Complete Write Path Execution Lifecycle" width="100%" />
+</p>
 
 ```
 [Client] 
@@ -262,6 +297,10 @@ This section tracks the execution flow across two primary operations:
 
 ## 1.2 Complete Read Path: `GET /api/v1/users/{id}`
 
+<p align="center">
+  <img src="assets/read_cache_flow.png" alt="Cache-Aside Read Path & Stampede Mutex Protection" width="100%" />
+</p>
+
 When a client queries a user by ID, the execution follows this decision tree:
 
 ```
@@ -332,6 +371,135 @@ LIMIT 51; -- Fetches limit + 1 to detect has_next_page
    - `app/schemas/base.py: encode_cursor(last_item.created_at, last_item.id)` encodes the new cursor token.
 5. **Cache Store**:
    - Caches the page dictionary in Redis under the current list version.
+
+---
+
+## 1.4 Elasticsearch Search & Async Logging Lifecycle
+
+The architecture implements **Command-Query Responsibility Segregation (CQRS)**: PostgreSQL is the authoritative system of record for all writes, while Elasticsearch 8 handles full-text fuzzy ranking, faceted search, and centralized high-throughput structured application logging.
+
+### CQRS Product Full-Text Search Path: `GET /api/v1/products/search?q=wireless`
+
+```
+[Client] ──► GET /api/v1/products/search?q=wireless&limit=20
+   │
+   ▼
+[app/api/crud_router.py: CRUDRouter.search()]
+   │ Extracts 'q', pagination parameters, and validates
+   ▼
+[app/services/product.py: ProductService.search_products(q="wireless", limit=20)]
+   │
+   ▼
+[app/core/elasticsearch.py: ElasticsearchService.search_products(query="wireless")]
+   │ Constructs Elasticsearch DSL:
+   │ {
+   │   "query": {
+   │     "multi_match": {
+   │       "query": "wireless",
+   │       "fields": ["name^3", "description^2", "category", "sku"],
+   │       "fuzziness": "AUTO"
+   │     }
+   │   },
+   │   "size": 20
+   │ }
+   │
+   ├─► [Elasticsearch Cluster Active (HTTP 200)]
+   │   ├─ Extracts hits._source documents
+   │   └─ Deserializes into List[ProductRead] in < 5ms
+   │
+   └─► [Elasticsearch Cluster Down or Disabled (Graceful Degradation)]
+       ├─ NullElasticsearch catches connection errors / circuit breaks
+       ├─ Emits warning log
+       └─ Degrades gracefully to empty list or fallback database ILIKE query
+   ▼
+[Fast Serialization via ORJSONResponse ──► Client receives HTTP 200 OK]
+```
+
+### High-Throughput Non-Blocking Structured Log Ingestion
+
+To serve **100,000 concurrent requests** without disk I/O bottlenecks or Elasticsearch latency impacting user responses, log events are processed via a decoupled, bounded in-memory buffer:
+
+```
+[Incoming Request] ──► request_id_and_tracing_middleware()
+   │ Injects contextvars: request_id, trace_id, client_ip
+   ▼
+[Application Layer Log] ──► logger.info("Order created", extra={"order_id": str(id)})
+   │
+   ▼
+[StructuredLogFormatter: app/core/logging.py]
+   │ ├─ Formats JSON payload adhering to Elastic Common Schema (ECS)
+   │ ├─ Injects contextvars: request_id, trace_id, environment
+   │ └─ Sanitizes PII (masks credit cards, passwords, authorization headers)
+   ▼
+[AsyncLogBuffer: Non-Blocking Bounded Queue (size=10,000)]
+   │ queue.put_nowait(log_dict) ──► Returns IMMEDIATELY in 0.001ms!
+   │ If queue full (extreme spike) ──► Drops item to protect ASGI event loop
+   ▼
+[Background Worker Task: app/core/logging.py]
+   │ Flushes every 1.0s OR when batch reaches 250 records
+   ▼
+[Elasticsearch 8 Bulk API: _bulk]
+   │ await es_client.bulk(operations=bulk_operations)
+   │ Writes to daily rollover index: app-logs-YYYY.MM.DD
+   ▼
+[Searchable via GET /api/v1/logs/search?level=ERROR&time_range=24h]
+```
+
+---
+
+## 1.5 Relational & Nested Query Execution Lifecycle
+
+When querying complex nested structures (e.g. a `Product` and its associated `Category`):
+
+### The Async N+1 Dilemma & `lazy="raise"`
+In traditional synchronous frameworks (like Django or sync SQLAlchemy), accessing `product.category_rel.name` automatically issues a hidden synchronous query behind the scenes. In an async event-loop architecture serving 100k concurrency, **implicit lazy loading blocks the entire async thread worker** and crashes with:
+```
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() using greenlet_spawn
+```
+To eliminate this hazard permanently, all relationships in this codebase declare `lazy="raise"`. Every relational attribute access that is not explicitly pre-loaded immediately raises an error during testing.
+
+### Eager Loaded Nested Path: `GET /api/v1/products/{id}/detail`
+
+```
+[Client] ──► GET /api/v1/products/f47ac10b-58cc-4372-a567-0e02b2c3d479/detail
+   │
+   ▼
+[app/api/v1/products.py: router.get("/{item_id}/detail")]
+   │ Endpoint calls: await service.get_detail(item_id)
+   ▼
+[app/services/product.py: ProductService.get_detail()]
+   │ Calls: await self.repository.get_with_category(product_id)
+   ▼
+[app/repositories/product.py: ProductRepository.get_with_category()]
+   │ Executes:
+   │ await self.get(product_id, options=[selectinload(Product.category_rel)])
+   ▼
+[SQLAlchemy Async Engine & PgBouncer Multiplexer]
+   │ Issues EXACTLY 2 optimized queries:
+   │ 1. SELECT * FROM products WHERE id = 'f47ac10b-...'
+   │ 2. SELECT * FROM categories WHERE id IN (product.category_id)
+   ▼
+[Entities Linked in Identity Map: product.category_rel is fully populated]
+   │
+   ▼
+[Pydantic v2 DTO Serialization: ProductDetail.model_validate(product)]
+   │ Schema nests CategoryRead inside ProductDetail:
+   │ {
+   │   "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+   │   "name": "Wireless Mechanical Keyboard",
+   │   "sku": "KEY-WL-01",
+   │   "price_cents": 8999,
+   │   "category_id": 1,
+   │   "category_rel": {
+   │     "id": 1,
+   │     "name": "Electronics",
+   │     "description": "Electronic components and accessories",
+   │     "is_active": true
+   │   }
+   │ }
+   ▼
+[Fast Serialization via ORJSONResponse ──► Client receives HTTP 200 OK]
+```
 
 ---
 
@@ -522,8 +690,7 @@ from app.core.exceptions import ConflictError, NotFoundError
 from app.models.order import Order
 from app.repositories.order_repository import OrderRepository
 from app.schemas.order import OrderCreate, OrderPage, OrderRead, OrderUpdate
-from app.services.base import BaseService
-from app.services.redis_crud_manager import DynamicRedisCache
+from app.services.base import BaseService, DynamicRedisCache
 
 
 class OrderService(BaseService[Order, OrderCreate, OrderUpdate, OrderRead, uuid.UUID]):
@@ -779,3 +946,376 @@ async def test_order_crud_lifecycle(async_session, mock_redis):
     with pytest.raises(NotFoundError):
         await service.get_by_id(uuid.uuid4())
 ```
+
+---
+
+## 2.5 Nested Tables & Entity Relationships Guide (Category in Product)
+
+This section details how to model, query, validate, cache, and migrate nested tables and relationships in this architecture, using the **Category $\leftrightarrow$ Product** relationship as the canonical production reference.
+
+<p align="center">
+  <img src="assets/relational_nested_flow.png" alt="Relational Eager Loading Pipeline" width="100%" />
+</p>
+
+---
+
+### 2.5.1 The `lazy="raise"` Rule in Async SQLAlchemy
+
+In an asynchronous high-concurrency architecture serving **100,000 concurrent requests**, implicit lazy loading is strictly prohibited:
+
+1. **The Event Loop Trap**: In synchronous SQLAlchemy, accessing `product.category_rel` triggers a blocking synchronous I/O query. In an `asyncio` event loop, this blocks the worker process or raises `sqlalchemy.exc.MissingGreenlet`.
+2. **The $N+1$ Database Penalty**: In a list of 100 products, naive attribute access executes $1 + 100 = 101$ roundtrips to the database multiplexer, exhausting PgBouncer backend connections instantly.
+3. **The Architectural Fix**: All relationship attributes in this repository must declare `lazy="raise"`. If a developer forgets to eager-load a relationship in the repository, SQLAlchemy immediately raises an exception at the query boundary rather than silently leaking queries into production.
+
+---
+
+### 2.5.2 Step 1: Model Definition with Foreign Keys & Relationships
+
+Both sides of the relationship are mapped using SQLAlchemy 2.0 type-annotated columns:
+
+#### Parent Entity: `Category` ([`app/models/category.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/models/category.py))
+```python
+from typing import List, Optional, TYPE_CHECKING
+from sqlalchemy import Boolean, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.db.base import Base, IdIntMixin, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.models.product import Product
+
+class Category(IdIntMixin, TimestampMixin, Base):
+    __tablename__ = "categories"
+
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # 1:N Relationship: one category has many products
+    # lazy="raise" prevents accidental N+1 queries
+    products: Mapped[List["Product"]] = relationship(
+        "Product",
+        back_populates="category_rel",
+        lazy="raise",
+    )
+```
+
+#### Child Entity: `Product` ([`app/models/product.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/models/product.py))
+```python
+from typing import Optional, TYPE_CHECKING
+import uuid
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.models.base import Base
+
+if TYPE_CHECKING:
+    from app.models.category import Category
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    sku: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # 1. Foreign Key with ondelete="RESTRICT"
+    # RESTRICT blocks deleting a Category if products are assigned to it (raises 409 Conflict)
+    category_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("categories.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,  # Crucial: Always index foreign keys for join performance
+    )
+
+    # 2. Bidirectional Relationship with lazy="raise"
+    category_rel: Mapped[Optional["Category"]] = relationship(
+        "Category",
+        back_populates="products",
+        lazy="raise",
+    )
+```
+
+> [!IMPORTANT]
+> - Always place `index=True` on Foreign Key columns. Without a B-Tree index on the foreign key, PostgreSQL must execute a full-table scan on the child table whenever the parent table is queried or modified.
+> - Use `ondelete="RESTRICT"` for critical business hierarchies to prevent accidental cascading deletion of inventory or orders.
+
+---
+
+### 2.5.3 Step 2: Nested Pydantic Schemas (Embedded DTOs & Validation)
+
+To optimize payload sizes, separate standard flat CRUD schemas from enriched nested detail schemas:
+
+#### Schema Definitions ([`app/schemas/product.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/schemas/product.py)):
+```python
+from datetime import datetime
+from typing import Optional, Union
+import uuid
+from pydantic import BaseModel, ConfigDict, Field
+from app.schemas.category import CategoryRead
+
+# 1. Base Product Schema (Flat attributes)
+class ProductBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    sku: str = Field(..., min_length=1, max_length=100)
+    price_cents: int = Field(..., ge=0)
+    category_id: Optional[int] = Field(default=None, description="Foreign key to categories")
+    is_active: bool = Field(default=True)
+    stock: int = Field(default=0, ge=0)
+
+# 2. Creation Payload (Client supplies category_id)
+class ProductCreate(ProductBase):
+    pass
+
+# 3. Standard Flat Read Schema (Used for fast keyset pagination)
+class ProductRead(BaseModel):
+    id: Union[uuid.UUID, int]
+    name: str
+    sku: str
+    price_cents: int
+    category_id: Optional[int] = None
+    is_active: bool
+    stock: int = 0
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+# 4. Nested Detail Schema (Eagerly embeds CategoryRead)
+class ProductDetail(ProductRead):
+    category_rel: Optional[CategoryRead] = None
+```
+
+---
+
+### 2.5.4 Step 3: Repository Eager Loading (`selectinload` vs `joinedload`)
+
+When querying entities with relationships, instruct SQLAlchemy to pre-load relations in the repository query:
+
+#### When to use which loader?
+- **`selectinload` (Recommended for 1:N collections and async N:1)**:
+  Executes two queries linked by primary keys:
+  ```sql
+  SELECT * FROM products WHERE id = :id;
+  SELECT * FROM categories WHERE id IN (:category_id);
+  ```
+  Prevents Cartesian product duplicates across tables.
+- **`joinedload` (Recommended for strict 1:1 foreign keys)**:
+  Uses an SQL `LEFT OUTER JOIN`. Do not use `joinedload` on large collections with `limit` or `offset`, as SQL joins multiply row counts before slicing.
+
+#### Implementation in [`app/repositories/product.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/repositories/product.py):
+```python
+from sqlalchemy.orm import selectinload
+from app.models.product import Product
+from app.repositories.base import BaseRepository
+
+class ProductRepository(BaseRepository[Product, uuid.UUID]):
+    def __init__(self, db: AsyncSession) -> None:
+        super().__init__(model=Product, db=db)
+
+    async def get_with_category(self, product_id: Union[uuid.UUID, int, str]) -> Optional[Product]:
+        """Eagerly loads product with its associated category using selectinload."""
+        return await self.get(
+            product_id,
+            options=[selectinload(Product.category_rel)],
+        )
+
+    async def list_with_category(self, limit: int = 50, **filters) -> Sequence[Product]:
+        """Lists products eagerly loading the category relation."""
+        return await self.list(
+            limit=limit,
+            options=[selectinload(Product.category_rel)],
+            **filters,
+        )
+```
+
+---
+
+### 2.5.5 Step 4: Service Layer Validation & Cross-Entity Cache Invalidation
+
+The Service layer enforces cross-entity business rules and cache consistency across parent and child entities:
+
+#### Implementation in [`app/services/product.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/services/product.py):
+```python
+from app.core.exceptions import BusinessRuleError, NotFoundError
+from app.repositories.category import CategoryRepository
+from app.schemas.product import ProductCreate, ProductDetail, ProductRead, ProductUpdate
+from app.services.base import BaseService
+
+class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductRead, uuid.UUID]):
+
+    async def _ensure_active_category(self, category_id: int) -> None:
+        """Validates that the referenced category exists and is currently active."""
+        if self.db is not None:
+            categories = CategoryRepository(self.db)
+            if not await categories.exists(id=category_id, is_active=True):
+                raise BusinessRuleError(f"Category id={category_id} does not exist or is inactive.")
+
+    async def before_create(self, payload: ProductCreate) -> Product:
+        """Lifecycle Hook: Enforces active category validation before saving."""
+        if getattr(payload, "category_id", None) is not None:
+            await self._ensure_active_category(payload.category_id)
+        return await super().before_create(payload)
+
+    async def before_update(self, entity: Product, payload: ProductUpdate) -> None:
+        """Lifecycle Hook: Validates category if modified during update."""
+        if getattr(payload, "category_id", None) is not None and payload.category_id != entity.category_id:
+            await self._ensure_active_category(payload.category_id)
+        await super().before_update(entity, payload)
+
+    async def get_detail(self, product_id: Union[uuid.UUID, int, str]) -> ProductDetail:
+        """Queries product with eagerly loaded category relation."""
+        product = await self.repository.get_with_category(product_id)
+        if product is None:
+            raise NotFoundError(f"Product with id={product_id} not found.")
+        return ProductDetail.model_validate(product)
+```
+
+#### Cache Coordination Between Parent and Child:
+When a parent `Category` is updated or deactivated:
+```python
+# Inside CategoryService.update_by_id():
+updated_category = await self.repo.update(...)
+
+# Invalidate product list version cache so all product listings re-fetch updated category data:
+await self.redis.incr("cache:products:list_ver")
+```
+
+---
+
+### 2.5.6 Step 5: Dynamic CRUDRouter & Custom Nested Endpoints
+
+In [`app/api/v1/products.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/api/v1/products.py), standard endpoints are generated by `CRUDRouter`, while relational query filters and detailed nested endpoints are configured with zero boilerplate:
+
+```python
+from app.api.crud_router import CRUDRouter
+from app.api.deps import ProductServiceDep, get_product_service
+from app.models.product import Product
+from app.schemas.product import ProductCreate, ProductDetail, ProductRead, ProductUpdate
+
+# 1. Register category_id as a queryable filter
+router = CRUDRouter(
+    model=Product,
+    service=get_product_service,
+    create_schema=ProductCreate,
+    update_schema=ProductUpdate,
+    read_schema=ProductRead,
+    prefix="/products",
+    tags=["Products"],
+    filter_fields={
+        "category_id": ["eq", "in"],  # Enables ?category_id=1 and ?category_id__in=1,2,3
+        "is_active": ["eq"],
+    },
+    sort_fields=["id", "name", "price_cents", "created_at"],
+)
+
+# 2. Attach Custom Relational Detail Endpoint
+@router.get("/{item_id}/detail", response_model=ProductDetail, summary="Product with its category")
+async def product_detail(item_id: Union[uuid.UUID, int], service: ProductServiceDep):
+    """Returns the full product entity with nested category details."""
+    return await service.get_detail(item_id)
+```
+
+---
+
+### 2.5.7 Step 6: Database Migrations with Alembic
+
+Whenever foreign keys or relationship tables are added or modified:
+
+1. **Generate the Migration Script**:
+   ```bash
+   alembic revision --autogenerate -m "add_category_fk_to_products"
+   ```
+
+2. **Inspect the Generated Migration File**:
+   Verify that the migration correctly includes:
+   ```python
+   # Inside alembic/versions/<hash>_add_category_fk_to_products.py
+   def upgrade() -> None:
+       op.add_column('products', sa.Column('category_id', sa.Integer(), nullable=True))
+       op.create_index('ix_products_category_id', 'products', ['category_id'], unique=False)
+       op.create_foreign_key(
+           'fk_products_category_id_categories',
+           'products',
+           'categories',
+           ['category_id'],
+           ['id'],
+           ondelete='RESTRICT'
+       )
+
+   def downgrade() -> None:
+       op.drop_constraint('fk_products_category_id_categories', 'products', type_='foreignkey')
+       op.drop_index('ix_products_category_id', table_name='products')
+       op.drop_column('products', 'category_id')
+   ```
+
+3. **Verify Schema Health**:
+   Run the migration helper script:
+   ```bash
+   python3 .agents/agents/developer-agent/skills/db_migration_helper.py
+   ```
+
+4. **Apply Migration to Database**:
+   ```bash
+   alembic upgrade head
+   ```
+
+---
+
+### 2.5.8 Step 7: Testing Relationships & Preventing N+1 Regressions
+
+Add automated test cases validating foreign key constraints and eager loading ([`tests/test_products.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_products.py)):
+
+```python
+import pytest
+from app.core.exceptions import BusinessRuleError
+from app.models.category import Category
+from app.models.product import Product
+from app.repositories.product import ProductRepository
+from app.schemas.product import ProductCreate, ProductDetail
+from app.services.product import ProductService
+
+@pytest.mark.asyncio
+async def test_product_with_category_eager_loading(async_session, mock_redis):
+    # 1. Create Parent Category
+    category = Category(name="Electronics", is_active=True)
+    async_session.add(category)
+    await async_session.flush()
+
+    # 2. Create Child Product
+    repo = ProductRepository(async_session)
+    service = ProductService(repo=repo, cache=mock_redis, db=async_session)
+    payload = ProductCreate(
+        name="Mechanical Keyboard",
+        sku="KEY-001",
+        price_cents=7999,
+        category_id=category.id,
+    )
+    product = await service.create(payload)
+    await async_session.commit()
+
+    # 3. Verify Eager Loading via Detail Endpoint
+    detail = await service.get_detail(product.id)
+    assert isinstance(detail, ProductDetail)
+    assert detail.category_rel is not None
+    assert detail.category_rel.name == "Electronics"
+
+@pytest.mark.asyncio
+async def test_product_category_inactive_rejected(async_session, mock_redis):
+    # Create inactive category
+    category = Category(name="Discontinued", is_active=False)
+    async_session.add(category)
+    await async_session.flush()
+
+    repo = ProductRepository(async_session)
+    service = ProductService(repo=repo, cache=mock_redis, db=async_session)
+    payload = ProductCreate(
+        name="Old Item",
+        sku="OLD-001",
+        price_cents=1000,
+        category_id=category.id,
+    )
+    # Business rule must reject inactive categories
+    with pytest.raises(BusinessRuleError):
+        await service.create(payload)
+```
+

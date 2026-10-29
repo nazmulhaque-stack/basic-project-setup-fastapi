@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 880" width="100%" height="100%" style="background:#0b1120; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <defs>
+    <linearGradient id="bgGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1120" />
+      <stop offset="100%" stop-color="#070d18" />
+    </linearGradient>
+    <marker id="seq-arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#38bdf8" />
+    </marker>
+    <marker id="seq-arrow-ret" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#34d399" />
+    </marker>
+  </defs>
+
+  <!-- Canvas -->
+  <rect width="1300" height="880" fill="url(#bgGrad2)" />
+
+  <!-- Header -->
+  <g transform="translate(50, 45)">
+    <text x="0" y="0" fill="#38bdf8" font-size="22" font-weight="800" letter-spacing="1">⏱️ END-TO-END REQUEST EXECUTION LIFECYCLE</text>
+    <text x="0" y="24" fill="#94a3b8" font-size="12" font-weight="500">Step-by-step tracing of POST /api/v1/users through proxy, rate limiter, encryption, database multiplexer, and cache</text>
+  </g>
+
+  <!-- Lifeline Columns -->
+  <!-- 1. Client (100) -->
+  <!-- 2. Nginx (260) -->
+  <!-- 3. Uvicorn (420) -->
+  <!-- 4. RateLimiter (580) -->
+  <!-- 5. UserService & Crypto (750) -->
+  <!-- 6. Repository & PgBouncer (930) -->
+  <!-- 7. Redis & Postgres (1120) -->
+
+  <!-- Lifeline Headers -->
+  <g transform="translate(0, 85)">
+    <!-- 1. Client -->
+    <rect x="50" y="0" width="110" height="38" rx="6" fill="#0284c7" stroke="#38bdf8" stroke-width="1.5" />
+    <text x="105" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">🌐 Client</text>
+    <line x1="105" y1="38" x2="105" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+
+    <!-- 2. Nginx -->
+    <rect x="205" y="0" width="120" height="38" rx="6" fill="#0f766e" stroke="#2dd4bf" stroke-width="1.5" />
+    <text x="265" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">🛡️ Nginx Proxy</text>
+    <line x1="265" y1="38" x2="265" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+
+    <!-- 3. Uvicorn & Middleware -->
+    <rect x="365" y="0" width="140" height="38" rx="6" fill="#312e81" stroke="#818cf8" stroke-width="1.5" />
+    <text x="435" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">⚡ Uvicorn + Trace</text>
+    <line x1="435" y1="38" x2="435" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+
+    <!-- 4. Rate Limiter -->
+    <rect x="535" y="0" width="140" height="38" rx="6" fill="#78350f" stroke="#fbbf24" stroke-width="1.5" />
+    <text x="605" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">⏱️ Lua RateLimiter</text>
+    <line x1="605" y1="38" x2="605" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+
+    <!-- 5. UserService & Crypto -->
+    <rect x="705" y="0" width="160" height="38" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1.5" />
+    <text x="785" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">🔐 Service &amp; Crypto</text>
+    <line x1="785" y1="38" x2="760" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+
+    <!-- 6. Repository & PgBouncer -->
+    <rect x="895" y="0" width="160" height="38" rx="6" fill="#064e3b" stroke="#34d399" stroke-width="1.5" />
+    <text x="975" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">🔄 PgBouncer Pool</text>
+    <line x1="975" y1="38" x2="975" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+
+    <!-- 7. Postgres & Redis -->
+    <rect x="1085" y="0" width="160" height="38" rx="6" fill="#1e3a8a" stroke="#60a5fa" stroke-width="1.5" />
+    <text x="1165" y="24" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle">🐘 PostgreSQL &amp; Redis</text>
+    <line x1="1165" y1="38" x2="1165" y2="760" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4,4" />
+  </g>
+
+  <!-- Step Sequences -->
+  <!-- Step 1: POST /api/v1/users -->
+  <g transform="translate(0, 160)">
+    <line x1="105" y1="0" x2="265" y2="0" stroke="#38bdf8" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="120" y="-18" width="130" height="18" rx="3" fill="#0f172a" />
+    <text x="125" y="-5" fill="#e2e8f0" font-size="10" font-weight="600">1. POST /api/v1/users</text>
+  </g>
+
+  <!-- Step 2: Nginx validates rate and limits -->
+  <g transform="translate(0, 205)">
+    <rect x="220" y="-12" width="230" height="24" rx="4" fill="#134e4a" stroke="#2dd4bf" stroke-width="1" />
+    <text x="230" y="4" fill="#ccfbf1" font-size="10">2. Verify limit_conn 100 &amp; limit_req 100r/s</text>
+  </g>
+
+  <!-- Step 3: Nginx to Uvicorn -->
+  <g transform="translate(0, 245)">
+    <line x1="265" y1="0" x2="435" y2="0" stroke="#2dd4bf" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="280" y="-18" width="140" height="18" rx="3" fill="#0f172a" />
+    <text x="285" y="-5" fill="#e2e8f0" font-size="10" font-weight="600">3. Keepalive TCP Dispatch</text>
+  </g>
+
+  <!-- Step 4: Tracing & Request ID -->
+  <g transform="translate(0, 290)">
+    <rect x="380" y="-12" width="240" height="24" rx="4" fill="#312e81" stroke="#818cf8" stroke-width="1" />
+    <text x="390" y="4" fill="#e0e7ff" font-size="10">4. Inject X-Request-ID &amp; Coroutine Context</text>
+  </g>
+
+  <!-- Step 5: Rate Limiter Lua -->
+  <g transform="translate(0, 335)">
+    <line x1="435" y1="0" x2="605" y2="0" stroke="#818cf8" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="450" y="-18" width="140" height="18" rx="3" fill="#0f172a" />
+    <text x="455" y="-5" fill="#e2e8f0" font-size="10" font-weight="600">5. RateLimiter.__call__()</text>
+  </g>
+
+  <!-- Step 6: EVALSHA in Redis -->
+  <g transform="translate(0, 380)">
+    <line x1="605" y1="0" x2="1165" y2="0" stroke="#f59e0b" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="780" y="-18" width="210" height="18" rx="3" fill="#0f172a" />
+    <text x="785" y="-5" fill="#fef3c7" font-size="10" font-weight="600">6. Redis: EVALSHA rl:{users:ip}:window</text>
+  </g>
+
+  <!-- Step 7: Controller & UserService -->
+  <g transform="translate(0, 425)">
+    <line x1="605" y1="0" x2="785" y2="0" stroke="#38bdf8" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="625" y="-18" width="140" height="18" rx="3" fill="#0f172a" />
+    <text x="630" y="-5" fill="#e2e8f0" font-size="10" font-weight="600">7. Dispatch UserService</text>
+  </g>
+
+  <!-- Step 8: AES-256-GCM Encryption & Blind Index -->
+  <g transform="translate(0, 470)">
+    <rect x="670" y="-12" width="230" height="26" rx="4" fill="#0f172a" stroke="#38bdf8" stroke-width="1.2" />
+    <text x="680" y="5" fill="#38bdf8" font-size="10" font-weight="700">8. AES-256-GCM AEAD (AAD Bound)</text>
+  </g>
+
+  <!-- Step 9: Repository to PgBouncer -->
+  <g transform="translate(0, 520)">
+    <line x1="785" y1="0" x2="975" y2="0" stroke="#34d399" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="805" y="-18" width="150" height="18" rx="3" fill="#0f172a" />
+    <text x="810" y="-5" fill="#e2e8f0" font-size="10" font-weight="600">9. repo.create() &amp; flush()</text>
+  </g>
+
+  <!-- Step 10: PgBouncer to PostgreSQL -->
+  <g transform="translate(0, 565)">
+    <line x1="975" y1="0" x2="1165" y2="0" stroke="#34d399" stroke-width="2" marker-end="url(#seq-arrow)" />
+    <rect x="995" y="-18" width="150" height="18" rx="3" fill="#0f172a" />
+    <text x="1000" y="-5" fill="#e2e8f0" font-size="10" font-weight="600">10. INSERT &amp; Unique Check</text>
+  </g>
+
+  <!-- Step 11: Cache List Invalidation -->
+  <g transform="translate(0, 610)">
+    <line x1="785" y1="0" x2="1165" y2="0" stroke="#ef4444" stroke-width="2" stroke-dasharray="4,4" marker-end="url(#seq-arrow)" />
+    <rect x="870" y="-18" width="210" height="18" rx="3" fill="#0f172a" />
+    <text x="875" y="-5" fill="#fca5a5" font-size="10" font-weight="600">11. INCR cache:users:list_ver (O(1))</text>
+  </g>
+
+  <!-- Step 12: Commit on get_db exit -->
+  <g transform="translate(0, 655)">
+    <rect x="910" y="-12" width="220" height="24" rx="4" fill="#064e3b" stroke="#34d399" stroke-width="1" />
+    <text x="920" y="4" fill="#a7f3d0" font-size="10">12. await session.commit() via get_db</text>
+  </g>
+
+  <!-- Step 13: Response transmission -->
+  <g transform="translate(0, 705)">
+    <line x1="785" y1="0" x2="105" y2="0" stroke="#34d399" stroke-width="2.5" marker-end="url(#seq-arrow-ret)" />
+    <rect x="350" y="-18" width="230" height="18" rx="3" fill="#0f172a" />
+    <text x="355" y="-5" fill="#86efac" font-size="11" font-weight="700">13. ORJSONResponse (HTTP 201 Created)</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="50" y="860" fill="#64748b" font-size="11" font-weight="500">Atomic Single Transaction Boundary • Zero Leaks • Negative Caching &amp; Mutex Stampede Locks</text>
+</svg>

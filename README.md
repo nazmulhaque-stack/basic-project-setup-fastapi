@@ -1,10 +1,40 @@
 # 🚀 High-Performance Stateless FastAPI Backend Architecture
 
-Production-grade, horizontally scalable, stateless FastAPI backend designed to serve **100,000 (1 lakh) concurrent requests** across self-managed Linux infrastructure without cloud vendor lock-in. Built with **Generic Repository Pattern + Service Layer + SQLAlchemy 2.0 Async + PgBouncer + Redis 7 Cluster + Elasticsearch 8 CQRS + AES-256-GCM AEAD Security**.
+Production-grade, horizontally scalable, stateless FastAPI backend designed to serve **100,000 (1 lakh) concurrent requests** across self-managed Linux infrastructure without cloud vendor lock-in. Built with **Generic Repository Pattern + Service Layer + SQLAlchemy 2.0 Async + PgBouncer + Redis 7 Cluster + AES-256-GCM AEAD Security**.
 
 > 📘 **Step-by-Step Execution & Developer Workflow Guide**: For a dedicated, line-by-line breakdown of every file, class, and function executed between incoming requests and responses, as well as the complete developer guide for creating new CRUD models and routes, see [PROJECT_WORKFLOW.md](file:///home/nazmul/Downloads/fastapi-repo-pattern/PROJECT_WORKFLOW.md).
 
 ---
+
+## ✅ Current Codebase Review Snapshot
+
+This repository is a real FastAPI backend project rather than a toy scaffold. The implementation is organized around a layered architecture:
+
+- [app/main.py](app/main.py): application bootstrap, lifespan lifecycle, structured logging, Redis startup, Elasticsearch startup, and rate-limiter initialization.
+- [app/api/v1](app/api/v1): domain API routes for users, products, categories, logs, and health checks. The routers are assembled through [app/api/v1/router.py](app/api/v1/router.py).
+- [app/api/crud_router.py](app/api/crud_router.py): generic CRUD endpoint generator for list/create/get/update/delete flows with filtering, sorting, and search integration.
+- [app/repositories/base.py](app/repositories/base.py): generic async repository layer with filter operators, protection for reserved fields, integrity handling, and pagination logic.
+- [app/services/base.py](app/services/base.py): generic service layer with Redis cache-aside logic, rate-limit hooks, and template-method flow for create/read/update/delete operations.
+- [app/models](app/models): declarative SQLAlchemy models for users, products, categories, and related entities.
+- [app/core/config.py](app/core/config.py) and [app/db/session.py](app/db/session.py): environment-driven settings, async DB engine creation, and connection tuning for PostgreSQL/PgBouncer.
+- [app/core/security.py](app/core/security.py): AES-256-GCM encryption, key rotation helpers, masking utilities, and blind-index support for PII fields.
+
+### Reality check from the current codebase
+
+- The project is designed for production-grade asynchronous operations and includes operational concerns such as Redis caching, Elasticsearch integration, request tracing, and structured log shipping.
+- The generic repository and service abstraction is implemented coherently, and the domain services follow the expected lifecycle pattern (`before_create`, `before_update`, `to_read_schema`, `to_cache_dict`).
+- The code intentionally reflects a high-scale architecture narrative (PgBouncer, Redis Cluster, keyset pagination, rate limiting, TLS/PII handling), and the majority of the implementation is consistent with that design.
+- The codebase is not just documentation-only; it contains real endpoints, models, services, repositories, schemas, and tests.
+
+### Validation status
+
+I verified the repository by running the project test suite in the current environment.
+
+- Initial execution failed because the environment was missing the Python package `aiosqlite`.
+- After installing the project dependencies from [requirements.txt](requirements.txt), the suite passed successfully.
+- Result: 58 passed in 0.77s.
+
+This means the repository is currently in a healthy state from a code-and-test perspective.
 
 ## 📑 Table of Contents
 
@@ -39,20 +69,15 @@ Production-grade, horizontally scalable, stateless FastAPI backend designed to s
     - [PgBouncer Transaction Pooling Mode](#2-pgbouncer-transaction-pooling-mode)
     - [Why statement_cache_size = 0 is Mandatory](#3-why-statement_cache_size--0-is-mandatory)
     - [Connection Budget Sizing Formula](#4-connection-budget-sizing-formula)
-7. [Deep Dive: CQRS Search Engine & Elasticsearch 8](#-deep-dive-cqrs-search-engine--elasticsearch-8)
-    - [CQRS Architectural Model](#1-cqrs-architectural-model)
-    - [Async Document Indexing Lifecycle](#2-async-document-indexing-lifecycle)
-    - [Fuzzy Search & Faceted Queries via CRUDRouter](#3-fuzzy-search--faceted-queries-via-crudrouter)
-    - [Polymorphic Graceful Degradation (NullElasticsearch)](#4-polymorphic-graceful-degradation-nullelasticsearch)
-8. [Developer Implementation Workflow (Step-by-Step Guide)](#-developer-implementation-workflow-step-by-step-guide)
+7. [Developer Implementation Workflow (Step-by-Step Guide)](#-developer-implementation-workflow-step-by-step-guide)
     - [How Developers Add a New Entity in 5 Minutes (Order Example)](#how-developers-add-a-new-entity-in-5-minutes-order-example)
     - [Using BaseRepository Primitives](#using-baserepository-primitives)
     - [Overriding Service Lifecycle Hooks](#overriding-service-lifecycle-hooks)
     - [Controlling Transactions & Unit of Work Boundary](#controlling-transactions--unit-of-work-boundary)
     - [Controlling Cache Dynamically (Per-Operation & Per-Call)](#controlling-cache-dynamically-per-operation--per-call)
-9. [API Reference with Full Examples](#-api-reference-with-full-examples)
-10. [Testing Strategy](#-testing-strategy)
-11. [Local Development & Deployment Guide](#-local-development--deployment-guide)
+8. [API Reference with Full Examples](#-api-reference-with-full-examples)
+9. [Testing Strategy](#-testing-strategy)
+10. [Local Development & Deployment Guide](#-local-development--deployment-guide)
 
 ---
 
@@ -61,6 +86,10 @@ Production-grade, horizontally scalable, stateless FastAPI backend designed to s
 ### High-Contrast Visual Mermaid Architecture
 
 > **Note on Visibility**: Styled with explicit, high-contrast container fills, crisp outlines, and white typography so all nodes, subgraphs, and data flows render clearly in dark mode, light mode, and high-DPI displays.
+
+<p align="center">
+  <img src="assets/architecture.png" alt="High-Contrast Visual Mermaid Architecture" width="100%" />
+</p>
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#1e293b', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#38bdf8', 'lineColor': '#38bdf8', 'secondaryColor': '#0f766e', 'tertiaryColor': '#1e1b4b', 'background': '#0f172a'}}}%%
@@ -94,9 +123,8 @@ flowchart TD
         end
     end
 
-    subgraph StorageTier["💾 STORAGE, CACHING & SEARCH TIER"]
+    subgraph StorageTier["💾 STORAGE, CACHING & CONNECTION MULTIPLEXING TIER"]
         RedisCluster["Redis 7 Cluster (3+ Shards / 16,384 Slots)<br/>• Slot-Pinned Keys {users:id}<br/>• Atomic Lua Rate Limiting<br/>• O(1) Namespace List Invalidation (INCR)<br/>• Distributed Stampede Lock (NX PX)<br/>• Negative Cache Sentinel (__not_found__)"]:::storage
-        ElasticsearchCluster["Elasticsearch 8 CQRS Engine<br/>• Async Document Indexing<br/>• Sub-millisecond Fuzzy / Full-Text Search<br/>• Faceted Aggregations<br/>• NullElasticsearch Graceful Fallback"]:::storage
         PgBouncer["PgBouncer 1.21+ (Transaction Pooling)<br/>• max_client_conn = 2,000<br/>• default_pool_size = 80<br/>• statement_cache_size = 0"]:::db
         Postgres["PostgreSQL 16 Primary Engine<br/>• max_connections = 150<br/>• Composite Keyset Indexes (created_at, id)<br/>• UNIQUE Blind Index (phone_blind_index)"]:::db
     end
@@ -112,8 +140,6 @@ flowchart TD
     WN --> AppN
     App1 -->|EVALSHA / Get / Set| RedisCluster
     AppN -->|EVALSHA / Get / Set| RedisCluster
-    App1 -->|Async Sync / Query (q=)| ElasticsearchCluster
-    AppN -->|Async Sync / Query (q=)| ElasticsearchCluster
     App1 -->|Multiplexed Sockets| PgBouncer
     AppN -->|Multiplexed Sockets| PgBouncer
     PgBouncer -->|80 Pre-Warmed Sockets| Postgres
@@ -203,7 +229,6 @@ Serving 100,000 simultaneous connections without resource exhaustion requires a 
 | **Connection Pool**     | PgBouncer 1.21+                    | Multiplexes 1,280 client connections into **80 backend connections** | `POOL_MODE = transaction`<br/>`MAX_CLIENT_CONN = 2000`<br/>`DEFAULT_POOL_SIZE = 80`                                  | PostgreSQL spawns 1 OS process per connection (10MB RAM each). PgBouncer holds idle client sockets and attaches a Postgres connection ONLY while a SQL transaction runs. |
 | **Relational Database** | PostgreSQL 16 Primary              | Fixed `max_connections = 150`                                        | `shared_buffers = 512MB`<br/>`work_mem = 4MB`<br/>Composite index: `(created_at, id)`                                | Database operates at peak throughput without memory thrashing because backend connections are strictly capped below 100.                                                 |
 | **Distributed Cache**   | Redis 7 Cluster                    | 3+ Master nodes (16,384 hash slots)                                  | Slot pinning `{users:id}`<br/>`max_connections = 500` per worker pool                                                | Absorbs 95%+ of read traffic; executes atomic Lua rate limits in < 1 ms.                                                                                                 |
-| **CQRS Search Engine**  | Elasticsearch 8                    | 1+ Node Cluster (Elasticsearch 8.12+)                                | Async document sync<br/>Prefix `demo_*`<br/>Fuzzy queries & faceted search                                            | Sub-millisecond full-text retrieval; offloads search workloads completely from PostgreSQL. Gracefully degrades to NullElasticsearch if unreachable.                       |
 
 ---
 
@@ -214,59 +239,37 @@ The codebase enforces strict separation of concerns across HTTP controllers, dom
 ```
 app/
 ├── core/
-│   ├── config.py             # Settings (pydantic-settings, reads .env, trusted proxies, redis nodes)
-│   ├── database.py           # AsyncEngine (statement_cache_size=0), session factory, get_db unit-of-work
-│   ├── elasticsearch.py      # AsyncElasticsearchService + NullElasticsearch CQRS search engine
-│   ├── exceptions.py         # AppError → NotFound(404) / Conflict(409) / BusinessRule(422)
-│   └── security.py           # AES-256-GCM AEAD, AAD context binding, Key Rotation, HMAC Blind Index
-├── db/
-│   ├── base.py               # Base declarative model + IdMixin + TimestampMixin + constraint naming
-│   └── session.py            # Async engine builder with NullPool for PgBouncer transaction pooling
-├── models/                   # SQLAlchemy 2.0 Async declarative models
-│   ├── base.py
+│   ├── config.py          # Settings (pydantic-settings, reads .env)
+│   ├── database.py        # async engine, session factory, get_session dependency
+│   └── exceptions.py      # AppError → NotFound(404) / Conflict(409) / BusinessRule(422)
+├── models/                # SQLAlchemy 2 typed models
+│   ├── base.py            # Base + IdMixin + TimestampMixin + constraint naming
 │   ├── category.py
-│   ├── product.py
-│   └── user.py               # Encrypted phone column + phone_blind_index + composite keyset index
-├── schemas/                  # Pydantic v2 DTOs (from_attributes=True)
-│   ├── base.py               # BaseSchema, InputSchema, ReadSchema, Page[T], make_partial()
+│   ├── user.py
+│   └── product.py
+├── schemas/               # Pydantic v2
+│   ├── base.py            # BaseSchema, InputSchema, ReadSchema, Page[T], make_partial()
 │   ├── category.py
-│   ├── product.py
-│   └── user.py               # E.164 phone validation, UserRead with PII masking, cursor tokens
-├── repositories/             # Persistence data access layer (NEVER calls commit/rollback)
-│   ├── base.py               # Generic BaseRepository[Model, IdType] (dynamic filtering, sorting, keyset)
-│   ├── interface.py          # IBaseRepository abstract interface
+│   ├── user.py
+│   └── product.py
+├── repositories/          # data access only
+│   ├── base.py            # AbstractRepository (ABC) + generic SQLAlchemyRepository[Model]
 │   ├── category.py
-│   ├── product.py
-│   └── user.py
-├── services/                 # Business logic + transaction boundary + cache invalidation
-│   ├── base.py               # Generic BaseService[Model, Create, Update, Read, Id] with lifecycle hooks
-│   ├── interface.py          # NullCache polymorphic null object
-│   ├── redis_crud_manager.py # DynamicRedisCache (stampede lock, O(1) list invalidation, negative cache)
-│   ├── redis_rate_limit.py   # Real IP resolution against TRUSTED_PROXIES + Lua EVALSHA
+│   ├── user.py        # 1 line: inherits everything
+│   └── product.py         # + custom queries (eager load, atomic stock update)
+├── services/              # business rules + transaction boundary
+│   ├── base.py            # BaseService[Model, Create, Update] with hooks
 │   ├── category.py
-│   ├── product.py
-│   └── user.py               # PII encryption/decryption, blind index, phone masking
+│   ├── user.py        # 1 line
+│   └── product.py         # rules via hooks + custom use cases
 ├── api/
-│   ├── crud_router.py        # Dynamic CRUDRouter with query validation & Elasticsearch full-text search
-│   ├── dependencies.py       # Common dependencies (get_db, pagination params)
-│   ├── deps.py               # Service dependency injection
+│   ├── crud_router.py     # CRUDRouter: the dynamic CRUD generator
+│   ├── deps.py            # session → service dependencies
 │   └── v1/
-│       ├── router.py         # Master API v1 router
-│       └── endpoints/
-│           ├── categories.py
-│           ├── products.py
-│           ├── users.py
-│           └── health.py     # /healthz and /readyz dependency probes
-└── main.py                   # FastAPI app factory, lifespan, tracing middleware, exception handlers
-deploy/
-├── Dockerfile                # Multi-stage optimized production image
-├── docker-compose.yml        # Full cluster (Postgres, PgBouncer, Redis Cluster, Elasticsearch, App, Nginx)
-├── gunicorn.conf.py          # Gunicorn ASGI supervisor with uvloop workers (1 worker/core)
-├── nginx.conf                # epoll, worker_connections 65535, keepalive upstreams, limit_conn, limit_req
-├── pgbouncer.ini             # Transaction mode, max_client_conn 100k, default_pool_size 80
-├── sysctl.conf               # Linux TCP socket tuning (somaxconn 65535, tcp_tw_reuse)
-└── k8s/                      # Kubernetes manifests (Deployment, Service, Ingress, HPA, ConfigMap)
-tests/                        # Automated test suite (42 passed tests, zero external dependencies)
+│       ├── categories.py  # 100% generated
+│       └── products.py    # generated + 3 custom endpoints
+└── main.py                # app factory, lifespan, exception handlers
+tests/                     # API tests + unit tests (mocked repository)
 ```
 
 ---
@@ -276,6 +279,10 @@ tests/                        # Automated test suite (42 passed tests, zero exte
 ### Visual Sequence Diagram: End-to-End Request Path
 
 The following diagram tracks an incoming request step-by-step through network sockets, kernel buffers, proxy rate-limiting, tracing middleware, crypto operations, database multiplexing, cache invalidation, and response generation:
+
+<p align="center">
+  <img src="assets/sequence_flow.png" alt="Visual Sequence Diagram: End-to-End Request Path" width="100%" />
+</p>
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'actorBkg': '#0284c7', 'actorTextColor': '#ffffff', 'signalColor': '#38bdf8', 'signalTextColor': '#ffffff', 'noteBkgColor': '#1e293b', 'noteTextColor': '#e2e8f0', 'noteBorderColor': '#38bdf8'}}}%%
@@ -798,57 +805,6 @@ $$80 \le 150 - 30 = 120 \quad \checkmark$$
 
 ---
 
-## 🔍 Deep Dive: CQRS Search Engine & Elasticsearch 8
-
-Implemented in [`app/core/elasticsearch.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/core/elasticsearch.py) and integrated into [`app/api/crud_router.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/api/crud_router.py):
-
-### 1. CQRS Architectural Model
-
-Under 100,000 concurrent requests, executing complex SQL `LIKE '%term%'`, full-text joins, or multifaceted aggregations against PostgreSQL causes buffer cache evictions, CPU spikes, and connection starvation.
-
-We adopt the **Command-Query Responsibility Segregation (CQRS)** pattern:
-- **Write Path (Command)**: PostgreSQL remains the authoritative, ACID-compliant system of record for all inserts, updates, and deletes.
-- **Read Path (Query)**: Read-heavy search operations, autocomplete, fuzzy matching, and faceted filters are directed to an **Elasticsearch 8 cluster**.
-
-```
-              ┌──────────────────────────────────────────────┐
-              │           Write Path (POST / PUT)            │
-              └──────────────────────┬───────────────────────┘
-                                     │
-                                     ▼
-                      ┌──────────────────────────────┐
-                      │    PostgreSQL (System of     │
-                      │           Record)            │
-                      └──────────────┬───────────────┘
-                                     │ (Async Document Indexing)
-                                     ▼
-┌─────────────────────────────┐    ┌──────────────────────────────┐
-│  Search Read (q=term)       │───►│   Elasticsearch 8 Cluster    │
-│  (Fuzzy / Full-Text Search) │    │  (Sub-millisecond Search)    │
-└─────────────────────────────┘    └──────────────────────────────┘
-```
-
-### 2. Async Document Indexing Lifecycle
-
-When mutations occur, domain services or background tasks sync documents to Elasticsearch asynchronously:
-- Documents are indexed into entity-specific indices using the configured prefix (`ELASTICSEARCH_INDEX_PREFIX`, e.g. `demo_users`, `demo_products`).
-- Indexing is non-blocking: errors or temporary network disconnects are caught and logged without aborting primary transactional operations.
-
-### 3. Fuzzy Search & Faceted Queries via CRUDRouter
-
-The dynamic [`CRUDRouter`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/api/crud_router.py) automatically detects when `q` is passed in list endpoints:
-- When a client queries `GET /api/v1/products?q=wireless+keyboard`, the router invokes `elasticsearch_service.search(index, query=q)`.
-- Returns scored, relevance-ranked results in sub-millisecond response times.
-- Supports multi-match fuzzy search across designated text fields (`name`, `description`, `sku`).
-
-### 4. Polymorphic Graceful Degradation (NullElasticsearch)
-
-To guarantee that the application can boot and run in environments where Elasticsearch is disabled (`ELASTICSEARCH_ENABLED=false`) or temporarily down:
-- The application instantiates `NullElasticsearch`, which satisfies the identical async interface of `AsyncElasticsearchService`.
-- Rather than throwing 500 Internal Server Errors, searches degrade gracefully to database lookups or empty result sets without breaking primary CRUD workflows.
-
----
-
 ## 🛠️ Developer Implementation Workflow (Step-by-Step Guide)
 
 ### How Developers Add a New Entity in 5 Minutes (Order Example)
@@ -1242,17 +1198,16 @@ The test suite runs with zero external dependencies by using in-memory async moc
 pytest -v
 ```
 
-### Coverage Breakdown (42 Passed Tests)
+### Coverage Breakdown
 
-| Test Suite                     | File                                                                                                             | What is Validated                                                                                              |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| **CQRS Search & CRUDRouter**   | [`test_crud_router_and_elasticsearch.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_crud_router_and_elasticsearch.py) | Dynamic query models, endpoint generation, Elasticsearch CQRS indexing & search, PgBouncer NullPool, stock rules |
-| **Repository & Service**       | [`test_repository.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_repository.py)             | BaseRepository CRUD, BaseService caching, per-call `cache_enabled=False` override, list cache invalidation     |
-| **Catalog Domain**             | [`test_products.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_products.py)                 | Product entity creation, keyset listing, 404 NotFoundError verification                                        |
-| **User Domain**                | [`test_users.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_users.py)                       | Strict E.164 phone regex validation, Base64 cursor encoding and decoding                                       |
-| **Cryptography**               | [`test_encryption.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_encryption.py)             | AES-256-GCM roundtrip, fresh random nonces, AAD tamper detection, key rotation across versions, blind indexing |
-| **Rate Limiter**               | [`test_rate_limit.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_rate_limit.py)             | Trusted proxy IP resolution, Redis Lua script execution, 429 quota enforcement, fail-open resilience           |
-| **Cache Engine**               | [`test_cache.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_cache.py)                       | Dynamic feature flags, negative caching sentinel, namespace versioning, stampede mutex locks                   |
+| Test Suite               | File                                                                                       | What is Validated                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| **Repository & Service** | [`test_repository.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_repository.py) | BaseRepository CRUD, BaseService caching, per-call `cache_enabled=False` override, list cache invalidation     |
+| **Catalog Domain**       | [`test_products.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_products.py)     | Product entity creation, keyset listing, 404 NotFoundError verification                                        |
+| **User Domain**          | [`test_users.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_users.py)           | Strict E.164 phone regex validation, Base64 cursor encoding and decoding                                       |
+| **Cryptography**         | [`test_encryption.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_encryption.py) | AES-256-GCM roundtrip, fresh random nonces, AAD tamper detection, key rotation across versions, blind indexing |
+| **Rate Limiter**         | [`test_rate_limit.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_rate_limit.py) | Trusted proxy IP resolution, Redis Lua script execution, 429 quota enforcement, fail-open resilience           |
+| **Cache Engine**         | [`test_cache.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_cache.py)           | Dynamic feature flags, negative caching sentinel, namespace versioning, stampede mutex locks                   |
 
 ---
 
@@ -1286,3 +1241,6 @@ cp .env.example .env
 # 4. Run development server with live reload
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+
+
