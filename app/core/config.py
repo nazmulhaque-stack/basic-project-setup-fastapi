@@ -205,6 +205,17 @@ class Settings(BaseSettings):
         description="Number of log records batched per bulk indexing request",
     )
 
+    # Elasticsearch Host/Port/Scheme Individual Parameters
+    ELASTICSEARCH_HOST: Optional[str] = Field(default=None, description="Elasticsearch hostname")
+    ELASTICSEARCH_PORT: Optional[int] = Field(default=None, description="Elasticsearch port")
+    ELASTICSEARCH_SCHEME: Optional[str] = Field(default=None, description="Elasticsearch protocol (http or https)")
+
+    # Redis Individual Parameters
+    REDIS_HOST: Optional[str] = Field(default=None, description="Redis standalone host")
+    REDIS_PORT: Optional[int] = Field(default=None, description="Redis standalone port")
+    REDIS_USER: Optional[str] = Field(default=None, description="Redis username (Redis 6+ ACL)")
+    REDIS_DB: Optional[int] = Field(default=None, description="Redis DB index (0-15)")
+
     # Redis (Cluster 7 and Standalone)
     REDIS_URL: Optional[str] = Field(
         default=None,
@@ -270,8 +281,26 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def resolve_database_urls(self) -> "Settings":
-        """Dynamically synchronize DATABASE_URL with explicit DB_USER/DB_PASSWORD or POSTGRES credentials."""
+    def resolve_service_urls(self) -> "Settings":
+        """Dynamically synchronize DATABASE_URL, REDIS_URL, and ELASTICSEARCH_URL with individual credentials."""
+        # 1. Resolve Redis standalone URL if host is provided and REDIS_URL is not explicitly set
+        if self.REDIS_HOST and not self.REDIS_URL:
+            scheme = "rediss" if self.REDIS_SSL else "redis"
+            auth = ""
+            if self.REDIS_USER and self.REDIS_PASSWORD:
+                auth = f"{self.REDIS_USER}:{self.REDIS_PASSWORD}@"
+            elif self.REDIS_PASSWORD:
+                auth = f":{self.REDIS_PASSWORD}@"
+            port = self.REDIS_PORT or 6379
+            db = self.REDIS_DB or 0
+            self.REDIS_URL = f"{scheme}://{auth}{self.REDIS_HOST}:{port}/{db}"
+
+        # 2. Resolve Elasticsearch URL if host is provided
+        if self.ELASTICSEARCH_HOST:
+            scheme = self.ELASTICSEARCH_SCHEME or ("https" if self.ELASTICSEARCH_VERIFY_CERTS else "http")
+            port = self.ELASTICSEARCH_PORT or 9200
+            self.ELASTICSEARCH_URL = f"{scheme}://{self.ELASTICSEARCH_HOST}:{port}"
+
         user = self.DB_USER or self.POSTGRES_USER
         password = self.DB_PASSWORD or self.POSTGRES_PASSWORD
         host = self.DB_HOST or self.POSTGRES_HOST
