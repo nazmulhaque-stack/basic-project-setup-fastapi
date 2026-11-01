@@ -28,6 +28,16 @@ Comprehensive architectural execution trace and complete developer implementatio
      - [2.5.6 Step 5: Dynamic CRUDRouter & Custom Nested Endpoints](#256-step-5-dynamic-crudrouter--custom-nested-endpoints)
      - [2.5.7 Step 6: Database Migrations with Alembic](#257-step-6-database-migrations-with-alembic)
      - [2.5.8 Step 7: Testing Relationships & Preventing N+1 Regressions](#258-step-7-testing-relationships--preventing-n1-regressions)
+   - [2.6 Developer Guide: Building Service-to-Service Events with Kafka](#26-developer-guide-building-service-to-service-events-with-kafka)
+     - [2.6.1 Architecture Overview: Decoupled Choreography & Dual-Write Prevention](#261-architecture-overview-decoupled-choreography--dual-write-prevention)
+     - [2.6.2 Step 1: Define Typed CloudEvents Contracts (`app/kafka/events/`)](#262-step-1-define-typed-cloudevents-contracts-appkafkaevents)
+     - [2.6.3 Step 2: Atomic Dual-Write in Domain Service via Transactional Outbox](#263-step-2-atomic-dual-write-in-domain-service-via-transactional-outbox)
+     - [2.6.4 Step 3: Asynchronous Outbox Dispatching Mechanics](#264-step-3-asynchronous-outbox-dispatching-mechanics)
+     - [2.6.5 Step 4: Implementing the Consuming Service (`BaseConsumer`)](#265-step-4-implementing-the-consuming-service-baseconsumer)
+     - [2.6.6 Step 5: Implementing Consumer Idempotency (Deduplication)](#266-step-5-implementing-consumer-idempotency-deduplication)
+     - [2.6.7 Step 6: Error Handling, Retries & Dead Letter Queue (DLQ)](#267-step-6-error-handling-retries--dead-letter-queue-dlq)
+     - [2.6.8 Step 7: Registering Consumers in the Background Worker Daemon](#268-step-7-registering-consumers-in-the-background-worker-daemon)
+     - [2.6.9 Step 8: Writing Automated Tests for Kafka Events](#269-step-8-writing-automated-tests-for-kafka-events)
 3. **[Part 3: High-Performance Infrastructure & State Engines (Redis, Elasticsearch & Apache Kafka)](#part-3-high-performance-infrastructure--state-engines-redis-elasticsearch--apache-kafka)** — Deep mechanics of the caching, search, and streaming pipelines:
    - [3.1 Redis 7 Cluster Architecture & Workflows](#31-redis-7-cluster-architecture--workflows)
      - [3.1.1 Distributed Mutex Locking & Stampede Protection](#311-distributed-mutex-locking--stampede-protection)
@@ -1357,6 +1367,415 @@ async def test_product_category_inactive_rejected(async_session, mock_redis):
 
 
 ---
+
+
+---
+
+## 2.6 Developer Guide: Building Service-to-Service Events with Kafka
+
+This walkthrough guides developers through implementing end-to-end asynchronous service-to-service communication using Apache Kafka and the Transactional Outbox Pattern.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        SERVICE-TO-SERVICE EVENT-DRIVEN FLOW                            │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│   [Service A: Producer]                                                                │
+│      │                                                                                 │
+│      ├── 1. ACID Transaction (PostgreSQL via PgBouncer)                                │
+│      │      ├── Insert Domain Mutation (e.g. orders table)                             │
+│      │      └── Insert Outbox Record (outbox_events table)                             │
+│      ▼                                                                                 │
+│   [PostgreSQL 16 Engine] ◄─── Atomic Commit (Zero Phantom Events)                      │
+│      │                                                                                 │
+│      ▼ (Asynchronous Poll via SKIP LOCKED)                                             │
+│   [Outbox Dispatcher Daemon]                                                           │
+│      │                                                                                 │
+│      ├── 2. Publish with acks=all, gzip, partition key=aggregate_id                    │
+│      ▼                                                                                 │
+│   [Apache Kafka Cluster] (Topic: orders.events)                                        │
+│      │                                                                                 │
+│      ▼ (Consumer Group Partition Assignment)                                           │
+│   [Service B: Consumer Daemon] (`app.workers.main`)                                    │
+│      │                                                                                 │
+│      ├── 3. Strict Manual Commit Protocol:                                             │
+│      │      ├── A. Validate Schema (CloudEvents envelope)                              │
+│      │      ├── B. Check Idempotency (Deduplicate event_id)                            │
+│      │      ├── C. Execute Downstream Business Mutation (e.g. inventory)               │
+│      │      ├── D. Commit PostgreSQL Transaction FIRST                                 │
+│      │      └── E. Commit Kafka Partition Offset SECOND                                │
+│      │                                                                                 │
+│      └── 4. On Error:                                                                  │
+│             ├── Transient Error  ──► Exponential Backoff Retry (Max 3)                 │
+│             └── Permanent Error  ──► Escalate to Dead Letter Queue (`orders.events.DLQ`)│
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2.6.1 Architecture Overview: Decoupled Choreography & Dual-Write Prevention
+
+In microservice architectures, synchronous HTTP calls (`POST http://inventory-service/reserve`) between services cause tight coupling, cascading latency spikes, and distributed transaction failure when one service is down.
+
+#### The Dual-Write Hazard
+Directly publishing to Kafka inside an HTTP controller creates data inconsistencies:
+```python
+# ANTI-PATTERN: DO NOT DO THIS
+async def create_order(order_data):
+    await db.execute(insert(Order)...) # If this succeeds...
+    await kafka.publish("orders", order_data) # ...but this fails, event is permanently lost!
+```
+If the database commit succeeds but the Kafka broker is unreachable, downstream services never hear about the order. Conversely, if Kafka publishing succeeds but the database transaction rolls back due to a constraint violation, downstream services process a phantom event.
+
+#### The Solution: Transactional Outbox
+Every domain event is written to `outbox_events` **inside the same PostgreSQL transaction** as the entity mutation. The event is guaranteed to persist if and only if the business data persists. A background dispatcher subsequently streams the event to Kafka.
+
+---
+
+### 2.6.2 Step 1: Define Typed CloudEvents Contracts (`app/kafka/events/`)
+
+Never publish arbitrary dictionaries or raw domain models. Every event must adhere to a typed, versioned CloudEvents contract subclassing [`BaseEvent[PayloadT]`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/kafka/events/base.py).
+
+Create a new contract file: [`app/kafka/events/order_events.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/kafka/events/order_events.py):
+
+```python
+"""Order domain event schemas for Kafka streaming."""
+
+from typing import Optional
+from pydantic import BaseModel, Field
+
+from app.kafka.events.base import BaseEvent
+
+
+class OrderPlacedPayload(BaseModel):
+    order_id: str = Field(description="Unique Order UUID")
+    user_id: str = Field(description="Customer User UUID")
+    total_cents: int = Field(ge=0, description="Order total amount in integer cents")
+    item_count: int = Field(ge=1, description="Number of line items")
+    currency: str = Field(default="USD", max_length=3)
+
+
+class OrderPlacedEvent(BaseEvent[OrderPlacedPayload]):
+    """CloudEvents envelope for an order placed domain event."""
+
+    event_type: str = Field(default="order.placed.v1")
+
+
+class OrderCancelledPayload(BaseModel):
+    order_id: str
+    user_id: str
+    reason: str
+
+
+class OrderCancelledEvent(BaseEvent[OrderCancelledPayload]):
+    """CloudEvents envelope for an order cancellation domain event."""
+
+    event_type: str = Field(default="order.cancelled.v1")
+
+
+__all__ = [
+    "OrderPlacedPayload",
+    "OrderPlacedEvent",
+    "OrderCancelledPayload",
+    "OrderCancelledEvent",
+]
+```
+
+#### Contract Design Rules:
+1. **Schema Versioning**: Suffix the `event_type` with the schema version (e.g. `.v1`, `.v2`).
+2. **Minimal PII**: Never include sensitive unencrypted PII (credit cards, raw phone numbers, passwords) in event payloads. Use entity IDs or masked values.
+3. **Immutability**: Event payloads represent historical facts that have already occurred.
+
+---
+
+### 2.6.3 Step 2: Atomic Dual-Write in Domain Service via Transactional Outbox
+
+Inside the domain service, write the entity and the outbox event atomically within a single `AsyncSession.begin()` transaction context:
+
+```python
+import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.kafka.events.order_events import OrderPlacedEvent, OrderPlacedPayload
+from app.models.order import Order
+from app.models.outbox import OutboxEvent
+
+class OrderService:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def place_order(
+        self,
+        user_id: uuid.UUID,
+        total_cents: int,
+        item_count: int,
+        correlation_id: str | None = None,
+    ) -> Order:
+        order_id = uuid.uuid4()
+
+        async with self.session.begin():
+            # 1. Mutate Domain Entity in PostgreSQL
+            order = Order(
+                id=order_id,
+                user_id=user_id,
+                total_cents=total_cents,
+                status="pending",
+            )
+            self.session.add(order)
+            await self.session.flush()
+
+            # 2. Construct Typed CloudEvents Envelope
+            event = OrderPlacedEvent(
+                aggregate_id=str(order.id),
+                correlation_id=correlation_id,
+                payload=OrderPlacedPayload(
+                    order_id=str(order.id),
+                    user_id=str(order.user_id),
+                    total_cents=order.total_cents,
+                    item_count=item_count,
+                ),
+            )
+
+            # 3. Append to Transactional Outbox in the SAME Transaction
+            outbox_record = OutboxEvent(
+                topic="orders.events",
+                # The event_key MUST be the aggregate_id to guarantee Kafka partition ordering!
+                event_key=str(order.id),
+                event_type=event.event_type,
+                payload=event.model_dump(mode="json"),
+            )
+            self.session.add(outbox_record)
+
+        # Atomic Commit: If anything fails above, neither the order nor the outbox record is saved.
+        return order
+```
+
+---
+
+### 2.6.4 Step 3: Asynchronous Outbox Dispatching Mechanics
+
+The [`OutboxDispatcher`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/services/outbox.py) automatically streams committed outbox records to Kafka in the background.
+
+```python
+# Internal query executed by OutboxDispatcher:
+select(OutboxEvent)
+    .where(OutboxEvent.published_at.is_(None))
+    .where(~has_earlier_unpublished_event) # Guarantees FIFO per aggregate!
+    .order_by(OutboxEvent.created_at, OutboxEvent.id)
+    .limit(100)
+    .with_for_update(skip_locked=True)     # Concurrency-safe across multiple workers!
+```
+
+#### Key Guarantees:
+1. `skip_locked=True`: Enables multiple horizontal worker processes to poll the outbox concurrently without lock contention or duplicate publishing.
+2. `~has_earlier_unpublished_event`: Strict causal ordering per aggregate. A later event (e.g. `order.cancelled.v1`) will **never** be dispatched before an earlier event (e.g. `order.placed.v1`) for the same `event_key`.
+3. `event_key`: Published as the Kafka record key. Kafka routes all events with the same key to the same partition, guaranteeing in-order arrival at consumer partitions.
+
+---
+
+### 2.6.5 Step 4: Implementing the Consuming Service (`BaseConsumer`)
+
+Downstream services consume events by subclassing [`BaseConsumer`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/kafka/consumer.py).
+
+Create a consumer: [`app/workers/order_notification_consumer.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/workers/order_notification_consumer.py):
+
+```python
+"""Downstream consumer handling order events for notifications and inventory."""
+
+import logging
+from typing import Any
+from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+
+from app.kafka.consumer import BaseConsumer
+from app.kafka.events.order_events import OrderPlacedEvent
+from app.kafka.producer import KafkaProducerService
+
+logger = logging.getLogger("app.workers.order_notification")
+
+
+class OrderNotificationConsumer(BaseConsumer):
+    topic = "orders.events"
+    group_id = "notification-service-orders"
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        producer: KafkaProducerService,
+    ) -> None:
+        super().__init__(producer=producer)
+        self.session_factory = session_factory
+
+    async def process_event(
+        self,
+        event_id: str,
+        payload: dict[str, Any],
+        raw_message: Any,
+    ) -> None:
+        # 1. Validate incoming event against typed CloudEvents schema
+        event = OrderPlacedEvent.model_validate(raw_message.value)
+        order_id = event.payload.order_id
+
+        # 2. Execute downstream business logic within an ACID session
+        async with self.session_factory() as session:
+            async with session.begin():
+                # Step A: Check Idempotency (Deduplicate)
+                # (See Section 2.6.6 below)
+                
+                # Step B: Execute Downstream Mutation
+                logger.info(
+                    "Processing OrderPlacedEvent [event_id: %s] for order %s (total: $%0.2f)",
+                    event.event_id,
+                    order_id,
+                    event.payload.total_cents / 100.0,
+                )
+                # Downstream side-effects: Send email, reserve inventory, update analytics...
+
+        # Note: The Kafka Partition Offset is committed automatically by BaseConsumer
+        # ONLY AFTER process_event() returns successfully without raising an exception!
+```
+
+---
+
+### 2.6.6 Step 5: Implementing Consumer Idempotency (Deduplication)
+
+Kafka provides **at-least-once delivery**. A network blip during offset commit can cause Kafka to re-deliver the same event. Downstream consumers **must be idempotent**.
+
+#### Idempotency Pattern A: Database Unique Constraint (Recommended)
+Maintain a `processed_events` table in PostgreSQL:
+```sql
+CREATE TABLE processed_events (
+    event_id VARCHAR(64) NOT NULL,
+    consumer_group VARCHAR(128) NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (event_id, consumer_group)
+);
+```
+
+Check and record the event atomically inside the business transaction:
+```python
+from sqlalchemy.dialects.postgresql import insert
+
+async with session.begin():
+    # Insert with ON CONFLICT DO NOTHING
+    stmt = (
+        insert(ProcessedEvent)
+        .values(event_id=event.event_id, consumer_group=self.group_id)
+        .on_conflict_do_nothing(index_elements=["event_id", "consumer_group"])
+    )
+    result = await session.execute(stmt)
+    if result.rowcount == 0:
+        logger.warning("Event %s already processed; skipping duplicate.", event.event_id)
+        return  # Deduplicated!
+
+    # Execute business mutation...
+```
+
+#### Idempotency Pattern B: Natural Business State (Conditional Updates)
+If processing inventory hold:
+```sql
+UPDATE products 
+SET reserved_quantity = reserved_quantity + :qty 
+WHERE id = :product_id AND (stock - reserved_quantity) >= :qty;
+```
+
+---
+
+### 2.6.7 Step 6: Error Handling, Retries & Dead Letter Queue (DLQ)
+
+[`BaseConsumer`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/kafka/consumer.py) differentiates between **transient** and **permanent** failures:
+
+1. **Transient Errors** (PostgreSQL deadlock, connection timeout):
+   - Caught by `RetryPolicy`.
+   - Consumer pauses and retries processing up to `max_retries=3` times using exponential backoff (`delay = 2.0 * (2 ** attempt)`).
+   - If retries succeed, the offset commits normally.
+
+2. **Permanent Errors** (Pydantic `ValidationError`, malformed JSON, corrupted data):
+   - Retrying will never succeed and would stall partition processing indefinitely.
+   - Escalated immediately to [`DeadLetterQueueService`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/kafka/dlq.py).
+   - Routed to `{topic}.DLQ` (e.g. `orders.events.DLQ`) with diagnostic headers:
+     - `x-error-message`: Full string representation of the exception.
+     - `x-original-topic`: `orders.events`.
+     - `x-failed-timestamp`: ISO 8601 UTC timestamp.
+     - `x-retry-count`: Number of attempts before failure.
+   - The offset commits, unblocking the consumer partition. SREs can inspect and replay the DLQ topic.
+
+---
+
+### 2.6.8 Step 7: Registering Consumers in the Background Worker Daemon
+
+Register all microservice consumers inside [`app/workers/consumer_runner.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/workers/consumer_runner.py):
+
+```python
+class WorkerSupervisor:
+    async def run(self) -> None:
+        settings = get_settings()
+        if not settings.KAFKA_ENABLED:
+            logger.warning("KAFKA_ENABLED=false. Worker will idle.")
+            await self._stop_event.wait()
+            return
+
+        engine = create_db_engine()
+        session_factory = create_session_factory(engine)
+        producer = KafkaProducerService(settings=settings)
+        await producer.start()
+
+        # Instantiate consumers
+        order_consumer = OrderNotificationConsumer(
+            session_factory=session_factory,
+            producer=producer,
+        )
+
+        # Launch consumer tasks
+        tasks = [
+            asyncio.create_task(order_consumer.start()),
+        ]
+
+        logger.info("All background Kafka consumers started successfully.")
+        await self._stop_event.wait()
+
+        # Graceful shutdown
+        await order_consumer.stop()
+        await producer.stop()
+        await engine.dispose()
+```
+
+#### Running the Background Worker:
+In development or production:
+```bash
+python -m app.workers.main
+```
+
+---
+
+### 2.6.9 Step 8: Writing Automated Tests for Kafka Events
+
+Add automated unit and integration tests ([`tests/test_kafka_events.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_kafka_events.py)):
+
+```python
+import pytest
+from app.kafka.events.order_events import OrderPlacedEvent, OrderPlacedPayload
+
+def test_order_placed_event_serialization():
+    payload = OrderPlacedPayload(
+        order_id="11111111-1111-1111-1111-111111111111",
+        user_id="22222222-2222-2222-2222-222222222222",
+        total_cents=4999,
+        item_count=2,
+    )
+    event = OrderPlacedEvent(aggregate_id=payload.order_id, payload=payload)
+    
+    # 1. Verify CloudEvents Schema Envelope
+    data = event.model_dump(mode="json")
+    assert data["event_type"] == "order.placed.v1"
+    assert data["event_version"] == 1
+    assert data["payload"]["total_cents"] == 4999
+    assert data["payload"]["currency"] == "USD"
+
+    # 2. Verify Deserialization Roundtrip
+    parsed = OrderPlacedEvent.model_validate(data)
+    assert parsed.payload.order_id == payload.order_id
+    assert parsed.payload.item_count == 2
+```
 
 # Part 3: High-Performance Infrastructure & State Engines (Redis, Elasticsearch & Apache Kafka)
 
