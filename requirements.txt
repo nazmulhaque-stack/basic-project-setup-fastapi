@@ -4,6 +4,7 @@ gunicorn==23.0.0
 uvloop==0.21.0
 httptools==0.6.4
 sqlalchemy[asyncio]==2.0.38
+alembic>=1.14,<2.0
 asyncpg==0.30.0
 asyncmy==0.2.9
 redis==5.2.1

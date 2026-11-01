@@ -69,6 +69,22 @@ services:
       - internal_net
 
   # ----------------------------------------------------------------------------
+  # Apply database schema migrations before starting the API
+  # ----------------------------------------------------------------------------
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@postgres:5432/app_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal_net
+
+  # ----------------------------------------------------------------------------
   # Redis 7 Cluster (3 Master Nodes across Ports 7000, 7001, 7002)
   # ----------------------------------------------------------------------------
   redis-1:
@@ -255,6 +271,8 @@ services:
     depends_on:
       pgbouncer:
         condition: service_started
+      migrate:
+        condition: service_completed_successfully
       redis-cluster-init:
         condition: service_completed_successfully
       elasticsearch:

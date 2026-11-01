@@ -1215,7 +1215,7 @@ pytest -v
 
 ### Option 1: Docker Compose (Full Production Cluster)
 
-Starts PostgreSQL 16, PgBouncer (transaction mode), 3-node Redis 7 Cluster, FastAPI (Gunicorn), and Nginx:
+Starts PostgreSQL 16, applies Alembic migrations, then starts PgBouncer (transaction mode), 3-node Redis 7 Cluster, FastAPI (Gunicorn), and Nginx:
 
 ```bash
 cd deploy
@@ -1224,6 +1224,8 @@ docker-compose up --build -d
 # Verify container health
 docker-compose ps
 ```
+
+The one-shot `migrate` service creates or upgrades the PostgreSQL schema before the API starts. For manual migration workflows, run `alembic upgrade head` from the repository root with `MIGRATION_DATABASE_URL` configured.
 
 ### Option 2: Local Virtual Environment (Fast Dev Mode)
 
@@ -1241,5 +1243,4 @@ cp .env.example .env
 # 4. Run development server with live reload
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
-
 
