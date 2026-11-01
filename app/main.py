@@ -27,11 +27,7 @@ from fastapi.routing import APIRoute
 from redis.asyncio import Redis, RedisCluster
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.v1.categories import router as categories_router
 from app.api.v1.health import router as health_router
-from app.api.v1.logs import router as logs_router
-from app.api.v1.products import router as products_router
-from app.api.v1.users import router as users_router
 from app.api.v1.router import api_v1_router
 
 from app.core.config import get_settings
@@ -331,10 +327,4 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> ORJSO
 
 # Mount versioned API v1 router
 app.include_router(api_v1_router, prefix="/api/v1")
-
-# Mount root routers for direct access and backwards compatibility
-app.include_router(users_router)
-app.include_router(products_router)
-app.include_router(categories_router)
-app.include_router(logs_router)
 app.include_router(health_router)

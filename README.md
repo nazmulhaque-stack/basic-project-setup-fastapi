@@ -11,7 +11,7 @@ Production-grade, horizontally scalable, stateless FastAPI backend designed to s
 This repository is a real FastAPI backend project rather than a toy scaffold. The implementation is organized around a layered architecture:
 
 - [app/main.py](app/main.py): application bootstrap, lifespan lifecycle, structured logging, Redis startup, Elasticsearch startup, and rate-limiter initialization.
-- [app/api/v1](app/api/v1): domain API routes for users, products, categories, logs, and health checks. The routers are assembled through [app/api/v1/router.py](app/api/v1/router.py).
+- [app/api/v1](app/api/v1): versioned domain API routes for users, products, categories, and logs, assembled through [app/api/v1/router.py](app/api/v1/router.py). Health probes remain at `/healthz` and `/readyz` for proxy and deployment checks.
 - [app/api/crud_router.py](app/api/crud_router.py): generic CRUD endpoint generator for list/create/get/update/delete flows with filtering, sorting, and search integration.
 - [app/repositories/base.py](app/repositories/base.py): generic async repository layer with filter operators, protection for reserved fields, integrity handling, and pagination logic.
 - [app/services/base.py](app/services/base.py): generic service layer with Redis cache-aside logic, rate-limit hooks, and template-method flow for create/read/update/delete operations.
@@ -1241,6 +1241,5 @@ cp .env.example .env
 # 4. Run development server with live reload
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
-
 
 
