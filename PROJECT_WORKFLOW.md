@@ -31,7 +31,7 @@ Comprehensive architectural execution trace and complete developer implementatio
    - [2.6 Developer Guide: Building Service-to-Service Events with Kafka](#26-developer-guide-building-service-to-service-events-with-kafka)
      - [2.6.1 Architecture Overview: Decoupled Choreography & Dual-Write Prevention](#261-architecture-overview-decoupled-choreography--dual-write-prevention)
      - [2.6.2 Step 1: Define Typed CloudEvents Contracts (`app/kafka/events/`)](#262-step-1-define-typed-cloudevents-contracts-appkafkaevents)
-     - [2.6.3 Step 2: Atomic Dual-Write in Domain Service via Transactional Outbox](#263-step-2-atomic-dual-write-in-domain-service-via-transactional-outbox)
+     - [2.6.3 Step 2: Triggering Events in the Service Layer (Transactional Outbox)](#263-step-2-triggering-events-in-the-service-layer-transactional-outbox)
      - [2.6.4 Step 3: Asynchronous Outbox Dispatching Mechanics](#264-step-3-asynchronous-outbox-dispatching-mechanics)
      - [2.6.5 Step 4: Implementing the Consuming Service (`BaseConsumer`)](#265-step-4-implementing-the-consuming-service-baseconsumer)
      - [2.6.6 Step 5: Implementing Consumer Idempotency (Deduplication)](#266-step-5-implementing-consumer-idempotency-deduplication)
@@ -73,6 +73,12 @@ Comprehensive architectural execution trace and complete developer implementatio
    - [5.1 Host vs. Docker Networking & Port Matrix](#51-host-vs-docker-networking--port-matrix)
    - [5.2 Environment Variable Dictionary (`.env`)](#52-environment-variable-dictionary-env)
    - [5.3 Dynamic Service URL Assembly in Pydantic Settings](#53-dynamic-service-url-assembly-in-pydantic-settings)
+6. **[Part 6: Server Deployment & Production Operations Guide](#part-6-server-deployment--production-operations-guide)** — Running on self-managed Linux servers:
+   - [6.1 Linux Kernel & Socket OS Tuning (`sysctl.conf`)](#61-linux-kernel--socket-os-tuning-sysctlconf)
+   - [6.2 Option A: Containerized Server Deployment (Docker Compose)](#62-option-a-containerized-server-deployment-docker-compose)
+   - [6.3 Option B: Bare-Metal Production Deployment (Systemd + Gunicorn + Nginx)](#63-option-b-bare-metal-production-deployment-systemd--gunicorn--nginx)
+   - [6.4 Zero-Downtime Rolling Reloads & Worker Recycling](#64-zero-downtime-rolling-reloads--worker-recycling)
+   - [6.5 Production Day-2 Management & Observability](#65-production-day-2-management--observability)
 
 ---
 
@@ -1488,9 +1494,125 @@ __all__ = [
 
 ---
 
-### 2.6.3 Step 2: Atomic Dual-Write in Domain Service via Transactional Outbox
+### 2.6.3 Step 2: Triggering Events in the Service Layer (Transactional Outbox)
 
-Inside the domain service, write the entity and the outbox event atomically within a single `AsyncSession.begin()` transaction context:
+In this architecture, developers trigger events in the service layer using the **Transactional Outbox Pattern**. 
+
+Events are **never published directly to Kafka over the network inside an HTTP service method** (which causes data loss or phantom events if the database transaction fails). Instead, events are enqueued as rows in PostgreSQL's `outbox_events` table **in the same ACID transaction** as the business mutation.
+
+Developers trigger events inside the service layer using three standard patterns depending on the complexity of the domain operation:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        SERVICE LAYER EVENT TRIGGERING OPTIONS                          │
+├────────────────────────────────┬───────────────────────────────┬───────────────────────┤
+│ Pattern                        │ When to Use                   │ Code Invocation       │
+├────────────────────────────────┼───────────────────────────────┼───────────────────────┤
+│ 1. Automatic Lifecycle Events  │ Standard CRUD operations      │ Automatic in          │
+│    (`BaseService` Built-in)    │ (create, update, delete)      │ `service.create()`,etc│
+├────────────────────────────────┼───────────────────────────────┼───────────────────────┤
+│ 2. Domain Action Helper        │ Custom business methods on    │ `self._enqueue_outbox_│
+│    (`_enqueue_outbox_event`)   │ domain entities               │ event("action", item)`│
+├────────────────────────────────┼───────────────────────────────┼───────────────────────┤
+│ 3. Explicit CloudEvents Envelop│ Multi-service sagas, complex  │ Direct `session.add(  │
+│    (`OutboxEvent` Direct Add)  │ payloads with custom DTOs     │ OutboxEvent(...))`    │
+└────────────────────────────────┴───────────────────────────────┴───────────────────────┘
+```
+
+#### How Dependency Injection Injects Outbox Capabilities
+In [`app/api/deps.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/api/deps.py), the FastAPI dependency provider dynamically inspects the service constructor. When `KAFKA_ENABLED=true` in `.env`, it automatically injects:
+```python
+if "outbox_enabled" in init_sig.parameters:
+    kwargs["outbox_enabled"] = settings.KAFKA_ENABLED  # True when Kafka is enabled
+
+if "outbox_topic" in init_sig.parameters:
+    kwargs["outbox_topic"] = settings.KAFKA_EVENTS_TOPIC  # Default: "domain.events"
+```
+
+---
+
+#### Pattern 1: Automatic Lifecycle Event Triggering (CRUD in `BaseService`)
+
+For any entity extending [`BaseService`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/services/base.py) (like `UserService`, `ProductService`, or `CategoryService`), standard CRUD operations **automatically trigger events** without writing any extra code:
+
+- `service.create(payload)` ➔ Automatically emits `{resource_name}.created.v1`
+- `service.update_by_id(id, payload)` ➔ Automatically emits `{resource_name}.updated.v1`
+- `service.delete_by_id(id)` ➔ Automatically emits `{resource_name}.deleted.v1`
+
+**How it executes inside `BaseService.create()`**:
+```python
+# app/services/base.py
+async def create(self, payload: CreateSchemaType) -> ReadSchemaType:
+    entity = await self.before_create(payload)
+    await self.repo.create(entity)
+
+    # 1. Automatically stages the outbox event before commit:
+    self._enqueue_outbox_event("created", entity)
+
+    # 2. Both the entity and outbox event commit in the SAME transaction:
+    if self.db is not None:
+        await self.db.commit()
+
+    return await self.to_read_model(entity)
+```
+
+The underlying `_enqueue_outbox_event` helper stages the event:
+```python
+def _enqueue_outbox_event(self, action: str, entity: ModelType) -> None:
+    if not self.outbox_enabled or self.db is None:
+        return
+
+    entity_id = str(getattr(entity, self.id_col))
+    event_id = uuid.uuid4()
+    event_type = f"{self.resource_name.lower()}.{action}.v1"
+
+    self.db.add(
+        OutboxEvent(
+            id=event_id,
+            topic=self.outbox_topic,
+            event_key=entity_id,  # Aggregate ID (Kafka partition FIFO ordering)
+            event_type=event_type,
+            payload={
+                "event_id": str(event_id),
+                "event_type": event_type,
+                "aggregate_type": self.resource_name,
+                "aggregate_id": entity_id,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "data": {"id": entity_id},
+            },
+        )
+    )
+```
+
+---
+
+#### Pattern 2: Domain Action Helper (`self._enqueue_outbox_event`)
+
+When writing custom service methods that mutate state (such as adjusting inventory or toggling user status), call the inherited `self._enqueue_outbox_event(action_name, entity)` helper:
+
+```python
+# app/services/product.py
+class ProductService(BaseService[Product, ...]):
+
+    async def adjust_stock(self, product_id: uuid.UUID, delta: int) -> ProductRead:
+        async with self.db.begin():
+            # 1. Mutate domain entity
+            product = await self.repo.adjust_stock(product_id, delta)
+            if product is None:
+                raise NotFoundError(f"Product {product_id} not found")
+
+            # 2. Trigger custom domain event: "product.stock_adjusted.v1"
+            self._enqueue_outbox_event("stock_adjusted", product)
+
+        # 3. Atomic commit: Both stock update and outbox event commit together!
+        return await self.to_read_model(product)
+```
+
+---
+
+#### Pattern 3: Explicit CloudEvents Triggering (`OutboxEvent` Direct Addition)
+
+For inter-microservice workflows requiring rich, strongly-typed event contracts (e.g. `OrderPlacedEvent` with item counts and total amount):
 
 ```python
 import uuid
@@ -1501,8 +1623,9 @@ from app.models.order import Order
 from app.models.outbox import OutboxEvent
 
 class OrderService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, outbox_topic: str = "orders.events") -> None:
         self.session = session
+        self.outbox_topic = outbox_topic
 
     async def place_order(
         self,
@@ -1538,8 +1661,9 @@ class OrderService:
 
             # 3. Append to Transactional Outbox in the SAME Transaction
             outbox_record = OutboxEvent(
-                topic="orders.events",
-                # The event_key MUST be the aggregate_id to guarantee Kafka partition ordering!
+                id=uuid.UUID(event.event_id),
+                topic=self.outbox_topic,
+                # CRITICAL: event_key MUST be the aggregate_id to guarantee Kafka partition ordering!
                 event_key=str(order.id),
                 event_type=event.event_type,
                 payload=event.model_dump(mode="json"),
@@ -1549,6 +1673,28 @@ class OrderService:
         # Atomic Commit: If anything fails above, neither the order nor the outbox record is saved.
         return order
 ```
+
+#### What Happens After the Event is Triggered?
+
+```
+[Service Layer: self.db.add(outbox_event)]
+           │
+           ▼ (Committed into PostgreSQL `outbox_events` table)
+[PostgreSQL Database Engine]
+           │
+           ▼ (Background Poll via SELECT ... FOR UPDATE SKIP LOCKED)
+[OutboxDispatcher Daemon (`app/services/outbox.py`)]
+           │
+           ▼ (Kafka Publish with acks="all", gzip)
+[Apache Kafka Cluster: Topic `orders.events`]
+           │
+           ▼ (Partition assigned to consumer group)
+[Downstream Consumer (`BaseConsumer` in `python -m app.workers.main`)]
+```
+
+1. **Dispatcher Polling**: The background [`OutboxDispatcher`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/services/outbox.py) daemon polls uncompleted rows with `SELECT ... FOR UPDATE SKIP LOCKED`.
+2. **Order Preservation**: The query checks `~has_earlier_unpublished_event` so an update event is never published before a creation event for the same aggregate ID.
+3. **Kafka Delivery**: Dispatches to the Kafka topic with `acks="all"`. Once acknowledged by the Kafka quorum, marks `published_at = NOW()`.
 
 ---
 
@@ -1775,6 +1921,48 @@ def test_order_placed_event_serialization():
     parsed = OrderPlacedEvent.model_validate(data)
     assert parsed.payload.order_id == payload.order_id
     assert parsed.payload.item_count == 2
+
+
+#### Integration Test: Verifying Database Outbox Event Staging ([`tests/test_kafka_outbox.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/tests/test_kafka_outbox.py))
+
+```python
+import pytest
+from sqlalchemy import select
+from app.models.outbox import OutboxEvent
+from app.models.product import Product
+from app.repositories.product import ProductRepository
+from app.services.product import ProductService
+
+@pytest.mark.asyncio
+async def test_service_triggers_outbox_event(async_session, mock_redis):
+    # 1. Arrange: Initialize service with outbox enabled
+    repo = ProductRepository(async_session)
+    service = ProductService(
+        repo=repo,
+        cache=mock_redis,
+        db=async_session,
+        outbox_enabled=True,
+        outbox_topic="domain.events",
+    )
+
+    # 2. Act: Trigger custom business action
+    product = Product(name="Gaming Mouse", sku="MOU-01", price_cents=4999, stock=10)
+    async_session.add(product)
+    await async_session.commit()
+
+    await service.adjust_stock(product.id, delta=-2)
+
+    # 3. Assert: Verify the OutboxEvent row was added to PostgreSQL
+    stmt = select(OutboxEvent).where(
+        OutboxEvent.event_key == str(product.id),
+        OutboxEvent.event_type == "product.stock_adjusted.v1",
+    )
+    result = await async_session.execute(stmt)
+    outbox_event = result.scalar_one_or_none()
+
+    assert outbox_event is not None
+    assert outbox_event.topic == "domain.events"
+    assert outbox_event.published_at is None  # Awaiting background dispatcher
 ```
 
 # Part 3: High-Performance Infrastructure & State Engines (Redis, Elasticsearch & Apache Kafka)
@@ -2349,3 +2537,313 @@ In [`app/core/config.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app
 - If individual Redis parameters (`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`) are supplied and `REDIS_URL` is empty, `REDIS_URL` is automatically assembled.
 - If `ELASTICSEARCH_HOST` and `ELASTICSEARCH_PORT` are supplied, `ELASTICSEARCH_URL` is assembled accordingly.
 - This ensures full flexibility between local single-variable shell overrides, containerized deployments, and standard `.env` configuration files.
+
+
+---
+
+# Part 6: Server Deployment & Production Operations Guide
+
+This guide provides the complete operational blueprint for deploying, running, and scaling the FastAPI application on self-managed Linux servers (bare-metal, private cloud VMs, or dedicated hardware).
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        PRODUCTION HIGH-CONCURRENCY SERVER TOPOLOGY                     │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│   [Clients / Browsers / Mobile Apps]                                                   │
+│      │                                                                                 │
+│      ▼ (100,000+ Concurrent HTTPS Connections)                                         │
+│   [Edge Load Balancer / Nginx Reverse Proxy] (Port 80/443)                             │
+│      │                                                                                 │
+│      ├── TCP Upstream Connection Pool (Keepalive: 60s)                                 │
+│      ▼                                                                                 │
+│   [App Server 1..M] (Gunicorn + UvicornWorker on Port 8000)                            │
+│      ├── Worker Processes: 1 per CPU Core (uvloop + httptools)                         │
+│      ├── Memory Limits: Recycled every 10k requests (Anti-Fragmentation)               │
+│      ├── Heartbeats in RAM: `/dev/shm` (Zero Disk I/O)                                 │
+│      │                                                                                 │
+│      ├──► PgBouncer Transaction Pooler (Port 6432) ──► PostgreSQL 16 (Port 5432)       │
+│      ├──► Redis 7 Cluster (Ports 7000-7002)                                            │
+│      ├──► Elasticsearch 8 Cluster (Port 9200)                                          │
+│      └──► Apache Kafka Cluster (Port 9092)                                             │
+│                                                                                        │
+│   [Dedicated Background Worker Server] (`python -m app.workers.main`)                  │
+│      ├── Consumes Kafka Events (Inventory, Notifications, Domain Sagas)                │
+│      └── Dispatches PostgreSQL Outbox Events to Kafka Topics                           │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 6.1 Linux Kernel & Socket OS Tuning (`sysctl.conf`)
+
+By default, standard Linux operating systems limit socket backlogs to 128 and open file descriptors to 1024, causing `ECONNRESET`, `connection refused`, and `too many open files` errors under high load.
+
+Apply the kernel tuning profile from [`deploy/sysctl.conf`](file:///home/nazmul/Downloads/fastapi-repo-pattern/deploy/sysctl.conf):
+
+### Step 1: Apply Sysctl Socket Configuration
+Copy the configuration to `/etc/sysctl.d/99-high-concurrency.conf`:
+```bash
+sudo cp deploy/sysctl.conf /etc/sysctl.d/99-high-concurrency.conf
+sudo sysctl -p /etc/sysctl.d/99-high-concurrency.conf
+```
+
+#### Key Parameters Explained:
+- `net.core.somaxconn = 65535`: Expands the OS socket listen backlog from 128 to 65,535, preventing connection drops during traffic spikes.
+- `net.ipv4.tcp_max_syn_backlog = 65535`: Maximum queued connection requests awaiting handshake completion.
+- `net.ipv4.ip_local_port_range = 1024 65535`: Expands the outbound ephemeral port range to 64,511 available ports for reverse proxying.
+- `net.ipv4.tcp_tw_reuse = 1`: Reuses `TIME_WAIT` sockets safely for outgoing connections.
+- `net.ipv4.tcp_fin_timeout = 15`: Reclaims closed sockets in 15 seconds instead of 60.
+- `fs.file-max = 2097152`: Increases the system-wide file descriptor limit to 2+ million.
+
+### Step 2: Configure System-Wide File Descriptor Limits
+Edit `/etc/security/limits.conf` to allow worker processes to hold 1,000,000+ open descriptors:
+```ini
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+```
+
+---
+
+## 6.2 Option A: Containerized Server Deployment (Docker Compose)
+
+The fastest and most consistent way to deploy on a Linux server is using Docker Compose.
+
+### Step 1: Server Preparation & Repository Setup
+```bash
+# Clone the repository onto the server
+git clone https://github.com/your-org/fastapi-repo-pattern.git /opt/fastapi-app
+cd /opt/fastapi-app
+
+# Prepare production environment file
+cp .env.example .env
+chmod 600 .env  # Restrict permissions so only owner can read secrets
+```
+
+### Step 2: Configure Production Secrets in `.env`
+Edit `/opt/fastapi-app/.env` and configure real production credentials:
+- Set hardened `DB_PASSWORD`, `REDIS_PASSWORD`, `ELASTICSEARCH_PASSWORD`.
+- Generate secure 32-byte (64 hex character) encryption keys:
+  ```bash
+  # Generate AES-256-GCM encryption key
+  openssl rand -hex 32
+
+  # Generate HMAC-SHA256 blind index key
+  openssl rand -hex 32
+  ```
+- Configure `TRUSTED_PROXIES` with your load balancer or Nginx private IP addresses.
+
+### Step 3: Launch Services via Docker Compose
+```bash
+# Build and start all services in detached mode
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+### Step 4: Verify Database Health & Run Migrations
+```bash
+# Check database connectivity, tables, and migration version
+docker compose -f deploy/docker-compose.yml exec app python -m app.database status
+
+# Apply database migrations
+docker compose -f deploy/docker-compose.yml exec app python -m app.database migrate
+
+# Run initial seeders (idempotent, safe to run)
+docker compose -f deploy/docker-compose.yml exec app python -m app.database.seeders run
+```
+
+### Step 5: Scale Web Application Workers
+To handle heavier traffic, horizontally scale the FastAPI container instances behind the internal network:
+```bash
+docker compose -f deploy/docker-compose.yml up -d --scale app=4
+```
+
+### Step 6: Run the Dedicated Background Kafka Worker Daemon
+To run event consumers and the outbox dispatcher in a dedicated container:
+```bash
+docker compose -f deploy/docker-compose.yml exec -d app python -m app.workers.main
+```
+
+---
+
+## 6.3 Option B: Bare-Metal Production Deployment (Systemd + Gunicorn + Nginx)
+
+For maximum performance on dedicated Linux hardware, deploy natively using Systemd services to eliminate container virtualization overhead.
+
+### Step 1: Create Dedicated System User & Virtual Environment
+```bash
+# 1. Create dedicated system user
+sudo useradd -r -m -s /bin/bash -d /opt/fastapi fastapi
+
+# 2. Deploy codebase
+sudo cp -r /home/nazmul/Downloads/fastapi-repo-pattern/* /opt/fastapi/
+sudo chown -R fastapi:fastapi /opt/fastapi
+cd /opt/fastapi
+
+# 3. Create Python 3.12 virtual environment
+sudo -u fastapi python3.12 -m venv /opt/fastapi/venv
+sudo -u fastapi /opt/fastapi/venv/bin/pip install --upgrade pip
+sudo -u fastapi /opt/fastapi/venv/bin/pip install -r requirements.txt
+```
+
+### Step 2: Create Web Service Unit (`/etc/systemd/system/fastapi-app.service`)
+Create the systemd service for Gunicorn:
+```ini
+[Unit]
+Description=FastAPI High-Performance Production Web Service
+After=network.target postgresql.service pgbouncer.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=fastapi
+Group=fastapi
+WorkingDirectory=/opt/fastapi
+EnvironmentFile=/opt/fastapi/.env
+
+# Start Gunicorn with tuned production configuration
+ExecStart=/opt/fastapi/venv/bin/gunicorn -c deploy/gunicorn.conf.py app.main:app
+
+# Zero-downtime rolling reload on SIGHUP
+ExecReload=/bin/kill -s HUP $MAINPID
+
+# Process Lifecycle & Resilience
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+
+# File Descriptors & Memory
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Step 3: Create Background Worker Unit (`/etc/systemd/system/fastapi-worker.service`)
+Create the systemd service for Kafka event consumers and outbox dispatching:
+```ini
+[Unit]
+Description=FastAPI Kafka Event Consumer & Outbox Worker Daemon
+After=network.target fastapi-app.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fastapi
+Group=fastapi
+WorkingDirectory=/opt/fastapi
+EnvironmentFile=/opt/fastapi/.env
+
+# Execute standalone worker supervisor
+ExecStart=/opt/fastapi/venv/bin/python -m app.workers.main
+
+# Process Lifecycle
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Step 4: Configure Nginx Edge Reverse Proxy ([`deploy/nginx.conf`](file:///home/nazmul/Downloads/fastapi-repo-pattern/deploy/nginx.conf))
+Copy or link the Nginx configuration:
+```bash
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/fastapi.conf
+sudo ln -s /etc/nginx/sites-available/fastapi.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Step 5: Enable and Start Services
+```bash
+sudo systemctl daemon-reload
+
+# Enable auto-start on boot
+sudo systemctl enable fastapi-app
+sudo systemctl enable fastapi-worker
+
+# Start services
+sudo systemctl start fastapi-app
+sudo systemctl start fastapi-worker
+
+# Verify status
+sudo systemctl status fastapi-app
+sudo systemctl status fastapi-worker
+```
+
+---
+
+## 6.4 Zero-Downtime Rolling Reloads & Worker Recycling
+
+When deploying new code or updating `.env` secrets on a live server, client requests must not be dropped.
+
+### How Zero-Downtime Reloading Works:
+```bash
+# Gracefully reload the live Gunicorn master process
+sudo systemctl reload fastapi-app
+# (or kill -HUP <GUNICORN_MASTER_PID>)
+```
+
+#### What Gunicorn Does Under the Hood:
+1. The Gunicorn master process receives `SIGHUP`.
+2. It re-reads `deploy/gunicorn.conf.py` and application code, spawning a new generation of Uvicorn workers.
+3. The new workers bind to the existing listening socket and warm up.
+4. Once new workers report ready, the master sends `SIGTERM` to the old workers.
+5. Old workers finish servicing existing in-flight HTTP requests (`graceful_timeout=30s`) and terminate.
+6. **Result**: Zero dropped packets, zero 502 Bad Gateway responses, and continuous 100k throughput during deployment.
+
+### Worker Recycling (Anti-Fragmentation Defense):
+In [`deploy/gunicorn.conf.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/deploy/gunicorn.conf.py):
+- `max_requests = 10_000`
+- `max_requests_jitter = 1_000`
+Workers automatically restart after processing ~10,000 requests to reclaim memory fragmentation and prevent slow Python memory leaks. The randomized jitter prevents all workers from restarting at the exact same second.
+
+---
+
+## 6.5 Production Day-2 Management & Observability
+
+### 1. Health & Liveness Inspection
+Verify application state from the command line:
+```bash
+# Liveness Check (Kubernetes / Load Balancer ping)
+curl -i http://localhost:8000/livez
+# HTTP 200: {"status": "alive"}
+
+# Readiness Check (Validates PostgreSQL, Redis, Elasticsearch, Kafka)
+curl -i http://localhost:8000/readyz
+# HTTP 200: {"status": "ready", "components": {"database": "connected", "redis": "connected", "elasticsearch": "connected", "kafka": "connected"}}
+```
+
+### 2. Executing Schema Migrations in Production
+Database migrations should be run as a pre-deploy or post-deploy job:
+```bash
+# 1. Inspect current migration version
+python -m app.database status
+
+# 2. Run pending migrations safely (protected by PostgreSQL advisory lock)
+python -m app.database migrate
+```
+
+### 3. Log Stream Monitoring
+```bash
+# Follow live application logs in Systemd journal
+sudo journalctl -u fastapi-app -f --output=cat
+
+# Follow live background worker logs
+sudo journalctl -u fastapi-worker -f --output=cat
+```
+*Note: Structured JSON logs are automatically streamed to the Elasticsearch `app-logs` index for visualization in Kibana or querying via the Log Search API.*
+
+### 4. Monitoring Kafka Dead Letter Queue (DLQ)
+When a consumer encounters a corrupted payload or unrecoverable error, the message is routed to `{topic}.DLQ` (e.g. `orders.events.DLQ`).
+SREs inspect the DLQ topic to diagnose failed events:
+```bash
+# Read failed messages from Dead Letter Queue
+docker compose -f deploy/docker-compose.yml exec kafka /opt/kafka/bin/kafka-console-consumer.sh   --bootstrap-server localhost:9092   --topic orders.events.DLQ   --from-beginning   --property print.headers=true
+```

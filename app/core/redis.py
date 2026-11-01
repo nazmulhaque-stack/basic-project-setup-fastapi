@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import orjson
 from redis.asyncio import ConnectionPool, Redis, RedisCluster
 from redis.asyncio.cluster import ClusterNode
-from redis.exceptions import ConnectionError as RedisConnError, RedisClusterException, RedisError, TimeoutError as RedisTimeoutError
+from redis.exceptions import AuthenticationError, ConnectionError as RedisConnError, RedisClusterException, RedisError, TimeoutError as RedisTimeoutError
 
 from app.core.config import Settings, get_settings
 
@@ -64,10 +64,11 @@ async def create_redis_client(
 
     # 2. Redis 7 Cluster via REDIS_CLUSTER_NODES
     startup_nodes = [ClusterNode(host=h, port=p) for h, p in cfg.parsed_redis_nodes]
+    redis_password = cfg.REDIS_PASSWORD or None
     try:
         cluster_client = RedisCluster(
             startup_nodes=startup_nodes,
-            password=cfg.REDIS_PASSWORD or None,
+            password=redis_password,
             socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
             socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
             decode_responses=False,
@@ -75,23 +76,54 @@ async def create_redis_client(
         await cluster_client.ping()
         logger.info("Connected to Redis 7 Cluster with %d startup nodes", len(startup_nodes))
         return cluster_client
+    except AuthenticationError as auth_err:
+        if redis_password and "without any password configured" in str(auth_err).lower():
+            logger.warning("Redis Cluster has no password configured; retrying connection without password.")
+            cluster_client = RedisCluster(
+                startup_nodes=startup_nodes,
+                password=None,
+                socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
+                decode_responses=False,
+            )
+            await cluster_client.ping()
+            logger.info("Connected to Redis 7 Cluster without authentication")
+            return cluster_client
+        raise
     except (RedisClusterException, RedisError, OSError) as exc:
         logger.warning(
             "Redis Cluster mode failed or inactive (%s). Falling back to standalone connection.",
             exc,
         )
         first_host, first_port = cfg.parsed_redis_nodes[0]
-        pool = ConnectionPool(
-            host=first_host,
-            port=first_port,
-            password=cfg.REDIS_PASSWORD or None,
-            max_connections=cfg.REDIS_MAX_CONNECTIONS,
-            socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
-            socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
-            decode_responses=False,
-        )
-        standalone = Redis(connection_pool=pool)
-        await standalone.ping()
+        try:
+            pool = ConnectionPool(
+                host=first_host,
+                port=first_port,
+                password=redis_password,
+                max_connections=cfg.REDIS_MAX_CONNECTIONS,
+                socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
+                decode_responses=False,
+            )
+            standalone = Redis(connection_pool=pool)
+            await standalone.ping()
+        except AuthenticationError as auth_err:
+            if redis_password and "without any password configured" in str(auth_err).lower():
+                logger.warning("Standalone Redis has no password configured; retrying connection without password.")
+                pool = ConnectionPool(
+                    host=first_host,
+                    port=first_port,
+                    password=None,
+                    max_connections=cfg.REDIS_MAX_CONNECTIONS,
+                    socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
+                    socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
+                    decode_responses=False,
+                )
+                standalone = Redis(connection_pool=pool)
+                await standalone.ping()
+            else:
+                raise
         logger.info("Connected to standalone fallback Redis at %s:%d", first_host, first_port)
         return standalone
 

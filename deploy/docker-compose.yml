@@ -298,8 +298,10 @@ services:
       - ../.env
     environment:
       DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-postgrespassword}@pgbouncer:5432/${DB_NAME:-app_db}
+      DB_HOST: pgbouncer
+      DB_PORT: 5432
       REDIS_CLUSTER_NODES: ${DOCKER_REDIS_CLUSTER_NODES:-redis-1:7000,redis-2:7001,redis-3:7002}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-redispassword}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ELASTICSEARCH_URL: ${DOCKER_ELASTICSEARCH_URL:-http://elasticsearch:9200}
       ELASTICSEARCH_USERNAME: ${ELASTICSEARCH_USERNAME:-elastic}
       ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD:-elasticpassword}

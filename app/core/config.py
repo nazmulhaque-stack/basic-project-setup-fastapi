@@ -313,8 +313,21 @@ class Settings(BaseSettings):
                 url = make_url(self.DATABASE_URL)
                 new_user = user if user is not None else url.username
                 new_password = password if password is not None else url.password
-                new_host = host if host is not None else url.host
-                new_port = port if port is not None else url.port
+                if host is not None:
+                    if url.host and url.host not in ("127.0.0.1", "localhost") and host in ("127.0.0.1", "localhost"):
+                        new_host = url.host
+                    else:
+                        new_host = host
+                else:
+                    new_host = url.host
+
+                if port is not None:
+                    if url.host and url.host not in ("127.0.0.1", "localhost") and host in ("127.0.0.1", "localhost"):
+                        new_port = url.port
+                    else:
+                        new_port = port
+                else:
+                    new_port = url.port
                 new_database = db_name if db_name is not None else url.database
 
                 updated_url = url.set(
