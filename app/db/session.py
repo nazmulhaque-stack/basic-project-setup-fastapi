@@ -6,6 +6,7 @@ Provides NullPool and statement_cache_size=0 options for 100k-scale PgBouncer po
 
 from collections.abc import AsyncGenerator
 from typing import Any, Dict
+import uuid
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -34,6 +35,8 @@ def create_db_engine(custom_settings: Settings = settings) -> AsyncEngine:
             connect_args.update({
                 "statement_cache_size": 0,
                 "prepared_statement_cache_size": 0,
+                # Prevent name collisions when PgBouncer reuses backend connections.
+                "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4().hex}__",
             })
             engine_kwargs["poolclass"] = NullPool
         else:

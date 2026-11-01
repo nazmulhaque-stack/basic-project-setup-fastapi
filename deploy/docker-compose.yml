@@ -41,12 +41,13 @@ services:
   # PgBouncer 1.21+ Transaction Pooling Layer
   # ----------------------------------------------------------------------------
   pgbouncer:
-    image: edoburu/pgbouncer:v1.21.0
+    image: edoburu/pgbouncer:1.21.0-p2
     container_name: demo_pgbouncer
     restart: unless-stopped
     environment:
       DB_USER: postgres
       DB_PASSWORD: postgrespassword
+      AUTH_TYPE: scram-sha-256
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: app_db
@@ -74,7 +75,12 @@ services:
     image: redis:7-alpine
     container_name: demo_redis_1
     restart: unless-stopped
-    command: ["redis-server", "--port", "7000", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--appendonly", "yes", "--protected-mode", "no"]
+    command: ["redis-server", "--port", "7000", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-hostname", "redis-1", "--cluster-preferred-endpoint-type", "hostname", "--appendonly", "yes", "--protected-mode", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7000", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
     networks:
       - internal_net
 
@@ -82,7 +88,12 @@ services:
     image: redis:7-alpine
     container_name: demo_redis_2
     restart: unless-stopped
-    command: ["redis-server", "--port", "7001", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--appendonly", "yes", "--protected-mode", "no"]
+    command: ["redis-server", "--port", "7001", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-hostname", "redis-2", "--cluster-preferred-endpoint-type", "hostname", "--appendonly", "yes", "--protected-mode", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7001", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
     networks:
       - internal_net
 
@@ -90,7 +101,12 @@ services:
     image: redis:7-alpine
     container_name: demo_redis_3
     restart: unless-stopped
-    command: ["redis-server", "--port", "7002", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--appendonly", "yes", "--protected-mode", "no"]
+    command: ["redis-server", "--port", "7002", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-hostname", "redis-3", "--cluster-preferred-endpoint-type", "hostname", "--appendonly", "yes", "--protected-mode", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7002", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
     networks:
       - internal_net
 
@@ -98,16 +114,108 @@ services:
     image: redis:7-alpine
     container_name: demo_redis_cluster_init
     depends_on:
-      - redis-1
-      - redis-2
-      - redis-3
+      redis-1:
+        condition: service_healthy
+      redis-2:
+        condition: service_healthy
+      redis-3:
+        condition: service_healthy
     networks:
       - internal_net
     entrypoint: >
       /bin/sh -c "
-      sleep 3;
-      echo 'yes' | redis-cli --cluster create redis-1:7000 redis-2:7001 redis-3:7002 --cluster-replicas 0;
-      exit 0;
+      set -eu;
+      for node in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+        set -- $$node;
+        attempt=0;
+        until redis-cli -h \"$$1\" -p \"$$2\" ping >/dev/null 2>&1; do
+          attempt=$$((attempt + 1));
+          if [ \"$$attempt\" -ge 30 ]; then
+            echo \"Redis node $$1:$$2 is unreachable after 30 seconds; refusing to inspect or reset cluster state.\" >&2;
+            exit 1;
+          fi;
+          sleep 1;
+        done;
+      done;
+      all_ok=1;
+      for node in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+        set -- $$node;
+        state=$$(redis-cli -h \"$$1\" -p \"$$2\" cluster info | sed -n 's/^cluster_state://p' | tr -d '\\r');
+        if [ \"$$state\" != 'ok' ]; then all_ok=0; fi;
+      done;
+      if [ \"$$all_ok\" = '1' ]; then
+        echo 'Redis Cluster is already initialized and healthy.';
+        exit 0;
+      fi;
+      fresh=1;
+      for node in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+        set -- $$node;
+        info=$$(redis-cli -h \"$$1\" -p \"$$2\" cluster info);
+        known=$$(printf '%s\\n' \"$$info\" | sed -n 's/^cluster_known_nodes://p' | tr -d '\\r');
+        assigned=$$(printf '%s\\n' \"$$info\" | sed -n 's/^cluster_slots_assigned://p' | tr -d '\\r');
+        if [ \"$$known\" != '1' ] || [ \"$$assigned\" != '0' ]; then fresh=0; fi;
+      done;
+      if [ \"$$fresh\" = '1' ]; then
+        echo 'Creating a new Redis Cluster.';
+        echo 'yes' | redis-cli --cluster create redis-1:7000 redis-2:7001 redis-3:7002 --cluster-replicas 0;
+      else
+        echo 'Existing Redis cluster metadata detected; refreshing known peer addresses.';
+        for node in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+          set -- $$node;
+          source_service=$$1;
+          source_port=$$2;
+          source_nodes=$$(redis-cli -h \"$$source_service\" -p \"$$source_port\" cluster nodes);
+          for peer in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+            set -- $$peer;
+            target_service=$$1;
+            target_port=$$2;
+            if [ \"$$target_service\" != \"$$source_service\" ]; then
+              target_id=$$(redis-cli -h \"$$target_service\" -p \"$$target_port\" cluster myid);
+              if ! printf '%s\\n' \"$$source_nodes\" | grep -q \"^$$target_id \"; then
+                echo \"Redis node $$source_service does not recognize expected peer $$target_service; refusing to merge unrelated cluster state.\" >&2;
+                exit 1;
+              fi;
+            fi;
+          done;
+        done;
+        for node in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+          set -- $$node;
+          source_service=$$1;
+          source_port=$$2;
+          for peer in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+            set -- $$peer;
+            target_service=$$1;
+            target_port=$$2;
+            if [ \"$$target_service\" != \"$$source_service\" ]; then
+              target_ip=$$(getent hosts \"$$target_service\" | awk 'NR == 1 { print $$1; exit }');
+              if [ -z \"$$target_ip\" ]; then
+                echo \"Could not resolve Redis peer $$target_service; refusing to change cluster state.\" >&2;
+                exit 1;
+              fi;
+              redis-cli -h \"$$source_service\" -p \"$$source_port\" cluster meet \"$$target_ip\" \"$$target_port\";
+            fi;
+          done;
+        done;
+      fi;
+      state=fail;
+      attempt=0;
+      while [ \"$$attempt\" -lt 60 ]; do
+        all_ok=1;
+        for node in 'redis-1 7000' 'redis-2 7001' 'redis-3 7002'; do
+          set -- $$node;
+          state=$$(redis-cli -h \"$$1\" -p \"$$2\" cluster info | sed -n 's/^cluster_state://p' | tr -d '\\r');
+          if [ \"$$state\" != 'ok' ]; then all_ok=0; fi;
+        done;
+        if [ \"$$all_ok\" = '1' ]; then
+          echo 'Redis Cluster is healthy; all slots are assigned.';
+          exit 0;
+        fi;
+        sleep 1;
+        attempt=$$((attempt + 1));
+      done;
+      echo 'Redis Cluster did not become healthy within 60 seconds; refusing to reset existing cluster data.' >&2;
+      redis-cli -h redis-1 -p 7000 cluster nodes >&2;
+      exit 1;
       "
 
   # ----------------------------------------------------------------------------
@@ -145,9 +253,12 @@ services:
       WEB_CONCURRENCY: 4
       GUNICORN_BIND: 0.0.0.0:8000
     depends_on:
-      - pgbouncer
-      - redis-cluster-init
-      - elasticsearch
+      pgbouncer:
+        condition: service_started
+      redis-cluster-init:
+        condition: service_completed_successfully
+      elasticsearch:
+        condition: service_started
     networks:
       - internal_net
 

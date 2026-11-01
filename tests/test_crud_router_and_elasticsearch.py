@@ -1,7 +1,7 @@
 """Comprehensive test suite for CRUDRouter, Elasticsearch CQRS, and PgBouncer integration."""
 
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy.pool import NullPool
@@ -200,14 +200,28 @@ async def test_category_service_crud_lifecycle() -> None:
     mock_es.delete_document.assert_awaited_once()
 
 
-def test_pgbouncer_nullpool_configuration() -> None:
+def test_pgbouncer_nullpool_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies that engine applies NullPool and disables statement caching when PgBouncer is enabled."""
     settings = Settings(
         PGBOUNCER_ENABLED=True,
         DATABASE_URL="postgresql+asyncpg://user:pass@127.0.0.1:6432/demo_db",
     )
+    import app.db.session as db_session
+
+    engine_kwargs: Dict[str, Any] = {}
+    original_create_async_engine = db_session.create_async_engine
+
+    def capture_engine_kwargs(url: Any, **kwargs: Any) -> Any:
+        engine_kwargs.update(kwargs)
+        return original_create_async_engine(url, **kwargs)
+
+    monkeypatch.setattr(db_session, "create_async_engine", capture_engine_kwargs)
     engine = create_db_engine(settings)
     assert isinstance(engine.pool, NullPool)
+    connect_args = engine_kwargs["connect_args"]
+    assert connect_args["statement_cache_size"] == 0
+    assert connect_args["prepared_statement_cache_size"] == 0
+    assert callable(connect_args["prepared_statement_name_func"])
 
 
 def test_partial_schema_generated_from_create_schema() -> None:
@@ -350,4 +364,3 @@ async def test_service_rule_with_mocked_repository() -> None:
         await service.create(payload)
 
     service.repository.create.assert_not_awaited()
-
