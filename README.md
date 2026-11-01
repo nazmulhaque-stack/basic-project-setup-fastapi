@@ -17,6 +17,7 @@ This repository is a real FastAPI backend project rather than a toy scaffold. Th
 - [app/services/base.py](app/services/base.py): generic service layer with Redis cache-aside logic, rate-limit hooks, and template-method flow for create/read/update/delete operations.
 - [app/models](app/models): declarative SQLAlchemy models for users, products, categories, and related entities.
 - [app/core/config.py](app/core/config.py) and [app/db/session.py](app/db/session.py): environment-driven settings, async DB engine creation, and connection tuning for PostgreSQL/PgBouncer.
+- [app/core/kafka.py](app/core/kafka.py) and [app/services/outbox.py](app/services/outbox.py): asynchronous Kafka publishing/consuming and transactional outbox dispatch for service-to-service domain events.
 - [app/core/security.py](app/core/security.py): AES-256-GCM encryption, key rotation helpers, masking utilities, and blind-index support for PII fields.
 
 ### Reality check from the current codebase
@@ -28,13 +29,21 @@ This repository is a real FastAPI backend project rather than a toy scaffold. Th
 
 ### Validation status
 
-I verified the repository by running the project test suite in the current environment.
+The current test result is maintained by running `pytest -q`; the earlier 58-test snapshot predates Kafka inventory consumption and database initialization.
 
-- Initial execution failed because the environment was missing the Python package `aiosqlite`.
-- After installing the project dependencies from [requirements.txt](requirements.txt), the suite passed successfully.
-- Result: 58 passed in 0.77s.
+### Kafka service-to-service events
 
-This means the repository is currently in a healthy state from a code-and-test perspective.
+When `KAFKA_ENABLED=true`, create/update/delete operations write a versioned event envelope to `outbox_events` in the same PostgreSQL transaction as the domain mutation. The background dispatcher publishes committed rows to `KAFKA_EVENTS_TOPIC`, keyed by aggregate ID; it will not publish a later event for an aggregate while an earlier event remains unpublished. Delivery is at least once: downstream consumers should deduplicate using `event_id` and make handlers idempotent. Event payloads contain the entity ID only; do not add PII without an explicit event-contract and privacy review.
+
+`app.core.kafka.consume_events()` provides the async consumer primitive for additional topics. It commits each record only after its handler succeeds and seeks back to a failed record so a later offset cannot skip it. The API's inventory reservation handler is wired separately below.
+
+### Inventory reservation consumer
+
+With `KAFKA_ENABLED=true`, the API also consumes `KAFKA_INVENTORY_TOPIC` (`inventory.events` by default) in its dedicated `KAFKA_INVENTORY_CONSUMER_GROUP`. It handles `inventory.reserved.v1` events containing `event_id`, `event_type`, `timestamp`, and a payload with `reservation_id`, `order_id`, `product_id`, `quantity`, and `ttl_minutes`; `location_id` is optional metadata in this global-inventory setup. `product_id` may be a product UUID or SKU.
+
+Reservations run in a PostgreSQL transaction and are idempotent by event and reservation ID. `products.stock` remains physical on-hand inventory, `reserved_quantity` tracks holds, and `available_quantity` is on-hand minus active reservations. Conditional database updates prevent overselling. Insufficient stock creates an idempotent rejection record and an `inventory.reservation_failed.v1` outbox event. Invalid payloads and unknown products are sent to `KAFKA_INVENTORY_DLQ_TOPIC`; the latter is logged at critical severity. A background sweeper releases expired holds and writes `inventory.reservation_expired.v1` events through the outbox. Consumer offsets advance only after the handler succeeds.
+
+The Compose Kafka broker is for local development. For production, provision durable replicated topics, broker authentication/TLS, monitoring, and a multi-broker cluster. This consumer currently handles reservation and TTL expiry; finalization/cancellation lifecycle events need their event contract and handlers before they can safely adjust on-hand inventory.
 
 ## 📑 Table of Contents
 
@@ -1215,7 +1224,7 @@ pytest -v
 
 ### Option 1: Docker Compose (Full Production Cluster)
 
-Starts PostgreSQL 16, applies Alembic migrations, then starts PgBouncer (transaction mode), 3-node Redis 7 Cluster, FastAPI (Gunicorn), and Nginx:
+Starts PostgreSQL 16, applies Alembic migrations, then starts PgBouncer (transaction mode), 3-node Redis 7 Cluster, Kafka, FastAPI (Gunicorn), Elasticsearch, and Nginx:
 
 ```bash
 cd deploy
@@ -1226,6 +1235,58 @@ docker-compose ps
 ```
 
 The one-shot `migrate` service creates or upgrades the PostgreSQL schema before the API starts. For manual migration workflows, run `alembic upgrade head` from the repository root with `MIGRATION_DATABASE_URL` configured.
+
+### Database initialization, migrations, and seeders
+
+Automatic initialization is opt-in. `AUTO_MIGRATE`, `AUTO_CREATE_TABLES`, and `AUTO_SEED` all default to `false`. Startup checks database connectivity and reports missing registered tables; it does not generate migrations or create schema unless explicitly enabled. Set `MIGRATION_DATABASE_URL` to a direct database connection when applying migrations, especially when the application URL goes through PgBouncer.
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `DATABASE_URL` | project async PostgreSQL URL | Application connection URL. PostgreSQL uses `asyncpg`, MySQL uses `asyncmy`, and SQLite uses `aiosqlite`. Common `mysql+pymysql://...` URLs are normalized to the supported async driver. |
+| `MIGRATION_DATABASE_URL` | unset | Optional direct URL used by Alembic and the migration CLI; falls back to `DATABASE_URL`. |
+| `ENVIRONMENT` | `development` | Environment label for deployment configuration. |
+| `AUTO_MIGRATE` | `false` | Applies existing Alembic revisions at startup. Never generates revisions. |
+| `AUTO_CREATE_TABLES` | `false` | Creates only missing metadata tables for an unmanaged development/test database. It refuses to bypass an existing `alembic_version` history. |
+| `AUTO_SEED` | `false` | Runs registered idempotent seeders after the schema is ready. |
+| `SEED_CATEGORIES` | `[]` | Optional JSON list of category names for the safe reference-data example seeder. Existing rows are not updated. No demo users/accounts or RBAC tables are seeded. |
+
+Production deployments should use the existing one-shot Compose migration job or a dedicated deployment job rather than enabling `AUTO_MIGRATE` in each API worker. PostgreSQL and MySQL migrations acquire a database-level lock, so concurrent CLI/startup migration attempts serialize; the one-shot deployment job remains preferred. Automatic initialization never drops tables or downgrades migrations. `create_all()` only runs when explicitly enabled and is not a substitute for Alembic. A database bootstrapped with `create-tables` is unmanaged and has no Alembic revision recorded; do not later run migrations against it without reviewing and explicitly baselining that schema.
+
+```bash
+# Inspect connectivity, tables, and migration state
+python -m app.database status
+python -m app.database check
+
+# Create missing tables only for an unmanaged development/test schema
+python -m app.database create-tables
+
+# Apply existing migrations, create an autogenerate revision, or roll back explicitly
+python -m app.database migrate
+python -m app.database revision "add product index"
+python -m app.database rollback
+python -m app.database history
+
+# List registered seeders, run all, or run one seeder and its dependencies
+python -m app.database seed list
+python -m app.database seed
+python -m app.database seed category_seeder
+python -m app.database seed run category_seeder
+```
+
+Equivalent direct Alembic commands are supported:
+
+```bash
+alembic revision --autogenerate -m "create users table"
+alembic upgrade head
+alembic downgrade -1
+alembic current
+alembic history
+alembic revision -m "custom migration"
+```
+
+Seeders run in a single transaction, in dependency order, behind a database lock on PostgreSQL/MySQL. Implementations must insert only missing records and must not commit the session themselves. The included `category_seeder` reads `SEED_CATEGORIES`; it is empty by default and never overwrites existing categories. No development users, passwords, role/permission catalog, or demo accounts are inserted. A failing seeder rolls back the seeding transaction.
+
+If tables are absent, `python -m app.database check` and `status` print the missing table list and remediation commands. For Alembic-managed databases, always use `python -m app.database migrate`; `create-tables` intentionally refuses to alter migration history.
 
 ### Option 2: Local Virtual Environment (Fast Dev Mode)
 
@@ -1243,4 +1304,3 @@ cp .env.example .env
 # 4. Run development server with live reload
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
-

@@ -3,8 +3,7 @@
 from datetime import datetime
 import uuid
 
-from sqlalchemy import DateTime, MetaData, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import DateTime, MetaData, Uuid, func
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -38,7 +37,7 @@ class IdUuidMixin:
     """UUID primary key mixin."""
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
         sort_order=-100,

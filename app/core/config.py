@@ -44,7 +44,31 @@ class Settings(BaseSettings):
     # PostgreSQL / PgBouncer Connection & Pooling
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://postgres:postgres@127.0.0.1:6432/app_db",
-        description="Asyncpg database URL pointing to PgBouncer transaction pooler",
+        description="Async database URL using asyncpg, asyncmy, or aiosqlite",
+    )
+    MIGRATION_DATABASE_URL: Optional[str] = Field(
+        default=None,
+        description="Optional direct database URL for Alembic migrations, bypassing PgBouncer",
+    )
+    ENVIRONMENT: str = Field(
+        default="development",
+        description="Deployment environment name, e.g. development, testing, or production",
+    )
+    AUTO_MIGRATE: bool = Field(
+        default=False,
+        description="Apply existing Alembic migrations during application startup",
+    )
+    AUTO_CREATE_TABLES: bool = Field(
+        default=False,
+        description="Create missing metadata tables for explicit development/testing bootstrap",
+    )
+    AUTO_SEED: bool = Field(
+        default=False,
+        description="Run registered idempotent database seeders during startup",
+    )
+    SEED_CATEGORIES: str = Field(
+        default="[]",
+        description="Optional JSON array of category names for the safe reference seeder",
     )
     PGBOUNCER_ENABLED: bool = Field(
         default=True,
@@ -72,6 +96,39 @@ class Settings(BaseSettings):
         default=100,
         description="Maximum allowed items per paginated page",
     )
+
+    # Kafka event integration
+    KAFKA_ENABLED: bool = Field(
+        default=False,
+        description="Enables the Kafka producer and transactional outbox dispatcher",
+    )
+    KAFKA_BOOTSTRAP_SERVERS: str = Field(
+        default="127.0.0.1:9092",
+        description="Comma-separated Kafka bootstrap broker addresses",
+    )
+    KAFKA_EVENTS_TOPIC: str = Field(
+        default="domain.events",
+        description="Topic for versioned domain event envelopes",
+    )
+    KAFKA_CONSUMER_GROUP: str = Field(
+        default="highperf-fastapi",
+        description="Default Kafka consumer group for service consumers",
+    )
+    KAFKA_INVENTORY_TOPIC: str = Field(
+        default="inventory.events",
+        description="Inbound topic containing inventory reservation requests",
+    )
+    KAFKA_INVENTORY_CONSUMER_GROUP: str = Field(
+        default="highperf-inventory",
+        description="Consumer group that owns inventory reservation processing",
+    )
+    KAFKA_INVENTORY_DLQ_TOPIC: str = Field(
+        default="inventory.events.dlq",
+        description="Dead-letter topic for invalid inventory reservation events",
+    )
+    INVENTORY_RESERVATION_SWEEP_INTERVAL: float = Field(default=30.0, gt=0)
+    OUTBOX_POLL_INTERVAL: float = Field(default=1.0, gt=0)
+    OUTBOX_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
 
     # Elasticsearch 8 Log & Search Engine
     ELASTICSEARCH_ENABLED: bool = Field(

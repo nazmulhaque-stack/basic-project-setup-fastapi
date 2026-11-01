@@ -82,6 +82,12 @@ def provide(service_cls: type[ServiceT], cache_prefix: Optional[str] = None) -> 
         if "elasticsearch" in init_sig.parameters:
             kwargs["elasticsearch"] = es
 
+        if "outbox_enabled" in init_sig.parameters:
+            kwargs["outbox_enabled"] = settings.KAFKA_ENABLED
+
+        if "outbox_topic" in init_sig.parameters:
+            kwargs["outbox_topic"] = settings.KAFKA_EVENTS_TOPIC
+
         return service_cls(**kwargs)
 
     _provider.__name__ = f"get_{service_cls.__name__.lower()}"

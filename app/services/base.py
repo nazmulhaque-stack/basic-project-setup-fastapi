@@ -43,6 +43,7 @@ import orjson
 from pydantic import BaseModel
 from redis.asyncio import Redis, RedisCluster
 from redis.exceptions import RedisError
+from sqlalchemy import Uuid
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +51,7 @@ from app.core.config import CacheOperationFlags, Settings, get_settings
 from app.core.elasticsearch import IElasticsearchService, NullElasticsearch
 from app.core.exceptions import ConflictError, NotFoundError
 from app.models.base import Base
+from app.models.outbox import OutboxEvent
 from app.repositories.interface import IBaseRepository
 from app.schemas.base import decode_cursor, encode_cursor
 from app.services.interface import IBaseService, ICacheService, NullCache
@@ -437,6 +439,8 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         id_col: str = "id",
         db: Optional[AsyncSession] = None,
         session: Optional[AsyncSession] = None,
+        outbox_enabled: bool = False,
+        outbox_topic: str = "domain.events",
     ) -> None:
         self.repo: IBaseRepository[ModelType, IdType] = repo
         self.repository: IBaseRepository[ModelType, IdType] = repo
@@ -453,6 +457,8 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         self.es: IElasticsearchService = self.elasticsearch
         self.order_col: str = order_col
         self.id_col: str = id_col
+        self.outbox_enabled = outbox_enabled
+        self.outbox_topic = outbox_topic
 
     @property
     def resource_name(self) -> str:
@@ -471,8 +477,13 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         """
         data: Dict[str, Any] = payload.model_dump()
         entity: ModelType = self.repo.model(**data)
-        if hasattr(entity, "id") and getattr(entity, "id", None) is None:
-            setattr(entity, "id", uuid.uuid4())
+        id_column = self.repo.model.__table__.c.get(self.id_col)
+        if (
+            id_column is not None
+            and isinstance(id_column.type, Uuid)
+            and getattr(entity, self.id_col, None) is None
+        ):
+            setattr(entity, self.id_col, uuid.uuid4())
         if hasattr(entity, "created_at") and getattr(entity, "created_at", None) is None:
             setattr(entity, "created_at", datetime.now(timezone.utc))
         return entity
@@ -508,6 +519,33 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         read_model: ReadSchemaType = await self.to_read_schema(entity)
         return read_model.model_dump(mode="json")
 
+    def _enqueue_outbox_event(self, action: str, entity: ModelType) -> None:
+        """Adds a non-sensitive event envelope to the current DB transaction."""
+        if not self.outbox_enabled:
+            return
+        if self.db is None:
+            raise RuntimeError("Kafka outbox events require an active database session.")
+
+        entity_id = str(getattr(entity, self.id_col))
+        event_id = uuid.uuid4()
+        event_type = f"{self.resource_name.lower()}.{action}.v1"
+        self.db.add(
+            OutboxEvent(
+                id=event_id,
+                topic=self.outbox_topic,
+                event_key=entity_id,
+                event_type=event_type,
+                payload={
+                    "event_id": str(event_id),
+                    "event_type": event_type,
+                    "aggregate_type": self.resource_name,
+                    "aggregate_id": entity_id,
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                    "data": {"id": entity_id},
+                },
+            )
+        )
+
     # --------------------------------------------------------------------------
     # Generic CRUD Operations
     # --------------------------------------------------------------------------
@@ -521,6 +559,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         entity: ModelType = await self.before_create(payload)
         try:
             await self.repo.create(entity)
+            self._enqueue_outbox_event("created", entity)
             await self.cache.invalidate_lists(enabled=cache_enabled)
             if self.db is not None:
                 await self.db.commit()
@@ -609,6 +648,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 await self.repo.update(entity)
             else:
                 await self.repo.flush()
+            self._enqueue_outbox_event("updated", entity)
 
             # Invalidate item and list caches polymorphically
             await self.cache.delete_item(entity_id, enabled=cache_enabled)
@@ -658,6 +698,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
 
         await self.before_delete(entity)
         await self.repo.delete(entity)
+        self._enqueue_outbox_event("deleted", entity)
 
         # Invalidate item and list caches polymorphically
         await self.cache.delete_item(entity_id, enabled=cache_enabled)

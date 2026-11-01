@@ -26,6 +26,8 @@ class CategoryService(BaseService[Category, CategoryCreate, CategoryUpdate, Cate
         repo: Optional[CategoryRepository] = None,
         cache: Optional[ICacheService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
+        outbox_enabled: bool = False,
+        outbox_topic: str = "domain.events",
     ) -> None:
         resolved_repo: CategoryRepository
         if repo is not None:
@@ -43,6 +45,8 @@ class CategoryService(BaseService[Category, CategoryCreate, CategoryUpdate, Cate
             order_col="created_at",
             id_col="id",
             db=db,
+            outbox_enabled=outbox_enabled,
+            outbox_topic=outbox_topic,
         )
         self.repository: CategoryRepository = resolved_repo
 

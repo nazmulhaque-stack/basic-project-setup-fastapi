@@ -25,7 +25,10 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
         """
         stmt = (
             update(Product)
-            .where(Product.id == product_id, Product.stock + delta >= 0)
+            .where(
+                Product.id == product_id,
+                Product.stock + delta >= Product.reserved_quantity,
+            )
             .values(stock=Product.stock + delta)
             .execution_options(synchronize_session=False)
         )
@@ -36,8 +39,14 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
         """Fetches active products with inventory stock under or equal to threshold."""
         stmt = (
             select(Product)
-            .where(Product.is_active.is_(True), Product.stock <= threshold)
-            .order_by(Product.stock.asc(), Product.id.asc())
+            .where(
+                Product.is_active.is_(True),
+                Product.stock - Product.reserved_quantity <= threshold,
+            )
+            .order_by(
+                (Product.stock - Product.reserved_quantity).asc(),
+                Product.id.asc(),
+            )
             .limit(limit)
         )
         return (await self.db.scalars(stmt)).all()
@@ -49,4 +58,3 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
 
 
 __all__ = ["ProductRepository"]
-

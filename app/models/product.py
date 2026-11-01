@@ -8,8 +8,17 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Uuid,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -24,7 +33,7 @@ class Product(Base):
     __tablename__ = "products"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
         nullable=False,
@@ -78,6 +87,18 @@ class Product(Base):
         default=0,
     )
 
+    reserved_quantity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+    @property
+    def available_quantity(self) -> int:
+        """Quantity available to promise while preserving physical on-hand stock."""
+        return (self.stock or 0) - (self.reserved_quantity or 0)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -94,8 +115,11 @@ class Product(Base):
     __table_args__ = (
         # Composite index for O(log N) keyset pagination
         Index("ix_products_created_at_id", "created_at", "id"),
+        CheckConstraint(
+            "reserved_quantity >= 0 AND reserved_quantity <= stock",
+            name="reserved_quantity_lte_stock",
+        ),
     )
 
     def __repr__(self) -> str:
         return f"<Product id={self.id} sku={self.sku} name={self.name}>"
-

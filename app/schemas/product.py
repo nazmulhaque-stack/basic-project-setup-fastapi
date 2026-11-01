@@ -16,7 +16,7 @@ class ProductBase(BaseModel):
     category: str = Field(default="general", min_length=1, max_length=100, description="Product category")
     category_id: Optional[int] = Field(default=None, description="Optional foreign key to categories table")
     is_active: bool = Field(default=True, description="Whether product is active for purchase")
-    stock: int = Field(default=0, ge=0, description="Available inventory stock units")
+    stock: int = Field(default=0, ge=0, description="Physical on-hand inventory units")
 
     @field_validator("sku")
     @classmethod
@@ -54,7 +54,9 @@ class ProductRead(BaseModel):
     category: str
     category_id: Optional[int] = None
     is_active: bool
-    stock: int = 0
+    stock: int = Field(default=0, description="Physical on-hand inventory units")
+    reserved_quantity: int = Field(default=0, description="Units held by active reservations")
+    available_quantity: int = Field(default=0, description="On-hand units not currently reserved")
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -63,6 +65,11 @@ class ProductRead(BaseModel):
     @field_validator("stock", mode="before")
     @classmethod
     def coerce_stock(cls, v: Any) -> int:
+        return 0 if v is None else v
+
+    @field_validator("reserved_quantity", mode="before")
+    @classmethod
+    def coerce_reserved_quantity(cls, v: Any) -> int:
         return 0 if v is None else v
 
 

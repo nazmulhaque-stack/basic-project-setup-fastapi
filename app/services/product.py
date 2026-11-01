@@ -29,6 +29,8 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         repo: Optional[ProductRepository] = None,
         cache: Optional[ICacheService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
+        outbox_enabled: bool = False,
+        outbox_topic: str = "domain.events",
     ) -> None:
         resolved_repo: ProductRepository
         if repo is not None:
@@ -46,6 +48,8 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
             order_col="created_at",
             id_col="id",
             db=db,
+            outbox_enabled=outbox_enabled,
+            outbox_topic=outbox_topic,
         )
         self.repository: ProductRepository = resolved_repo
 
@@ -73,6 +77,13 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
 
     async def before_update(self, entity: Product, payload: ProductUpdate) -> None:
         """Enforces unique SKU and active category validation if changed during partial update."""
+        if (
+            payload.stock is not None
+            and payload.stock < (entity.reserved_quantity or 0)
+        ):
+            raise BusinessRuleError(
+                "On-hand stock cannot be reduced below the quantity already reserved."
+            )
         if payload.sku is not None:
             existing = await self.repository.get_by_sku(payload.sku)
             if existing is not None and str(existing.id) != str(entity.id):
@@ -103,6 +114,7 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         if not success:
             raise BusinessRuleError(f"Not enough stock to remove {-delta} unit(s).")
 
+        self._enqueue_outbox_event("stock_adjusted", product)
         if self.db is not None:
             await self.db.commit()
             await self.db.refresh(product)

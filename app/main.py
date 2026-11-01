@@ -15,7 +15,7 @@ Architecture & Principles:
 from contextlib import asynccontextmanager
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 import sys
 import time
 import uuid
@@ -31,6 +31,7 @@ from app.api.v1.health import router as health_router
 from app.api.v1.router import api_v1_router
 
 from app.core.config import get_settings
+from app.core.kafka import KafkaEventProducer, consume_events_forever
 from app.core.elasticsearch import (
     AsyncElasticsearchService,
     IElasticsearchService,
@@ -47,8 +48,14 @@ from app.core.logging import (
 )
 from app.core.redis import close_redis_client, create_redis_client
 from app.core.security import CryptoService
+from app.database.initialization import initialize_database
 from app.db.session import create_db_engine, create_session_factory
 from app.schemas.base import ErrorDetail, ErrorResponse
+from app.services.outbox import OutboxDispatcher
+from app.services.inventory_reservations import (
+    handle_inventory_reserved,
+    run_expiration_sweeper,
+)
 from app.services.redis_rate_limit import RATE_LIMIT_LUA_SCRIPT
 
 # Setup structured application logging
@@ -74,6 +81,61 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     session_factory = create_session_factory(engine)
     app.state.engine = engine
     app.state.session_factory = session_factory
+    try:
+        await initialize_database(engine, session_factory, settings)
+    except Exception:
+        await engine.dispose()
+        raise
+
+    kafka_producer: Optional[KafkaEventProducer] = None
+    outbox_dispatcher: Optional[OutboxDispatcher] = None
+    inventory_consumer_stop: Optional[asyncio.Event] = None
+    inventory_consumer_task: Optional[asyncio.Task[None]] = None
+    reservation_sweeper_task: Optional[asyncio.Task[None]] = None
+    if settings.KAFKA_ENABLED:
+        kafka_producer = KafkaEventProducer(settings.KAFKA_BOOTSTRAP_SERVERS)
+        await kafka_producer.start()
+        outbox_dispatcher = OutboxDispatcher(
+            session_factory,
+            kafka_producer,
+            poll_interval=settings.OUTBOX_POLL_INTERVAL,
+            batch_size=settings.OUTBOX_BATCH_SIZE,
+        )
+        outbox_dispatcher.start()
+        inventory_consumer_stop = asyncio.Event()
+
+        async def handle_inventory_event(event: dict[str, Any]) -> None:
+            await handle_inventory_reserved(
+                event,
+                session_factory,
+                kafka_producer,
+                output_topic=settings.KAFKA_EVENTS_TOPIC,
+                dead_letter_topic=settings.KAFKA_INVENTORY_DLQ_TOPIC,
+            )
+
+        inventory_consumer_task = asyncio.create_task(
+            consume_events_forever(
+                bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
+                topics=[settings.KAFKA_INVENTORY_TOPIC],
+                group_id=settings.KAFKA_INVENTORY_CONSUMER_GROUP,
+                handler=handle_inventory_event,
+                stop_event=inventory_consumer_stop,
+            ),
+            name="kafka-inventory-reservation-consumer",
+        )
+        reservation_sweeper_task = asyncio.create_task(
+            run_expiration_sweeper(
+                session_factory,
+                settings.KAFKA_EVENTS_TOPIC,
+                interval=settings.INVENTORY_RESERVATION_SWEEP_INTERVAL,
+                stop_event=inventory_consumer_stop,
+            ),
+            name="inventory-reservation-expiration-sweeper",
+        )
+        app.state.kafka_producer = kafka_producer
+        app.state.outbox_dispatcher = outbox_dispatcher
+        app.state.inventory_consumer_task = inventory_consumer_task
+        app.state.reservation_sweeper_task = reservation_sweeper_task
 
     # 2. Initialize Redis Client via Centralized Factory (Standalone & Cluster with pooling)
     redis_client = await create_redis_client(settings)
@@ -135,6 +197,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Graceful Shutdown
     logger.info("Closing application resources...")
+    if inventory_consumer_stop is not None:
+        inventory_consumer_stop.set()
+    if inventory_consumer_task is not None:
+        await inventory_consumer_task
+    if reservation_sweeper_task is not None:
+        await reservation_sweeper_task
+    if outbox_dispatcher is not None:
+        await outbox_dispatcher.stop()
+    if kafka_producer is not None:
+        await kafka_producer.stop()
+
     if log_buffer is not None:
         try:
             await log_buffer.stop()

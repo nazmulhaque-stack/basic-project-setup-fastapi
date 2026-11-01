@@ -12,8 +12,7 @@ Design Rules:
 from datetime import datetime
 import uuid
 
-from sqlalchemy import DateTime, Index, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import DateTime, Index, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -26,7 +25,7 @@ class User(Base):
 
     # Client-generated UUIDv4: needed so ID is known before insert for AAD binding
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
         nullable=False,

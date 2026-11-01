@@ -32,6 +32,8 @@ class UserService(BaseService[User, UserCreate, UserUpdate, UserRead, uuid.UUID]
         cache: Optional[ICacheService] = None,
         crypto: Optional[CryptoService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
+        outbox_enabled: bool = False,
+        outbox_topic: str = "domain.events",
     ) -> None:
         resolved_repo: UserRepository
         if repo is not None:
@@ -49,6 +51,8 @@ class UserService(BaseService[User, UserCreate, UserUpdate, UserRead, uuid.UUID]
             order_col="created_at",
             id_col="id",
             db=db,
+            outbox_enabled=outbox_enabled,
+            outbox_topic=outbox_topic,
         )
         self.repository: UserRepository = resolved_repo
         self.crypto: Optional[CryptoService] = crypto
