@@ -8,7 +8,7 @@ from app.database.seeders.registry import get_registered_seeders, order_seeders
 
 def load_seeders() -> None:
     """Import built-in seeder modules so their explicit registrations run."""
-    from app.database.seeders import category_seeder  # noqa: F401
+    from app.database.seeders import category_seeder, user_seeder  # noqa: F401
 
 
 async def run_seeders(

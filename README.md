@@ -1286,6 +1286,27 @@ alembic revision -m "custom migration"
 
 Seeders run in a single transaction, in dependency order, behind a database lock on PostgreSQL/MySQL. Implementations must insert only missing records and must not commit the session themselves. The included `category_seeder` reads `SEED_CATEGORIES`; it is empty by default and never overwrites existing categories. No development users, passwords, role/permission catalog, or demo accounts are inserted. A failing seeder rolls back the seeding transaction.
 
+#### Standalone Seeder CLI
+
+```bash
+# List all registered seeders in topological dependency order
+python -m app.database.seeders list
+
+# Run all seeders
+python -m app.database.seeders run
+
+# Run a specific seeder (e.g. user_seeder, category_seeder)
+python -m app.database.seeders run user_seeder
+```
+
+#### Dedicated Worker Mode (Worker-Only Deployment)
+
+Run background consumers, inventory sweepers, and the outbox dispatcher outside web API pods:
+
+```bash
+python -m app.workers.main
+```
+
 If tables are absent, `python -m app.database check` and `status` print the missing table list and remediation commands. For Alembic-managed databases, always use `python -m app.database migrate`; `create-tables` intentionally refuses to alter migration history.
 
 ### Option 2: Local Virtual Environment (Fast Dev Mode)

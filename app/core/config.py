@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # PostgreSQL / PgBouncer Connection & Pooling
+    # Database Credentials & Individual Connection Parameters
+    DB_USER: Optional[str] = Field(default=None, description="Database username")
+    DB_PASSWORD: Optional[str] = Field(default=None, description="Database password")
+    DB_HOST: Optional[str] = Field(default=None, description="Database host")
+    DB_PORT: Optional[int] = Field(default=None, description="Database port")
+    DB_NAME: Optional[str] = Field(default=None, description="Database name")
+
+    POSTGRES_USER: Optional[str] = Field(default=None, description="PostgreSQL username alias")
+    POSTGRES_PASSWORD: Optional[str] = Field(default=None, description="PostgreSQL password alias")
+    POSTGRES_HOST: Optional[str] = Field(default=None, description="PostgreSQL host alias")
+    POSTGRES_PORT: Optional[int] = Field(default=None, description="PostgreSQL port alias")
+    POSTGRES_DB: Optional[str] = Field(default=None, description="PostgreSQL database name alias")
+
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://postgres:postgres@127.0.0.1:6432/app_db",
         description="Async database URL using asyncpg, asyncmy, or aiosqlite",
@@ -255,6 +268,45 @@ class Settings(BaseSettings):
         default="127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
         description="Comma-separated CIDRs or IPs of trusted reverse proxies",
     )
+
+    @model_validator(mode="after")
+    def resolve_database_urls(self) -> "Settings":
+        """Dynamically synchronize DATABASE_URL with explicit DB_USER/DB_PASSWORD or POSTGRES credentials."""
+        user = self.DB_USER or self.POSTGRES_USER
+        password = self.DB_PASSWORD or self.POSTGRES_PASSWORD
+        host = self.DB_HOST or self.POSTGRES_HOST
+        port = self.DB_PORT or self.POSTGRES_PORT
+        db_name = self.DB_NAME or self.POSTGRES_DB
+
+        if user or password or host or port or db_name:
+            try:
+                from sqlalchemy.engine import make_url
+                url = make_url(self.DATABASE_URL)
+                new_user = user if user is not None else url.username
+                new_password = password if password is not None else url.password
+                new_host = host if host is not None else url.host
+                new_port = port if port is not None else url.port
+                new_database = db_name if db_name is not None else url.database
+
+                updated_url = url.set(
+                    username=new_user,
+                    password=new_password,
+                    host=new_host,
+                    port=new_port,
+                    database=new_database,
+                )
+                self.DATABASE_URL = updated_url.render_as_string(hide_password=False)
+
+                if self.MIGRATION_DATABASE_URL:
+                    mig_url = make_url(self.MIGRATION_DATABASE_URL)
+                    mig_updated = mig_url.set(
+                        username=user if user is not None else mig_url.username,
+                        password=password if password is not None else mig_url.password,
+                    )
+                    self.MIGRATION_DATABASE_URL = mig_updated.render_as_string(hide_password=False)
+            except Exception:
+                pass
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

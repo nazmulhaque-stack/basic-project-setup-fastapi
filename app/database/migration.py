@@ -5,8 +5,16 @@ import os
 from pathlib import Path
 from typing import Iterator
 
-from alembic import command
-from alembic.config import Config
+try:
+    from alembic import command
+    from alembic.config import Config
+except ImportError as exc:
+    raise RuntimeError(
+        "Alembic is unavailable in the active Python environment. Install project "
+        "dependencies with `python -m pip install -r requirements.txt` using the "
+        "same interpreter that runs this command. If the dependency is missing, "
+        "the repository's alembic/ directory may shadow the Alembic package."
+    ) from exc
 
 from app.db.session import normalize_async_database_url
 

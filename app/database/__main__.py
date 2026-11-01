@@ -13,12 +13,6 @@ from app.database.initialization import (
     create_missing_tables,
     get_missing_tables,
 )
-from app.database.migration import (
-    create_revision,
-    downgrade_database,
-    show_history,
-    upgrade_database,
-)
 from app.database.seeders.runner import load_seeders, run_seeders
 from app.database.seeders.registry import get_registered_seeders
 from app.db.session import create_db_engine, create_session_factory
@@ -158,27 +152,43 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "seed":
             return asyncio.run(_seed(args.seed_args))
         if args.command == "migrate":
+            from app.database.migration import upgrade_database
+
             print("[INFO] Applying Alembic migrations...")
             upgrade_database(migration_url)
             print("[SUCCESS] Database is up to date.")
             return 0
         if args.command == "rollback":
+            from app.database.migration import downgrade_database
+
             print(f"[INFO] Rolling back migration {args.revision}...")
             downgrade_database(migration_url, args.revision)
             print("[SUCCESS] Migration rollback completed.")
             return 0
         if args.command == "revision":
+            from app.database.migration import create_revision
+
             message = " ".join(args.message)
             create_revision(migration_url, message)
             print(f"[SUCCESS] Created migration revision: {message}")
             return 0
         if args.command == "history":
+            from app.database.migration import show_history
+
             show_history(migration_url)
             return 0
         parser.error(f"Unsupported command: {args.command}")
     except Exception as exc:
         logger.exception("Database command failed.")
-        print(f"[ERROR] {exc}", file=sys.stderr)
+        msg = str(exc)
+        if "SASL authentication failed" in msg or "password authentication failed" in msg:
+            print(
+                "[ERROR] Database authentication failed (SASL / invalid password or user).\n"
+                "Please check DB_USER and DB_PASSWORD (or DATABASE_URL) in your .env file.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
     return 2
 
