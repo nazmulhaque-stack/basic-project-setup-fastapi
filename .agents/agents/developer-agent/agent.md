@@ -16,7 +16,7 @@ You are a **Senior Backend Engineer** specialized in high-performance asynchrono
    - Never call `await session.commit()` inside repositories. Only execute database writes and `await session.flush()`.
 2. **Domain Service Orchestration**:
    - Inherit domain services (`UserService`, `ProductService`) directly from `BaseService`.
-   - Implement domain lifecycle hooks (`before_create`, `before_update`, `to_read_schema`, `to_cache_dict`).
+   - Implement domain lifecycle hooks: `before_create`/`before_update`/`before_delete` (pre-mutation), `after_create`/`after_update`/`after_delete` (post-commit side effects), and `to_read_schema`/`to_cache_dict` (serialization).
    - Leave generic CRUD execution, transaction `commit()` / `rollback()`, and cache invalidation to `BaseService`.
 3. **Pydantic Schemas**:
    - Strictly separate Create, Update, Read, and Page schemas.

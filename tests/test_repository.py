@@ -315,3 +315,77 @@ async def test_user_service_crud_pattern_methods(
     assert deleted is True
 
 
+@pytest.mark.asyncio
+async def test_base_service_after_hooks_fire_after_commit() -> None:
+    """Verifies after_create/after_update/after_delete fire exactly once, after the
+    transaction commits, with the expected entity (and payload for after_update)."""
+    from app.models.product import Product
+    from app.repositories.product import ProductRepository
+    from app.schemas.product import ProductCreate, ProductRead, ProductUpdate
+
+    events: list[str] = []
+
+    mock_session: AsyncMock = AsyncMock()
+    mock_session.commit = AsyncMock(side_effect=lambda: events.append("commit"))
+
+    mock_product_repo: MagicMock = MagicMock(spec=ProductRepository)
+    mock_product_repo.model = Product
+    mock_product_repo.session = mock_session
+    mock_product_repo.create = AsyncMock(side_effect=lambda entity: events.append("repo.create"))
+
+    class TrackedProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductRead, uuid.UUID]):
+        def __init__(self) -> None:
+            super().__init__(repo=mock_product_repo, read_schema_cls=ProductRead, db=mock_session)
+            self.after_create_calls: list[Product] = []
+            self.after_update_calls: list[tuple[Product, ProductUpdate]] = []
+            self.after_delete_calls: list[Product] = []
+
+        async def after_create(self, entity: Product) -> None:
+            events.append("after_create")
+            self.after_create_calls.append(entity)
+
+        async def after_update(self, entity: Product, payload: ProductUpdate) -> None:
+            events.append("after_update")
+            self.after_update_calls.append((entity, payload))
+
+        async def after_delete(self, entity: Product) -> None:
+            events.append("after_delete")
+            self.after_delete_calls.append(entity)
+
+    service: TrackedProductService = TrackedProductService()
+
+    # --- create() ---
+    created: ProductRead = await service.create(
+        ProductCreate(name="Hook Widget", sku="HOOK-1", price_cents=500)
+    )
+    assert len(service.after_create_calls) == 1
+    assert service.after_create_calls[0].name == "Hook Widget"
+    assert events == ["repo.create", "commit", "after_create"]
+
+    # --- update() ---
+    existing: Product = Product(
+        id=uuid.uuid4(), name="Hook Widget", sku="HOOK-1", price_cents=500,
+        category="general", is_active=True, created_at=datetime.now(timezone.utc),
+    )
+    events.clear()
+    mock_product_repo.get = AsyncMock(return_value=existing)
+    mock_product_repo.update = AsyncMock(side_effect=lambda entity: events.append("repo.update"))
+    update_payload = ProductUpdate(price_cents=999)
+    await service.update(existing.id, update_payload)
+    assert len(service.after_update_calls) == 1
+    updated_entity, received_payload = service.after_update_calls[0]
+    assert updated_entity is existing
+    assert received_payload is update_payload
+    assert events == ["repo.update", "commit", "after_update"]
+
+    # --- delete() ---
+    events.clear()
+    mock_product_repo.get = AsyncMock(return_value=existing)
+    mock_product_repo.delete = AsyncMock(side_effect=lambda entity: events.append("repo.delete"))
+    deleted: bool = await service.delete(existing.id)
+    assert deleted is True
+    assert len(service.after_delete_calls) == 1
+    assert service.after_delete_calls[0] is existing
+    assert events == ["repo.delete", "commit", "after_delete"]
+
+

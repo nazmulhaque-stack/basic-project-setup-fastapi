@@ -8,6 +8,8 @@
    - Every domain service must inherit from `BaseService[Model, CreateSchema, UpdateSchema, ReadSchema, IdType]`.
    - Implement `before_create` for validation, ID generation, and encryption.
    - Implement `before_update` for partial updates and re-encryption.
+   - Implement `before_delete` for custom cascading rules prior to deletion.
+   - Implement `after_create` / `after_update` / `after_delete` for post-commit side effects (notifications, audit logs, follow-up jobs) that must only run once the mutation is durably persisted. All three default to a no-op.
    - Implement `to_read_schema` for decryption and masking.
    - Implement `to_cache_dict` for Redis serialization.
    - Do not override `create`, `get`, `update`, `delete` unless altering the core transaction boundary.

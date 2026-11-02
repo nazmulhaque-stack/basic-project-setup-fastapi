@@ -12,7 +12,9 @@ Redis Cluster caching infrastructure:
 2. BaseService (IBaseService):
    - Template Method Pattern: Generic CRUD workflow orchestration with transaction consistency boundaries.
    - Decoupled from transport layer: Emits domain-level exceptions (NotFoundError, ConflictError).
-   - Pluggable Lifecycle Hooks: `before_create`, `before_update`, `to_read_schema`, `to_cache_dict`.
+   - Pluggable Lifecycle Hooks: `before_create`, `before_update`, `before_delete` (pre-mutation),
+     `after_create`, `after_update`, `after_delete` (post-commit side effects), and
+     `to_read_schema`, `to_cache_dict` (serialization).
    - Keyset (cursor) B-Tree pagination and offset pagination with safety limits.
    - Polymorphic Caching: Uses NullCache transparently when no cache instance is provided.
 """
@@ -582,6 +584,34 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         """Hook called before deleting entity. Override to enforce custom cascading rules."""
         pass
 
+    async def after_create(self, entity: ModelType) -> None:
+        """Hook called after the entity has been created and the transaction committed.
+
+        Override for side effects that require the entity to already be durably
+        persisted (e.g. sending a welcome email, scheduling a follow-up job, audit
+        logging). Runs after `before_create`/repository insert/commit, but before
+        the Elasticsearch CQRS sync.
+        """
+        pass
+
+    async def after_update(self, entity: ModelType, payload: UpdateSchemaType) -> None:
+        """Hook called after the entity has been updated and the transaction committed.
+
+        Override for post-update side effects (e.g. notifying subscribers of the
+        change). `payload` is the original update DTO, in case the hook needs to
+        know which fields were explicitly set (`payload.model_dump(exclude_unset=True)`).
+        """
+        pass
+
+    async def after_delete(self, entity: ModelType) -> None:
+        """Hook called after the entity has been deleted and the transaction committed.
+
+        Override for cleanup side effects (e.g. removing dependent cached resources,
+        emitting a deletion notification). The `entity` instance reflects its last
+        in-memory state prior to deletion.
+        """
+        pass
+
     async def to_read_schema(self, entity: ModelType) -> ReadSchemaType:
         """Hook converting database model to public read schema.
 
@@ -718,6 +748,8 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
             if self.db is not None:
                 await self.db.commit()
 
+            await self.after_create(entity)
+
             # CQRS: sync created document to Elasticsearch for text search offloading
             try:
                 doc = await self.to_cache_dict(entity)
@@ -816,6 +848,8 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
             if self.db is not None:
                 await self.db.commit()
 
+            await self.after_update(entity, payload)
+
             # CQRS: update document in Elasticsearch
             try:
                 doc = await self.to_cache_dict(entity)
@@ -876,6 +910,8 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
 
         if self.db is not None:
             await self.db.commit()
+
+        await self.after_delete(entity)
 
         # CQRS: remove document from Elasticsearch
         try:

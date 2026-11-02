@@ -14,7 +14,7 @@
 ## 2. Architectural Boundaries & Decoupling
 1. **Clean Separation of Concerns**:
    - **Transport Layer (`app/api/`)**: Thin controllers handling HTTP requests, response schemas, and status codes. No direct database queries or raw business rules.
-   - **Service Layer (`app/services/`)**: Orchestrates business rules, domain lifecycle hooks (`before_create`, `before_update`, `to_read_schema`), transaction boundaries (`commit()`, `rollback()`), and cache eviction.
+   - **Service Layer (`app/services/`)**: Orchestrates business rules, domain lifecycle hooks (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`), transaction boundaries (`commit()`, `rollback()`), and cache eviction.
    - **Repository Layer (`app/repositories/`)**: Encapsulates persistence queries, dynamic filtering, ordering, and keyset cursor seek logic. **Repositories must NEVER commit transactions**—they only execute and flush (`flush()`).
    - **Database Models (`app/models/`)**: Declarative SQLAlchemy models inheriting from `Base`.
    - **Schemas (`app/schemas/`)**: Pydantic models for request ingestion, payload validation, and public serialization.

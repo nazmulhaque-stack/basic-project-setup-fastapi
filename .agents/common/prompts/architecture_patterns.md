@@ -54,12 +54,15 @@ class BaseService:
         await self.repo.create(entity)                  # Persistence
         await self.cache.invalidate_lists()             # Cache Eviction
         await self.db.commit()                          # Transaction Commit Boundary
+        await self.after_create(entity)                 # [HOOK] Post-commit side effects
         return await self.to_read_schema(entity)        # [HOOK] Decryption, Masking
 ```
 
 ### Pluggable Lifecycle Hooks:
 - **`before_create(payload) -> Model`**: Uniqueness checks (email, phone blind index), client UUID generation, PII encryption.
 - **`before_update(entity, payload) -> None`**: Partial update application, selective field re-encryption, conflict checks.
+- **`before_delete(entity) -> None`**: Custom cascading rules prior to deletion. No-op by default.
+- **`after_create(entity) -> None`** / **`after_update(entity, payload) -> None`** / **`after_delete(entity) -> None`**: Fire only after the transaction has committed — the entity is durably persisted. Use for side effects that must not run if the mutation rolls back (notifications, audit logs, follow-up jobs). No-op by default.
 - **`to_read_schema(entity) -> ReadSchema`**: Plaintext decryption using AAD, phone masking (`+1******2671`).
 - **`to_cache_dict(entity) -> Dict`**: Masked representation serialized for Redis storage.
 

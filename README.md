@@ -23,7 +23,7 @@ This repository is a real FastAPI backend project rather than a toy scaffold. Th
 ### Reality check from the current codebase
 
 - The project is designed for production-grade asynchronous operations and includes operational concerns such as Redis caching, Elasticsearch integration, request tracing, and structured log shipping.
-- The generic repository and service abstraction is implemented coherently, and the domain services follow the expected lifecycle pattern (`before_create`, `before_update`, `to_read_schema`, `to_cache_dict`).
+- The generic repository and service abstraction is implemented coherently, and the domain services follow the expected lifecycle pattern (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`, `to_cache_dict`).
 - The code intentionally reflects a high-scale architecture narrative (PgBouncer, Redis Cluster, keyset pagination, rate limiting, TLS/PII handling), and the majority of the implementation is consistent with that design.
 - The codebase is not just documentation-only; it contains real endpoints, models, services, repositories, schemas, and tests.
 
@@ -82,6 +82,7 @@ The Compose Kafka broker is for local development. For production, provision dur
 14. [Local Development & Production Deployment Guide](#-local-development--production-deployment-guide)
 
 ---
+
 ## 🏛️ Architecture & System Topology
 
 ### High-Contrast Visual Mermaid Architecture
@@ -92,60 +93,6 @@ The Compose Kafka broker is for local development. For production, provision dur
   <img src="assets/architecture.png" alt="High-Contrast Visual Mermaid Architecture" width="100%" />
 </p>
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#1e293b', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#38bdf8', 'lineColor': '#38bdf8', 'secondaryColor': '#0f766e', 'tertiaryColor': '#1e1b4b', 'background': '#0f172a'}}}%%
-flowchart TD
-    classDef client fill:#0284c7,stroke:#38bdf8,stroke-width:2px,color:#ffffff,font-weight:bold;
-    classDef proxy fill:#0f766e,stroke:#2dd4bf,stroke-width:2px,color:#ffffff,font-weight:bold;
-    classDef server fill:#1e293b,stroke:#818cf8,stroke-width:2px,color:#ffffff;
-    classDef storage fill:#312e81,stroke:#a78bfa,stroke-width:2px,color:#ffffff,font-weight:bold;
-    classDef db fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#ffffff,font-weight:bold;
-
-    subgraph ClientTier["🌐 INGRESS TIER: 100,000 CONCURRENT CLIENTS"]
-        Clients["100,000 Concurrent HTTP Sockets<br/>(Mobile Apps, Browsers, IoT)"]:::client
-        L4["Layer 4 Load Balancer / Anycast IP<br/>• TCP Stream Balancing (ECMP / HAProxy)<br/>• Non-terminating TCP Handshakes"]:::client
-    end
-
-    subgraph ProxyTier["🛡️ REVERSE PROXY TIER: MULTI-HOST NGINX (13-20 NODES)"]
-        Nginx1["Nginx Node 1<br/>• epoll worker_connections 65535<br/>• limit_conn: 100/IP | limit_req: 100r/s<br/>• Upstream Keepalive: 128 sockets"]:::proxy
-        NginxN["Nginx Node N<br/>• epoll worker_connections 65535<br/>• limit_conn: 100/IP | limit_req: 100r/s<br/>• Upstream Keepalive: 128 sockets"]:::proxy
-    end
-
-    subgraph AppTier["⚡ APP TIER: MULTI-CONTAINER / MULTI-PROCESS CLUSTER (128 WORKERS)"]
-        subgraph Server1["Bare Metal / VM Node 1 (8 Cores)"]
-            G1["Gunicorn Supervisor (Master PID)"]:::server
-            W1["8 Uvicorn Workers (uvloop epoll)<br/>Handles ~1,000-2,000 sockets/worker"]:::server
-            App1["Stateless FastAPI Application<br/>• Tracing Middleware (X-Request-ID)<br/>• Lua RateLimiter (EVALSHA)<br/>• UserService / ProductService<br/>• BaseRepository (session.flush)"]:::server
-        end
-        subgraph ServerN["Bare Metal / VM Node N (8 Cores)"]
-            GN["Gunicorn Supervisor (Master PID)"]:::server
-            WN["8 Uvicorn Workers (uvloop epoll)<br/>Handles ~1,000-2,000 sockets/worker"]:::server
-            AppN["Stateless FastAPI Application<br/>• Tracing Middleware (X-Request-ID)<br/>• Lua RateLimiter (EVALSHA)<br/>• UserService / ProductService<br/>• BaseRepository (session.flush)"]:::server
-        end
-    end
-
-    subgraph StorageTier["💾 STORAGE, CACHING & CONNECTION MULTIPLEXING TIER"]
-        RedisCluster["Redis 7 Cluster (3+ Shards / 16,384 Slots)<br/>• Slot-Pinned Keys {users:id}<br/>• Atomic Lua Rate Limiting<br/>• O(1) Namespace List Invalidation (INCR)<br/>• Distributed Stampede Lock (NX PX)<br/>• Negative Cache Sentinel (__not_found__)"]:::storage
-        PgBouncer["PgBouncer 1.21+ (Transaction Pooling)<br/>• max_client_conn = 2,000<br/>• default_pool_size = 80<br/>• statement_cache_size = 0"]:::db
-        Postgres["PostgreSQL 16 Primary Engine<br/>• max_connections = 150<br/>• Composite Keyset Indexes (created_at, id)<br/>• UNIQUE Blind Index (phone_blind_index)"]:::db
-    end
-
-    Clients -->|100k TCP Streams| L4
-    L4 -->|TCP Balance| Nginx1
-    L4 -->|TCP Balance| NginxN
-    Nginx1 -->|Keepalive TCP| G1
-    NginxN -->|Keepalive TCP| GN
-    G1 --> W1
-    GN --> WN
-    W1 --> App1
-    WN --> AppN
-    App1 -->|EVALSHA / Get / Set| RedisCluster
-    AppN -->|EVALSHA / Get / Set| RedisCluster
-    App1 -->|Multiplexed Sockets| PgBouncer
-    AppN -->|Multiplexed Sockets| PgBouncer
-    PgBouncer -->|80 Pre-Warmed Sockets| Postgres
-```
-
 ---
 
 ### Unicode / ASCII Architecture Diagram (100% Theme Visible)
@@ -154,59 +101,59 @@ For instant readability across raw terminals, plain-text viewers, and all IDE co
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                       🌐 100,000 CONCURRENT CLIENT CONNECTIONS                             │
+│                            100,000 CONCURRENT CLIENT CONNECTIONS                            │
 │                  (Web Browsers, Mobile Apps, Microservices, Partner APIs)                   │
-└──────────────────────────────────────────────┬──────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
                                                │ (100,000 Incoming TCP Sockets)
                                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                 LAYER 4 INFRASTRUCTURE LOAD BALANCER (Anycast BGP / ECMP)                   │
-│           • Distributes raw TCP packets at line-rate across multiple reverse proxies        │
-└───────────────────────┬─────────────────────────────────────────────┬───────────────────────┘
-                        │                                             │
-                        ▼                                             ▼
+│                  LAYER 4 INFRASTRUCTURE LOAD BALANCER (Anycast BGP / ECMP)                  │
+│  • Distributes raw TCP packets at line-rate across multiple reverse proxies                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                        │                                                             │
+                        ▼                                                             ▼
 ┌───────────────────────────────────────────┐   ┌───────────────────────────────────────────┐
-│     🛡️ NGINX REVERSE PROXY NODE 1         │   │     🛡️ NGINX REVERSE PROXY NODE N         │
-│  • worker_connections: 65,535 (epoll)     │   │  • worker_connections: 65,535 (epoll)     │
+│        NGINX REVERSE PROXY NODE 1         │   │        NGINX REVERSE PROXY NODE N         │
+│  • worker_connections: 65535 (epoll)      │   │  • worker_connections: 65535 (epoll)      │
 │  • limit_conn: 100 per client IP          │   │  • limit_conn: 100 per client IP          │
 │  • limit_req: 100r/s burst=50 nodelay     │   │  • limit_req: 100r/s burst=50 nodelay     │
 │  • Upstream keepalive pool: 128 sockets   │   │  • Upstream keepalive pool: 128 sockets   │
-└─────────────────────┬─────────────────────┘   └─────────────────────┬─────────────────────┘
-                      │ (Persistent Keepalive TCP)                    │
-                      ▼                                               ▼
+└───────────────────────────────────────────┘   └───────────────────────────────────────────┘
+                      │ (Persistent Keepalive TCP)
+                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│              ⚡ APPLICATION TIER: MULTI-HOST / MULTI-CONTAINER CLUSTER                      │
-│                          (16 Servers × 8 Cores = 128 Worker Processes)                      │
+│                   APPLICATION TIER: MULTI-HOST / MULTI-CONTAINER CLUSTER                    │
+│                        (16 Servers x 8 Cores = 128 Worker Processes)                        │
 │                                                                                             │
-│  ┌─────────────────────────────────────┐         ┌─────────────────────────────────────┐   │
-│  │ Gunicorn Master Supervisor Node 1   │         │ Gunicorn Master Supervisor Node N   │   │
-│  │ ├─ Uvicorn Worker 1 (uvloop epoll)  │         │ ├─ Uvicorn Worker 1 (uvloop epoll)  │   │
-│  │ ├─ Uvicorn Worker 2 (uvloop epoll)  │         │ ├─ Uvicorn Worker 2 (uvloop epoll)  │   │
-│  │ └─ ... (8 workers per node)         │         │ └─ ... (8 workers per node)         │   │
-│  │                                     │         │                                     │   │
-│  │   [ FastAPI Stateless Application ] │         │   [ FastAPI Stateless Application ] │   │
-│  │   • Request ID & Tracing Middleware │         │   • Request ID & Tracing Middleware │   │
-│  │   • Redis Lua RateLimiter (EVALSHA) │         │   • Redis Lua RateLimiter (EVALSHA) │   │
-│  │   • Pydantic v2 Schema Validators   │         │   • Pydantic v2 Schema Validators   │   │
-│  │   • Service Layer (Hooks & Crypto)  │         │   • Service Layer (Hooks & Crypto)  │   │
-│  │   • BaseRepository (session.flush)  │         │   • BaseRepository (session.flush)  │   │
-│  │   • Unit of Work (get_db commit)    │         │   • Unit of Work (get_db commit)    │   │
-│  └──────────────────┬──────────────────┘         └──────────────────┬──────────────────┘   │
-└─────────────────────┼───────────────────────────────────────────────┼───────────────────────┘
+│ ┌─────────────────────────────────────┐   ┌─────────────────────────────────────┐           │
+│ │  Gunicorn Master Supervisor Node 1  │   │  Gunicorn Master Supervisor Node N  │           │
+│ │  ├─ Uvicorn Worker 1 (uvloop epoll) │   │  ├─ Uvicorn Worker 1 (uvloop epoll) │           │
+│ │  ├─ Uvicorn Worker 2 (uvloop epoll) │   │  ├─ Uvicorn Worker 2 (uvloop epoll) │           │
+│ │  └─ ... (8 workers per node)        │   │  └─ ... (8 workers per node)        │           │
+│ │                                     │   │                                     │           │
+│ │  [ FastAPI Stateless Application ]  │   │  [ FastAPI Stateless Application ]  │           │
+│ │  • Request ID & Tracing Middleware  │   │  • Request ID & Tracing Middleware  │           │
+│ │  • Redis Lua RateLimiter (EVALSHA)  │   │  • Redis Lua RateLimiter (EVALSHA)  │           │
+│ │  • Pydantic v2 Schema Validators    │   │  • Pydantic v2 Schema Validators    │           │
+│ │  • Service Layer (Hooks & Crypto)   │   │  • Service Layer (Hooks & Crypto)   │           │
+│ │  • BaseRepository (session.flush)   │   │  • BaseRepository (session.flush)   │           │
+│ │  • Unit of Work (get_db commit)     │   │  • Unit of Work (get_db commit)     │           │
+│ └─────────────────────────────────────┘   └─────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
                       │                                               │
-           ┌──────────┴────────────────────────┐          ┌───────────┴───────────────────────┐
-           │ Dynamic Cache / Rate Limiting     │          │ Relational Data Persistence       │
-           ▼                                   ▼          ▼                                   ▼
+           ┌──────────┴────────────────────┐          ┌───────────────┴────────────────────┐
+           │ Dynamic Cache / Rate Limiting  │          │ Relational Data Persistence         │
+           ▼                                 ▼         ▼                                     ▼
 ┌──────────────────────────────────────────────┐   ┌──────────────────────────────────────────┐
-│          ⚡ REDIS 7 CLUSTER (3+ NODES)        │   │     🔄 PGBOUNCER 1.21+ TRANSACTION POOL  │
-│  • 16,384 Hash Slots with Slot Pinning {key} │   │  • max_client_conn = 2,000 Sockets      │
+│          REDIS 7 CLUSTER (3+ NODES)          │   │     PGBOUNCER 1.21+ TRANSACTION POOL     │
+│  • 16,384 Hash Slots with Slot Pinning {key} │   │  • max_client_conn = 2,000 Sockets       │
 │  • Lua EVALSHA Atomic Rate Limiting          │   │  • default_pool_size = 80 Backend Conn   │
 │  • Dynamic Cache-Aside (get_item / set_item) │   │  • statement_cache_size = 0 (Mandatory)  │
-│  • O(1) Namespace Invalidation (INCR)        │   └────────────────────┬─────────────────────┘
-│  • Mutex Stampede Locks (SET NX PX)          │                        │ (80 Multiplexed Conn)
-│  • Negative Cache Sentinels (__not_found__)  │                        ▼
+│  • O(1) Namespace Invalidation (INCR)        │   └──────────────────────────────────────────┘
+│  • Mutex Stampede Locks (SET NX PX)          │                       │ (80 Multiplexed Conn) 
+│  • Negative Cache Sentinels (__not_found__)  │                       ▼                       
 └──────────────────────────────────────────────┘   ┌──────────────────────────────────────────┐
-                                                   │       🐘 POSTGRESQL 16 PRIMARY ENGINE    │
+                                                   │       POSTGRESQL 16 PRIMARY ENGINE       │
                                                    │  • max_connections = 150 (30 Reserved)   │
                                                    │  • B-Tree Keyset Index: (created_at, id) │
                                                    │  • UNIQUE Index: (phone_blind_index)     │
@@ -221,12 +168,12 @@ For instant readability across raw terminals, plain-text viewers, and all IDE co
 Serving 100,000 simultaneous connections without resource exhaustion requires a strict connection budget across all tiers:
 
 | Tier                    | Component                          | Sizing for 100k Concurrency                                          | Math & Configuration                                                                                                 | Architectural Rationale                                                                                                                                                  |
-| ----------------------- | ----------------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ----------------------- | ---------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **L4 Ingress**          | Anycast / ECMP / HAProxy           | Handles 100,000 simultaneous TCP sockets                             | Line-rate stream forwarding                                                                                          | Terminates zero HTTP traffic; routes IP packets to proxy tier.                                                                                                           |
 | **L7 Reverse Proxy**    | Multi-Host Nginx (13–20 instances) | 65,535 connections per node                                          | `worker_connections 65535;`<br/>`keepalive 128;`<br/>`limit_conn 100;`                                               | Non-blocking `epoll` event loop buffers client slow-loris bursts; reuses persistent keepalive TCP connections to FastAPI workers.                                        |
 | **Process Manager**     | Gunicorn 23.0.0                    | 8 workers per 8-core host (16 hosts = 128 workers)                   | `workers = multiprocessing.cpu_count()`<br/>`worker_tmp_dir = "/dev/shm"`<br/>`max_requests = 10000; jitter = 1000;` | 1 worker per physical core achieves CPU saturation without context-switch thrashing. Periodic jittered worker recycling prevents memory fragmentation.                   |
-| **Async Event Loop**    | Uvicorn + uvloop 0.34.0             | 128 total worker processes across cluster                            | **~800 to 1,200 concurrent sockets per worker process**                                                              | Written in C on top of `libuv`. Switches asynchronously on socket I/O events without spawning OS threads.                                                                |
-| **App Framework**       | Stateless FastAPI 0.115.8           | Zero shared in-process state                                         | Default response class: `ORJSONResponse`                                                                             | Rust-based binary JSON encoding; dependency injection manages scoped unit-of-work sessions.                                                                              |
+| **Async Event Loop**    | Uvicorn + uvloop 0.34.0            | 128 total worker processes across cluster                            | **~800 to 1,200 concurrent sockets per worker process**                                                              | Written in C on top of `libuv`. Switches asynchronously on socket I/O events without spawning OS threads.                                                                |
+| **App Framework**       | Stateless FastAPI 0.115.8          | Zero shared in-process state                                         | Default response class: `ORJSONResponse`                                                                             | Rust-based binary JSON encoding; dependency injection manages scoped unit-of-work sessions.                                                                              |
 | **Connection Pool**     | PgBouncer 1.21+                    | Multiplexes 1,280 client connections into **80 backend connections** | `POOL_MODE = transaction`<br/>`MAX_CLIENT_CONN = 2000`<br/>`DEFAULT_POOL_SIZE = 80`                                  | PostgreSQL spawns 1 OS process per connection (10MB RAM each). PgBouncer holds idle client sockets and attaches a Postgres connection ONLY while a SQL transaction runs. |
 | **Relational Database** | PostgreSQL 16 Primary              | Fixed `max_connections = 150`                                        | `shared_buffers = 512MB`<br/>`work_mem = 4MB`<br/>Composite index: `(created_at, id)`                                | Database operates at peak throughput without memory thrashing because backend connections are strictly capped below 100.                                                 |
 | **Distributed Cache**   | Redis 7 Cluster                    | 3+ Master nodes (16,384 hash slots)                                  | Slot pinning `{users:id}`<br/>`max_connections = 500` per worker pool                                                | Absorbs 95%+ of read traffic; executes atomic Lua rate limits in < 1 ms.                                                                                                 |
@@ -240,32 +187,32 @@ The codebase enforces strict separation of concerns across HTTP controllers, dom
 ```
 app/
 ├── core/
-│   ├── config.py          # Settings (pydantic-settings, reads .env)
-│   ├── database.py        # async engine, session factory, get_session dependency
-│   ├── security.py        # AES-256-GCM CryptoService, blind indexing, masking
+│   ├── config.py           # Settings (pydantic-settings, reads .env)
+│   ├── database.py         # async engine, session factory, get_session dependency
+│   ├── security.py         # AES-256-GCM CryptoService, blind indexing, masking
 │   ├── redis.py            # Redis Cluster client, distributed lock primitive
 │   ├── elasticsearch.py    # AsyncElasticsearchService + NullElasticsearch fallback
 │   ├── kafka.py            # Kafka producer/consumer primitives
 │   ├── logging.py          # Structured logging, AsyncLogBuffer, ECS formatter
 │   └── exceptions.py       # AppError → NotFound(404) / Conflict(409) / BusinessRule(422)
-├── models/                # SQLAlchemy 2 typed models
+├── models/                 # SQLAlchemy 2 typed models
 │   ├── base.py             # Base + IdMixin + TimestampMixin + constraint naming
 │   ├── category.py
 │   ├── user.py
 │   ├── product.py
 │   ├── employee.py
 │   └── outbox.py           # OutboxEvent (transactional outbox table)
-├── schemas/               # Pydantic v2
+├── schemas/                # Pydantic v2
 │   ├── base.py             # BaseSchema, InputSchema, ReadSchema, Page[T], make_partial()
 │   ├── category.py
 │   ├── user.py
 │   └── product.py
-├── repositories/          # data access only
+├── repositories/           # data access only
 │   ├── base.py             # IBaseRepository (ABC) + generic BaseRepository[Model]/SQLAlchemyRepository[Model]
 │   ├── category.py
 │   ├── user.py             # 1 line: inherits everything
 │   └── product.py          # + custom queries (eager load, atomic stock update)
-├── services/              # business rules + transaction boundary
+├── services/               # business rules + transaction boundary
 │   ├── base.py             # BaseService[Model, Create, Update] with hooks + DynamicRedisCache
 │   ├── category.py
 │   ├── user.py             # 1 line
@@ -274,13 +221,13 @@ app/
 │   ├── inventory_reservations.py
 │   └── redis_rate_limit.py # Lua EVALSHA sliding-window rate limiter
 ├── kafka/
-│   ├── producer.py          # AIOKafkaProducer wrapper (acks=all, idempotence, gzip)
-│   ├── consumer.py          # BaseConsumer (manual offset commit, retry policy)
-│   ├── dlq.py               # DeadLetterQueueService
-│   └── events/               # Typed CloudEvents payload contracts
+│   ├── producer.py         # AIOKafkaProducer wrapper (acks=all, idempotence, gzip)
+│   ├── consumer.py         # BaseConsumer (manual offset commit, retry policy)
+│   ├── dlq.py              # DeadLetterQueueService
+│   └── events/             # Typed CloudEvents payload contracts
 ├── workers/
-│   ├── main.py               # Standalone background worker entrypoint
-│   └── consumer_runner.py    # WorkerSupervisor registering all consumers
+│   ├── main.py             # Standalone background worker entrypoint
+│   └── consumer_runner.py  # WorkerSupervisor registering all consumers
 ├── api/
 │   ├── crud_router.py      # CRUDRouter: the dynamic CRUD generator
 │   ├── deps.py             # session → service dependency providers
@@ -288,7 +235,7 @@ app/
 │       ├── categories.py   # 100% generated
 │       ├── products.py     # generated + custom endpoints
 │       ├── employees.py
-│       └── logs.py          # Elasticsearch log search endpoints
+│       └── logs.py         # Elasticsearch log search endpoints
 └── main.py                 # app factory, lifespan, exception handlers
 alembic/                    # Migration environment + versioned revisions
 deploy/                     # Dockerfile, nginx.conf, gunicorn.conf.py, sysctl.conf, docker-compose.yml, k8s/
@@ -296,6 +243,7 @@ tests/                      # API tests + unit tests (mocked repository)
 ```
 
 ---
+
 ## ⚡ 1 Lakh (100k) Concurrent Requests: System Execution Flow
 
 ### Visual Sequence Diagram: End-to-End Request Path
@@ -305,81 +253,6 @@ The following diagram tracks an incoming request step-by-step through network so
 <p align="center">
   <img src="assets/sequence_flow.png" alt="Visual Sequence Diagram: End-to-End Request Path" width="100%" />
 </p>
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'actorBkg': '#0284c7', 'actorTextColor': '#ffffff', 'signalColor': '#38bdf8', 'signalTextColor': '#ffffff', 'noteBkgColor': '#1e293b', 'noteTextColor': '#e2e8f0', 'noteBorderColor': '#38bdf8'}}}%%
-sequenceDiagram
-    autonumber
-    actor Client as 🌐 Client (1 of 100k)
-    participant Nginx as 🛡️ Nginx Proxy
-    participant Uvicorn as ⚡ Uvicorn (uvloop)
-    participant Middleware as 🆔 Tracing Middleware
-    participant RateLimit as ⏱️ Lua RateLimiter
-    participant DbDep as 🔄 get_db (Unit of Work)
-    participant Controller as 🎮 Endpoint Controller
-    participant Service as 💼 UserService
-    participant Crypto as 🔐 CryptoService (AES-GCM)
-    participant Repo as 🗄️ UserRepository
-    participant PgBouncer as 🔄 PgBouncer Pool
-    participant Postgres as 🐘 PostgreSQL 16
-    participant Redis as ⚡ Redis 7 Cluster
-
-    Client->>Nginx: POST /api/v1/users (Incoming Request)
-    Note over Nginx: Checks limit_conn (100/IP) & limit_req (100r/s)<br/>Matches keepalive upstream socket
-    Nginx->>Uvicorn: Upstream HTTP/1.1 keepalive dispatch
-    Note over Uvicorn: uvloop (epoll) parses HTTP headers via httptools<br/>Dispatches ASGI scope asynchronously
-
-    Uvicorn->>Middleware: request_id_and_tracing_middleware(request, call_next)
-    Note over Middleware: Extracts X-Request-ID or generates uuid4()<br/>Attaches to request.state.request_id
-
-    Middleware->>RateLimit: RateLimiter.__call__(request, response)
-    Note over RateLimit: resolve_client_ip() verifies peer against TRUSTED_PROXIES<br/>Constructs slot-pinned key: rl:{users:ip:X}:window
-    RateLimit->>Redis: EVALSHA rate_limit_lua_sha
-    Redis-->>RateLimit: [current_count, ttl]
-    Note over RateLimit: Attaches X-RateLimit-* headers (or raises 429)
-
-    RateLimit->>DbDep: get_db() dependency injection
-    Note over DbDep: session_factory() opens AsyncSession<br/>Unit of work begins (autoflush=False)
-
-    DbDep->>Controller: create_user(payload: UserCreate, service)
-    Note over Controller: Pydantic v2 validates E.164 phone & email
-    Controller->>Service: UserService.create_user(payload)
-
-    Service->>Service: before_create() hook: pre-generates user_id = uuid4()
-    Note over Service: Constructs aad = f"users.phone:{user_id}"
-
-    Service->>Crypto: CryptoService.encrypt(plain_phone, aad)
-    Note over Crypto: Generates fresh 12B nonce via os.urandom(12)<br/>Encrypts with AES-256-GCM + computes tag bound to AAD<br/>Packs [version(1B) || nonce(12B) || ciphertext+tag]
-    Crypto-->>Service: Base64 URL-safe ciphertext
-
-    Service->>Crypto: CryptoService.blind_index(plain_phone)
-    Note over Crypto: Computes HMAC-SHA256(blind_key, phone)
-    Crypto-->>Service: 64-char hex string (phone_blind_index)
-
-    Service->>Repo: UserRepository.create(user_entity)
-    Note over Repo: session.add(user_entity)
-    Repo->>PgBouncer: await session.flush() (INSERT INTO users)
-    PgBouncer->>Postgres: Dispatches over pre-warmed backend connection
-    Note over Postgres: Enforces UNIQUE on email & phone_blind_index<br/>Returns row without committing transaction
-    Postgres-->>PgBouncer: Row inserted
-    PgBouncer-->>Repo: Flush acknowledged (unit of work remains open)
-
-    Service->>Redis: await cache.invalidate_lists() -> INCR cache:users:list_ver
-    Note over Redis: O(1) atomic version increment invalidates all cached user lists!
-
-    Service->>Crypto: to_read_schema(): decrypts phone & applies masking
-    Note over Crypto: Decrypts with AAD verification<br/>Masks: "+1*******2671"
-    Crypto-->>Service: UserRead schema
-
-    Service-->>Controller: Returns UserRead
-    Controller-->>DbDep: Endpoint completed successfully
-    Note over DbDep: await session.commit() -> Unit of work committed to PostgreSQL!<br/>PgBouncer releases server connection to pool immediately
-
-    DbDep-->>Middleware: Final HTTP response
-    Middleware-->>Uvicorn: Response with X-Request-ID header
-    Uvicorn-->>Nginx: Fast binary ORJSONResponse (HTTP 201 Created)
-    Nginx-->>Client: HTTP 201 Created with masked phone & headers
-```
 
 ---
 
@@ -720,9 +593,11 @@ When querying complex nested structures (e.g. a `Product` and its associated `Ca
 #### The Async N+1 Dilemma & `lazy="raise"`
 
 In traditional synchronous frameworks (like Django or sync SQLAlchemy), accessing `product.category_rel.name` automatically issues a hidden synchronous query behind the scenes. In an async event-loop architecture serving 100k concurrency, **implicit lazy loading blocks the entire async thread worker** and crashes with:
+
 ```
 sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() using greenlet_spawn
 ```
+
 To eliminate this hazard permanently, all relationships in this codebase declare `lazy="raise"`. Every relational attribute access that is not explicitly pre-loaded immediately raises an error during testing — turning a silent $N+1$ production incident into an immediate test failure. The full model/schema/repository/service pattern for this is in [§9.10 Nested Tables & Entity Relationships Guide](#910-nested-tables--entity-relationships-guide-category-in-product).
 
 #### Eager Loaded Nested Path: `GET /api/v1/products/{id}/detail`
@@ -769,6 +644,7 @@ To eliminate this hazard permanently, all relationships in this codebase declare
 ```
 
 ---
+
 ## 🔐 Deep Dive: Encryption, AAD, Key Rotation & Blind Indexing
 
 Implemented in [`app/core/security.py`](app/core/security.py).
@@ -851,9 +727,9 @@ Traditional cache invalidation tracks query hashes in a Redis Set and executes m
     - Cache list keys include the namespace version: `cache:users:list:v{list_ver}:{filters_hash}`.
     - When any user is created, updated, or deleted, the service runs a single atomic command:
 
-        ```
-        INCR cache:users:list_ver
-        ```
+            ```
+            INCR cache:users:list_ver
+            ```
 
     - **Complexity**: $O(1)$ single-key atomic increment, taking microseconds.
     - **Cluster Compatibility**: 100% cluster safe — never multi-key.
@@ -912,6 +788,7 @@ If an attacker queries thousands of non-existent UUIDs, each request would other
 When thousands of items are cached simultaneously, expiring them at the exact same second creates a coordinated database traffic spike. Our cache automatically applies a **±10% randomized jitter** to all item TTLs, spreading expirations smoothly across time.
 
 Granular per-entity TTL defaults are configured in [`app/core/config.py`](app/core/config.py):
+
 - `CACHE_ITEM_TTL` (default 300s): individual entity records (e.g. a single user profile).
 - `CACHE_LIST_TTL` (default 120s): paginated/list query results.
 - `CACHE_NEGATIVE_TTL` (default 30s): the `__not_found__` sentinel.
@@ -940,17 +817,19 @@ Granular per-entity TTL defaults are configured in [`app/core/config.py`](app/co
 ### 7. Request Idempotency Engine
 
 Network dropouts between clients and reverse proxies can cause clients to retry write mutations (payment, order creation, reservations) that must not be double-applied.
+
 - **Key Format**: `idempotency:{key}`
 - **TTL**: 86,400s (24 hours)
 - **Lifecycle**:
-  1. Client sends header `X-Idempotency-Key: <UUID>`.
-  2. First request executes `SET idempotency:<UUID> PENDING NX EX 86400`.
-  3. If acquisition succeeds: Request executes business logic, then stores the final JSON response in `idempotency:<UUID>`.
-  4. If acquisition fails: Returns the existing cached response, or HTTP 409 Conflict if the original request is still `PENDING`.
+    1. Client sends header `X-Idempotency-Key: <UUID>`.
+    2. First request executes `SET idempotency:<UUID> PENDING NX EX 86400`.
+    3. If acquisition succeeds: Request executes business logic, then stores the final JSON response in `idempotency:<UUID>`.
+    4. If acquisition fails: Returns the existing cached response, or HTTP 409 Conflict if the original request is still `PENDING`.
 
 ### 8. Verification Challenges & One-Time Tokens
 
 For SMS verification codes, email magic links, or password reset challenges:
+
 - **Key Format**: `challenge:{scope}:{token}` (e.g. `challenge:sms_verify:928374`)
 - **TTL**: 300s (5 minutes)
 - **One-Time Consumption**: Handled via a single-round-trip `GET` followed by an atomic `DEL`. Storing transient tokens in PostgreSQL would cause table bloat, autovacuum overhead, and write WAL amplification for data that is discarded within minutes.
@@ -965,6 +844,7 @@ For SMS verification codes, email magic links, or password reset challenges:
 ### 10. Cluster High-Availability & Standalone Fallback
 
 In [`app/core/redis.py`](app/core/redis.py):
+
 - Connects across 16,384 hash slots on Redis 7 Cluster nodes (`redis-1:7000`, `redis-2:7001`, `redis-3:7002`).
 - **Resilience**: If Cluster mode is inactive (e.g. local single-node development or maintenance mode), it catches the cluster-unavailable exception and automatically falls back to standalone Redis on the first reachable node, so local development never requires a real 3-node cluster.
 
@@ -983,6 +863,7 @@ Elasticsearch provides distributed inverted indexing, BM25 scoring, and columnar
 ```
 
 When an entity (User, Category, Product) is created or updated:
+
 1. PostgreSQL executes relational integrity checks and foreign keys.
 2. A sanitized read DTO is constructed via the service's `to_cache_dict()` hook.
 3. The document is indexed into `{index_prefix}-{entity}` (e.g. `demo-products`) via [`app/core/elasticsearch.py`](app/core/elasticsearch.py).
@@ -993,33 +874,38 @@ When an entity (User, Category, Product) is created or updated:
 
 - **BM25 Algorithm**: Evaluates term frequency and inverse document frequency for multi-word queries.
 - **Multi-Field Boosting**: Query weights search matches across fields:
-  ```json
-  {
-    "multi_match": {
-      "query": "mechanical keyboard",
-      "fields": ["name^3", "description^1", "sku^5"],
-      "fuzziness": "AUTO"
+
+    ```json
+    {
+    	"multi_match": {
+    		"query": "mechanical keyboard",
+    		"fields": ["name^3", "description^1", "sku^5"],
+    		"fuzziness": "AUTO"
+    	}
     }
-  }
-  ```
+    ```
+
 - **Typo Tolerance**: Levenshtein distance (`fuzziness: "AUTO"`) handles user misspellings without expensive regexes.
 
 ### 3. Columnar Doc Values & Real-Time Faceted Aggregations
 
 E-commerce catalogs require dynamic category counts and price histograms:
+
 - Elasticsearch uses **Doc Values** (disk-based columnar storage) to calculate aggregations across millions of matching documents in milliseconds.
-- Resolves counts for filters (e.g., *Categories: Keyboards (120), Mice (45)*) in the same query as the search results.
+- Resolves counts for filters (e.g., _Categories: Keyboards (120), Mice (45)_) in the same query as the search results.
 
 ### 4. Deep Pagination via `search_after`
 
 Standard SQL `OFFSET 50000 LIMIT 20` requires database engines to scan and discard 50,000 rows. Elasticsearch instead uses `search_after` based on sort keys and document IDs:
+
 ```json
 {
-  "size": 20,
-  "sort": [{"created_at": "desc"}, {"_id": "asc"}],
-  "search_after": [1730467200, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"]
+	"size": 20,
+	"sort": [{ "created_at": "desc" }, { "_id": "asc" }],
+	"search_after": [1730467200, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"]
 }
 ```
+
 This traverses millions of records with constant $O(1)$ retrieval cost — the same philosophy as the PostgreSQL keyset pagination in [Phase 6](#phase-6-high-concurrency-keyset-cursor-pagination-path), applied to the search index.
 
 ### 5. High-Throughput Non-Blocking Structured Logging
@@ -1027,18 +913,20 @@ This traverses millions of records with constant $O(1)$ retrieval cost — the s
 - **Engine**: [`app/core/logging.py`](app/core/logging.py) (`AsyncLogBuffer`, `AsyncElasticsearchLogHandler`)
 - **Queue Mechanics**: Incoming log records are dispatched to a bounded in-memory ring buffer (`ELASTICSEARCH_LOG_BUFFER_SIZE`, default 1000).
 - **Batching & Flushing**: A background task flushes logs in bulk HTTP requests (`_bulk` API) when either condition is met:
-  - `ELASTICSEARCH_LOG_BATCH_SIZE` (default 100) records accumulate.
-  - `ELASTICSEARCH_LOG_FLUSH_INTERVAL` (default 2.0s) elapses.
+    - `ELASTICSEARCH_LOG_BATCH_SIZE` (default 100) records accumulate.
+    - `ELASTICSEARCH_LOG_FLUSH_INTERVAL` (default 2.0s) elapses.
 - **Backpressure Protection**: If Elasticsearch is congested and the buffer reaches capacity, debug-level logs are dropped first, ensuring HTTP request workers are never blocked waiting on the logging pipeline.
 - **Log Index Lifecycle**: Log records are routed to `app-logs` timeseries indices with automated retention pruning (`ELASTICSEARCH_LOG_RETENTION_DAYS`, default 30 days).
 
 ### 6. Log Search API & Histogram Aggregations
 
 Structured logs can be inspected programmatically via [`app/services/log_search.py`](app/services/log_search.py):
+
 - Filter by `correlation_id`, `service`, `level` (ERROR, WARNING, INFO), and ISO 8601 timestamp range.
 - Query aggregate error-rate histograms over time for operational observability via `GET /api/v1/logs/search?level=ERROR&time_range=24h`.
 
 ---
+
 ## 📨 Deep Dive: Apache Kafka, Transactional Outbox & Event-Driven Architecture
 
 Apache Kafka provides durable, distributed event streaming for inter-service communication, inventory reservation sagas, and asynchronous outbox dispatch, cooperating with PostgreSQL to sustain **100,000 concurrent requests** with strict data integrity and zero cross-process shared state.
@@ -1067,12 +955,14 @@ Apache Kafka provides durable, distributed event streaming for inter-service com
 ### 1. The Dual-Write Problem & Transactional Outbox Pattern
 
 Directly publishing to Kafka inside an HTTP controller creates data inconsistencies:
+
 ```python
 # ANTI-PATTERN: DO NOT DO THIS
 async def create_order(order_data):
     await db.execute(insert(Order)...)         # If this succeeds...
     await kafka.publish("orders", order_data)  # ...but this fails, the event is permanently lost!
 ```
+
 - If the database commit succeeds but the Kafka broker is unreachable, downstream services never hear about the order (silent data inconsistency).
 - If Kafka publishing succeeds but the database transaction rolls back due to a constraint violation, downstream services process a phantom event that never actually happened.
 
@@ -1113,11 +1003,11 @@ HighPerfStatelessService . user . created [ . v1 ]
 
 ```json
 {
-  "event_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
-  "aggregate_id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a",
-  "event_type": "HighPerfStatelessService.user.created",
-  "occurred_at": "2026-11-02T05:25:35.961836Z",
-  "data": { "id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a" }
+	"event_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+	"aggregate_id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a",
+	"event_type": "HighPerfStatelessService.user.created",
+	"occurred_at": "2026-11-02T05:25:35.961836Z",
+	"data": { "id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a" }
 }
 ```
 
@@ -1148,14 +1038,14 @@ To prevent bulk imports, migrations, and internal housekeeping updates from acci
 
 #### Developer Triggering Scenarios
 
-| Use Case | Method / Call | Resulting `event_type` |
-| :--- | :--- | :--- |
-| **Standard CRUD (opt-in)** | `service.create(payload, emit_outbox_event=True)` | `HighPerfStatelessService.user.created` |
-| **Standard CRUD (default)** | `service.create(payload)` | *No event generated* |
-| **Custom action** | `service.enqueue_outbox_event("verified", user)` | `HighPerfStatelessService.user.verified` |
-| **Versioned action** | `service.enqueue_outbox_event("verified", user, version="v1")` | `HighPerfStatelessService.user.verified.v1` |
-| **Helper call** | `format_event_type("order", "placed")` | `HighPerfStatelessService.order.placed` |
-| **Cross-service helper** | `format_event_type("AuthService", "user", "created")` | `AuthService.user.created` |
+| Use Case                    | Method / Call                                                  | Resulting `event_type`                      |
+| :-------------------------- | :------------------------------------------------------------- | :------------------------------------------ |
+| **Standard CRUD (opt-in)**  | `service.create(payload, emit_outbox_event=True)`              | `HighPerfStatelessService.user.created`     |
+| **Standard CRUD (default)** | `service.create(payload)`                                      | _No event generated_                        |
+| **Custom action**           | `service.enqueue_outbox_event("verified", user)`               | `HighPerfStatelessService.user.verified`    |
+| **Versioned action**        | `service.enqueue_outbox_event("verified", user, version="v1")` | `HighPerfStatelessService.user.verified.v1` |
+| **Helper call**             | `format_event_type("order", "placed")`                         | `HighPerfStatelessService.order.placed`     |
+| **Cross-service helper**    | `format_event_type("AuthService", "user", "created")`          | `AuthService.user.created`                  |
 
 ```python
 # Scenario: specifying a contract version for a breaking schema change
@@ -1197,6 +1087,7 @@ ON outbox_events (topic, event_key, published_at, created_at);
 ```
 
 **Non-blocking worker concurrency (`SKIP LOCKED`)** — the background dispatcher polls pending records using PostgreSQL row-level locks:
+
 ```sql
 SELECT * FROM outbox_events AS o
 WHERE o.published_at IS NULL
@@ -1211,6 +1102,7 @@ ORDER BY o.created_at, o.id
 LIMIT 100
 FOR UPDATE SKIP LOCKED;
 ```
+
 - **`SKIP LOCKED`**: Multiple worker instances poll concurrently without lock contention or deadlocks.
 - **`NOT EXISTS`**: Guarantees strict FIFO ordering per aggregate — if Event 1 fails, Event 2 for the same entity waits until Event 1 succeeds.
 
@@ -1218,6 +1110,7 @@ FOR UPDATE SKIP LOCKED;
 
 1. **Partition keying**: all events are produced to Kafka using `key=event.event_key` (the entity/aggregate ID). Kafka guarantees that messages with an identical key land on the same partition, guaranteeing **strict in-order delivery**.
 2. **At-least-once deduplication**: because network retries can resend events, downstream consumers must deduplicate using `event_id`:
+
 ```python
 async def handle_user_created(event: dict) -> None:
     event_id = event["event_id"]
@@ -1232,6 +1125,7 @@ async def handle_user_created(event: dict) -> None:
 ### 6. Producer Architecture
 
 [`app/kafka/producer.py`](app/kafka/producer.py) — driver: `aiokafka.AIOKafkaProducer`.
+
 - `acks="all"`: ensures acknowledgment by the full broker quorum (leader and in-sync replicas).
 - `enable_idempotence=True`: eliminates duplicate messages from producer-side retries.
 - `compression_type="gzip"`: minimizes network bandwidth overhead.
@@ -1239,18 +1133,21 @@ async def handle_user_created(event: dict) -> None:
 ### 7. Consumer Architecture & Strict Manual Offset Commit
 
 [`app/kafka/consumer.py`](app/kafka/consumer.py) — **the golden rule: database transaction commits first, Kafka offset commits second.**
+
 - `enable_auto_commit=False`: offsets are never advanced automatically.
 - **Failure recovery**: if the database transaction or handler fails, the consumer seeks back to the failed record offset (`consumer.seek(partition, failed_offset)`) and does **not** advance the offset, ensuring no event is ever skipped.
 
 ### 8. Consumer Retry Policy & Dead Letter Queue
 
 [`app/kafka/dlq.py`](app/kafka/dlq.py) differentiates between two failure classes:
+
 1. **Transient errors** (deadlocks, DB connection dropouts): retried up to 3 times with exponential backoff and random jitter. If retries succeed, the offset commits normally.
 2. **Permanent errors** (malformed JSON, `ValidationError`, non-existent entity): retrying is futile and would stall partition processing indefinitely. Escalated immediately to `DeadLetterQueueService`, routed to `{topic}.DLQ` (e.g. `orders.events.DLQ`) with diagnostic headers: `x-error-message`, `x-original-topic`, `x-failed-timestamp`, `x-retry-count`. The offset then commits, unblocking the partition for SREs to inspect and replay the DLQ topic.
 
 ### 9. Inventory Reservation Saga & TTL Sweeper
 
 Manages high-throughput inventory allocation without race conditions ([`app/services/inventory_reservations.py`](app/services/inventory_reservations.py)):
+
 1. Consumes `inventory.reserved.v1` events on `KAFKA_INVENTORY_TOPIC`.
 2. **PostgreSQL conditional hold**: `products.stock` remains physical on-hand stock; `products.reserved_quantity` tracks holds; available-to-promise is `stock - reserved_quantity`.
 3. If stock is sufficient, records the reservation with an expiration timestamp (`ttl_minutes`).
@@ -1262,9 +1159,11 @@ Invalid payloads and unknown products are routed to `KAFKA_INVENTORY_DLQ_TOPIC` 
 ### 10. Standalone Background Worker Daemon
 
 [`app/workers/main.py`](app/workers/main.py) decouples long-running Kafka event consumption and outbox dispatch from web worker processes:
+
 ```bash
 python -m app.workers.main
 ```
+
 Manages supervisor lifecycle, graceful shutdown on `SIGINT`/`SIGTERM`, and asynchronous consumer loops outside Gunicorn. See [`app/workers/consumer_runner.py`](app/workers/consumer_runner.py) `WorkerSupervisor` for how consumers are registered — also covered in [§9.11.8](#911-building-service-to-service-events-with-kafka).
 
 ---
@@ -1325,6 +1224,7 @@ $$\text{PgBouncer } \text{DEFAULT\_POOL\_SIZE} \le \text{PostgreSQL } \text{max\
 $$80 \le 150 - 30 = 120 \quad \checkmark$$
 
 ---
+
 ## 🛠️ Developer Implementation Workflow (Step-by-Step Guide)
 
 This section is a complete, copy-pasteable reference for developers creating a new entity, CRUD operations, relationships, or Kafka events in the project.
@@ -1333,19 +1233,19 @@ This section is a complete, copy-pasteable reference for developers creating a n
 
 When adding a new entity (for example, `Order`), follow this checklist:
 
-| Action | File Path | Purpose |
-|---|---|---|
-| **CREATE** | `app/models/order.py` | SQLAlchemy 2.0 Declarative Table Model |
-| **CREATE** | `app/schemas/order.py` | Pydantic v2 Schemas (`OrderCreate`, `OrderUpdate`, `OrderRead`, `OrderPage`) |
-| **CREATE** | `app/repositories/order_repository.py` | Subclass of `BaseRepository[Order, uuid.UUID]` |
-| **CREATE** | `app/services/order_service.py` | Subclass of `BaseService` with domain logic and hooks |
-| **CREATE** | `app/api/v1/orders.py` | Dynamic `CRUDRouter` with zero explicit boilerplate |
-| **CREATE** | `tests/test_orders.py` | Automated tests (CRUD, pagination, validation, 404s) |
-| **MODIFY** | `app/models/__init__.py` | Export `Order` model for discovery |
-| **MODIFY** | `app/schemas/__init__.py` | Re-export schemas |
-| **MODIFY** | `app/repositories/__init__.py` | Re-export repository |
-| **MODIFY** | `app/services/__init__.py` | Re-export service |
-| **MODIFY** | `app/api/v1/router.py` | Mount `orders.router` under `/orders` |
+| Action     | File Path                              | Purpose                                                                      |
+| ---------- | -------------------------------------- | ---------------------------------------------------------------------------- |
+| **CREATE** | `app/models/order.py`                  | SQLAlchemy 2.0 Declarative Table Model                                       |
+| **CREATE** | `app/schemas/order.py`                 | Pydantic v2 Schemas (`OrderCreate`, `OrderUpdate`, `OrderRead`, `OrderPage`) |
+| **CREATE** | `app/repositories/order_repository.py` | Subclass of `BaseRepository[Order, uuid.UUID]`                               |
+| **CREATE** | `app/services/order_service.py`        | Subclass of `BaseService` with domain logic and hooks                        |
+| **CREATE** | `app/api/v1/orders.py`                 | Dynamic `CRUDRouter` with zero explicit boilerplate                          |
+| **CREATE** | `tests/test_orders.py`                 | Automated tests (CRUD, pagination, validation, 404s)                         |
+| **MODIFY** | `app/models/__init__.py`               | Export `Order` model for discovery                                           |
+| **MODIFY** | `app/schemas/__init__.py`              | Re-export schemas                                                            |
+| **MODIFY** | `app/repositories/__init__.py`         | Re-export repository                                                         |
+| **MODIFY** | `app/services/__init__.py`             | Re-export service                                                            |
+| **MODIFY** | `app/api/v1/router.py`                 | Mount `orders.router` under `/orders`                                        |
 
 ### 9.2 How Developers Add a New Entity (Order Example)
 
@@ -1405,6 +1305,7 @@ class Order(Base):
 ```
 
 **Key requirements**:
+
 1. Inherit from `app.models.base.Base`.
 2. Always define the composite index: `Index("ix_<table_name>_created_at_id", "created_at", "id")`.
 3. Use `UUID(as_uuid=True)` for native PostgreSQL UUIDs.
@@ -1637,26 +1538,27 @@ __all__ = ["router", "get_order_service", "OrderServiceDep"]
 #### Step 6: Register the Route & Exports
 
 1. **Mount in master router** (`app/api/v1/router.py`):
-   ```python
-   from app.api.v1.categories import router as categories_router
-   from app.api.v1.health import router as health_router
-   from app.api.v1.orders import router as orders_router
-   from app.api.v1.products import router as products_router
-   from app.api.v1.users import router as users_router
 
-   api_router = APIRouter()
-   api_router.include_router(users_router)
-   api_router.include_router(products_router)
-   api_router.include_router(categories_router)
-   api_router.include_router(orders_router)  # <-- Mounts /orders CRUD + custom actions
-   api_router.include_router(health_router)
-   ```
+    ```python
+    from app.api.v1.categories import router as categories_router
+    from app.api.v1.health import router as health_router
+    from app.api.v1.orders import router as orders_router
+    from app.api.v1.products import router as products_router
+    from app.api.v1.users import router as users_router
+
+    api_router = APIRouter()
+    api_router.include_router(users_router)
+    api_router.include_router(products_router)
+    api_router.include_router(categories_router)
+    api_router.include_router(orders_router)  # <-- Mounts /orders CRUD + custom actions
+    api_router.include_router(health_router)
+    ```
 
 2. **Re-export in package inits**:
-   - `app/models/__init__.py`: add `from app.models.order import Order`
-   - `app/schemas/__init__.py`: add `from app.schemas.order import OrderCreate, OrderRead, OrderUpdate, OrderPage`
-   - `app/repositories/__init__.py`: add `from app.repositories.order_repository import OrderRepository`
-   - `app/services/__init__.py`: add `from app.services.order_service import OrderService`
+    - `app/models/__init__.py`: add `from app.models.order import Order`
+    - `app/schemas/__init__.py`: add `from app.schemas.order import OrderCreate, OrderRead, OrderUpdate, OrderPage`
+    - `app/repositories/__init__.py`: add `from app.repositories.order_repository import OrderRepository`
+    - `app/services/__init__.py`: add `from app.services.order_service import OrderService`
 
 The new entity is immediately operational with keyset pagination, Redis caching, stampede locks, and transaction management — with zero duplicated CRUD code.
 
@@ -1703,6 +1605,7 @@ active_count = await repo.count(is_active=True)
 If a business action must modify multiple entities atomically (for example, creating an order and reducing inventory), both repositories must share the exact same `AsyncSession`:
 
 **Pattern A — Shared `AsyncSession` via `get_db`** (preferred for request-scoped services):
+
 ```python
 class CheckoutService:
     def __init__(self, order_repo: OrderRepository, product_repo: ProductRepository):
@@ -1725,6 +1628,7 @@ class CheckoutService:
 ```
 
 **Pattern B — Explicit multi-repository transaction with a shared session**:
+
 ```python
 async def process_checkout(db: AsyncSession, user_id: uuid.UUID, sku: str, quantity: int):
     product_repo = ProductRepository(db)
@@ -1742,6 +1646,7 @@ async def process_checkout(db: AsyncSession, user_id: uuid.UUID, sku: str, quant
 ```
 
 **Golden Rules**:
+
 - Never call `session.commit()` inside repositories or services' repository calls — only `get_db` (or a `uow` context manager) commits.
 - Repositories only call `session.flush()`, pushing SQL to the transaction buffer without committing.
 - This design allows a service to update multiple repositories within a single atomic database transaction.
@@ -1752,7 +1657,7 @@ async def process_checkout(db: AsyncSession, user_id: uuid.UUID, sku: str, quant
 
 ### 9.6 Overriding Service Lifecycle Hooks
 
-[`BaseService`](app/services/base.py) exposes four lifecycle hooks:
+[`BaseService`](app/services/base.py) exposes seven lifecycle hooks — three `before_*` hooks (run prior to the repository write), three `after_*` hooks (run after the transaction commits), and two serialization hooks:
 
 ```python
 class CustomService(BaseService[...]):
@@ -1766,6 +1671,28 @@ class CustomService(BaseService[...]):
         for key, val in update_data.items():
             setattr(entity, key, val)
 
+    async def before_delete(self, entity: Model) -> None:
+        """Called before the repository delete. Enforce custom cascading rules."""
+        pass
+
+    async def after_create(self, entity: Model) -> None:
+        """Called after the entity is created AND the transaction commits.
+        Side effects here see a durably persisted entity — e.g. send a welcome email,
+        schedule a follow-up job, write an audit log. Runs before the Elasticsearch sync."""
+        pass
+
+    async def after_update(self, entity: Model, payload: UpdateSchema) -> None:
+        """Called after the entity is updated AND the transaction commits.
+        `payload` is the original update DTO, in case the hook needs to know which
+        fields were explicitly set (`payload.model_dump(exclude_unset=True)`)."""
+        pass
+
+    async def after_delete(self, entity: Model) -> None:
+        """Called after the entity is deleted AND the transaction commits.
+        `entity` reflects its last in-memory state prior to deletion — use it to
+        clean up dependent resources or emit a deletion notification."""
+        pass
+
     async def to_read_schema(self, entity: Model) -> ReadSchema:
         """Converts model to public read schema. Decrypt ciphertext or mask PII fields."""
         return self.read_schema_cls.model_validate(entity)
@@ -1775,6 +1702,8 @@ class CustomService(BaseService[...]):
         read_model = await self.to_read_schema(entity)
         return read_model.model_dump(mode="json")
 ```
+
+All six `before_*`/`after_*` hooks default to a no-op (`before_create`/`before_update` instead have a sensible generic default implementation — see [`app/services/base.py`](app/services/base.py)); override only the ones a given domain service actually needs. The `after_*` hooks fire unconditionally once the surrounding `create`/`update`/`delete` call reaches that point — including when the service has no `db` session (e.g. in unit tests) — so they're always a reliable place to hook in side effects without duplicating `BaseService`'s transaction-commit logic.
 
 ### 9.7 Controlling Transactions & Unit of Work Boundary
 
@@ -1790,6 +1719,7 @@ class CustomService(BaseService[...]):
 The caching layer can be toggled globally via environment variables or overridden per-call in code:
 
 **Global environment toggles (`.env`)**:
+
 ```ini
 CACHE_ENABLE_GET_ITEM=true
 CACHE_ENABLE_SET_ITEM=true
@@ -1800,6 +1730,7 @@ CACHE_ENABLE_NEGATIVE_CACHE=true
 ```
 
 **Per-call runtime overrides (Python)**:
+
 ```python
 # Standard request: honors global cache settings
 user = await service.get_user_by_id(user_id)
@@ -1844,6 +1775,7 @@ async def test_order_crud_lifecycle(async_session, mock_redis):
 ```
 
 ---
+
 ### 9.10 Nested Tables & Entity Relationships Guide (Category in Product)
 
 This section details how to model, query, validate, cache, and migrate nested tables and relationships in this architecture, using the **Category ↔ Product** relationship as the canonical production reference.
@@ -1865,6 +1797,7 @@ In an asynchronous high-concurrency architecture serving **100,000 concurrent re
 Both sides of the relationship are mapped using SQLAlchemy 2.0 type-annotated columns:
 
 **Parent entity: `Category`** (`app/models/category.py`):
+
 ```python
 from typing import List, Optional, TYPE_CHECKING
 from sqlalchemy import Boolean, String, Text
@@ -1891,6 +1824,7 @@ class Category(IdIntMixin, TimestampMixin, Base):
 ```
 
 **Child entity: `Product`** (`app/models/product.py`):
+
 ```python
 from typing import Optional, TYPE_CHECKING
 import uuid
@@ -1927,12 +1861,14 @@ class Product(Base):
 ```
 
 > [!IMPORTANT]
+>
 > - Always place `index=True` on Foreign Key columns. Without a B-Tree index on the foreign key, PostgreSQL must execute a full-table scan on the child table whenever the parent table is queried or modified.
 > - Use `ondelete="RESTRICT"` for critical business hierarchies to prevent accidental cascading deletion of inventory or orders.
 
 #### 9.10.3 Step 2: Nested Pydantic Schemas (Embedded DTOs & Validation)
 
 To optimize payload sizes, separate standard flat CRUD schemas from enriched nested detail schemas (`app/schemas/product.py`):
+
 ```python
 from datetime import datetime
 from typing import Optional, Union
@@ -1977,14 +1913,18 @@ class ProductDetail(ProductRead):
 When querying entities with relationships, instruct SQLAlchemy to pre-load relations in the repository query:
 
 - **`selectinload` (recommended for 1:N collections and async N:1)**: executes two queries linked by primary keys:
-  ```sql
-  SELECT * FROM products WHERE id = :id;
-  SELECT * FROM categories WHERE id IN (:category_id);
-  ```
-  Prevents Cartesian product duplicates across tables.
+
+    ```sql
+    SELECT * FROM products WHERE id = :id;
+    SELECT * FROM categories WHERE id IN (:category_id);
+    ```
+
+    Prevents Cartesian product duplicates across tables.
+
 - **`joinedload` (recommended for strict 1:1 foreign keys)**: uses an SQL `LEFT OUTER JOIN`. Do not use `joinedload` on large collections with `limit`/`offset`, since SQL joins multiply row counts before slicing.
 
 Implementation in `app/repositories/product.py`:
+
 ```python
 from sqlalchemy.orm import selectinload
 from app.models.product import Product
@@ -2013,6 +1953,7 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
 #### 9.10.5 Step 4: Service Layer Validation & Cross-Entity Cache Invalidation
 
 The Service layer enforces cross-entity business rules and cache consistency across parent and child entities (`app/services/product.py`):
+
 ```python
 from app.core.exceptions import BusinessRuleError, NotFoundError
 from app.repositories.category import CategoryRepository
@@ -2049,6 +1990,7 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
 ```
 
 **Cache coordination between parent and child** — when a parent `Category` is updated or deactivated, invalidate the child's list cache too, so stale embedded category data never serves from a product list:
+
 ```python
 # Inside CategoryService.update_by_id():
 updated_category = await self.repo.update(...)
@@ -2095,37 +2037,44 @@ async def product_detail(item_id: Union[uuid.UUID, int], service: ProductService
 Whenever foreign keys or relationship tables are added or modified:
 
 1. **Generate the migration script**:
-   ```bash
-   alembic revision --autogenerate -m "add_category_fk_to_products"
-   ```
-2. **Inspect the generated migration file** — verify that it correctly includes:
-   ```python
-   # Inside alembic/versions/<hash>_add_category_fk_to_products.py
-   def upgrade() -> None:
-       op.add_column('products', sa.Column('category_id', sa.Integer(), nullable=True))
-       op.create_index('ix_products_category_id', 'products', ['category_id'], unique=False)
-       op.create_foreign_key(
-           'fk_products_category_id_categories',
-           'products',
-           'categories',
-           ['category_id'],
-           ['id'],
-           ondelete='RESTRICT'
-       )
 
-   def downgrade() -> None:
-       op.drop_constraint('fk_products_category_id_categories', 'products', type_='foreignkey')
-       op.drop_index('ix_products_category_id', table_name='products')
-       op.drop_column('products', 'category_id')
-   ```
+    ```bash
+    alembic revision --autogenerate -m "add_category_fk_to_products"
+    ```
+
+2. **Inspect the generated migration file** — verify that it correctly includes:
+
+    ```python
+    # Inside alembic/versions/<hash>_add_category_fk_to_products.py
+    def upgrade() -> None:
+        op.add_column('products', sa.Column('category_id', sa.Integer(), nullable=True))
+        op.create_index('ix_products_category_id', 'products', ['category_id'], unique=False)
+        op.create_foreign_key(
+            'fk_products_category_id_categories',
+            'products',
+            'categories',
+            ['category_id'],
+            ['id'],
+            ondelete='RESTRICT'
+        )
+
+    def downgrade() -> None:
+        op.drop_constraint('fk_products_category_id_categories', 'products', type_='foreignkey')
+        op.drop_index('ix_products_category_id', table_name='products')
+        op.drop_column('products', 'category_id')
+    ```
+
 3. **Verify schema health**:
-   ```bash
-   python3 .agents/agents/developer-agent/skills/db_migration_helper.py
-   ```
+
+    ```bash
+    python3 .agents/agents/developer-agent/skills/db_migration_helper.py
+    ```
+
 4. **Apply migration to database**:
-   ```bash
-   alembic upgrade head
-   ```
+
+    ```bash
+    alembic upgrade head
+    ```
 
 #### 9.10.8 Step 7: Testing Relationships & Preventing N+1 Regressions
 
@@ -2186,44 +2135,45 @@ async def test_product_category_inactive_rejected(async_session, mock_redis):
 ```
 
 ---
+
 ### 9.11 Building Service-to-Service Events with Kafka
 
 This walkthrough guides developers through implementing end-to-end asynchronous service-to-service communication using Apache Kafka and the Transactional Outbox Pattern (mechanics covered in [§7 Deep Dive: Apache Kafka](#-deep-dive-apache-kafka-transactional-outbox--event-driven-architecture)).
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                        SERVICE-TO-SERVICE EVENT-DRIVEN FLOW                            │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                        │
-│   [Service A: Producer]                                                                │
-│      │                                                                                 │
-│      ├── 1. ACID Transaction (PostgreSQL via PgBouncer)                                │
-│      │      ├── Insert Domain Mutation (e.g. orders table)                             │
-│      │      └── Insert Outbox Record (outbox_events table)                             │
-│      ▼                                                                                 │
-│   [PostgreSQL 16 Engine] ◄─── Atomic Commit (Zero Phantom Events)                      │
-│      │                                                                                 │
-│      ▼ (Asynchronous Poll via SKIP LOCKED)                                             │
-│   [Outbox Dispatcher Daemon]                                                           │
-│      │                                                                                 │
-│      ├── 2. Publish with acks=all, gzip, partition key=aggregate_id                    │
-│      ▼                                                                                 │
-│   [Apache Kafka Cluster] (Topic: orders.events)                                        │
-│      │                                                                                 │
-│      ▼ (Consumer Group Partition Assignment)                                           │
-│   [Service B: Consumer Daemon] (`app.workers.main`)                                    │
-│      │                                                                                 │
-│      ├── 3. Strict Manual Commit Protocol:                                             │
-│      │      ├── A. Validate Schema (CloudEvents envelope)                              │
-│      │      ├── B. Check Idempotency (Deduplicate event_id)                            │
-│      │      ├── C. Execute Downstream Business Mutation (e.g. inventory)               │
-│      │      ├── D. Commit PostgreSQL Transaction FIRST                                 │
-│      │      └── E. Commit Kafka Partition Offset SECOND                                │
-│      │                                                                                 │
-│      └── 4. On Error:                                                                  │
-│             ├── Transient Error  ──► Exponential Backoff Retry (Max 3)                 │
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                        SERVICE-TO-SERVICE EVENT-DRIVEN FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                         │
+│   [Service A: Producer]                                                                 │
+│      │                                                                                  │
+│      ├── 1. ACID Transaction (PostgreSQL via PgBouncer)                                 │
+│      │      ├── Insert Domain Mutation (e.g. orders table)                              │
+│      │      └── Insert Outbox Record (outbox_events table)                              │
+│      ▼                                                                                  │
+│   [PostgreSQL 16 Engine] ◄─── Atomic Commit (Zero Phantom Events)                       │
+│      │                                                                                  │
+│      ▼ (Asynchronous Poll via SKIP LOCKED)                                              │
+│   [Outbox Dispatcher Daemon]                                                            │
+│      │                                                                                  │
+│      ├── 2. Publish with acks=all, gzip, partition key=aggregate_id                     │
+│      ▼                                                                                  │
+│   [Apache Kafka Cluster] (Topic: orders.events)                                         │
+│      │                                                                                  │
+│      ▼ (Consumer Group Partition Assignment)                                            │
+│   [Service B: Consumer Daemon] (`app.workers.main`)                                     │
+│      │                                                                                  │
+│      ├── 3. Strict Manual Commit Protocol:                                              │
+│      │      ├── A. Validate Schema (CloudEvents envelope)                               │
+│      │      ├── B. Check Idempotency (Deduplicate event_id)                             │
+│      │      ├── C. Execute Downstream Business Mutation (e.g. inventory)                │
+│      │      ├── D. Commit PostgreSQL Transaction FIRST                                  │
+│      │      └── E. Commit Kafka Partition Offset SECOND                                 │
+│      │                                                                                  │
+│      └── 4. On Error:                                                                   │
+│             ├── Transient Error  ──► Exponential Backoff Retry (Max 3)                  │
 │             └── Permanent Error  ──► Escalate to Dead Letter Queue (`orders.events.DLQ`)│
-└────────────────────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### 9.11.1 Architecture Overview: Decoupled Choreography & Dual-Write Prevention
@@ -2280,6 +2230,7 @@ __all__ = [
 ```
 
 **Contract design rules**:
+
 1. **Schema versioning**: suffix the `event_type` with the schema version (e.g. `.v1`, `.v2`).
 2. **Minimal PII**: never include sensitive unencrypted PII (credit cards, raw phone numbers, passwords) in event payloads. Use entity IDs or masked values.
 3. **Immutability**: event payloads represent historical facts that have already occurred.
@@ -2306,6 +2257,7 @@ Events are **never published directly to Kafka over the network inside an HTTP s
 ```
 
 In `app/api/deps.py`, the FastAPI dependency provider dynamically inspects the service constructor. When `KAFKA_ENABLED=true` in `.env`, it automatically injects:
+
 ```python
 if "outbox_enabled" in init_sig.parameters:
     kwargs["outbox_enabled"] = settings.KAFKA_ENABLED  # True when Kafka is enabled
@@ -2315,11 +2267,13 @@ if "outbox_topic" in init_sig.parameters:
 ```
 
 **Pattern 1 — Automatic lifecycle event triggering.** For any entity extending `BaseService` (like `UserService`, `ProductService`, or `CategoryService`), standard CRUD operations can trigger events without writing any extra code once `emit_outbox_event=True` is passed (or `auto_outbox_events=True` is set — see [§7.3](#-deep-dive-apache-kafka-transactional-outbox--event-driven-architecture)):
+
 - `service.create(payload, emit_outbox_event=True)` ➔ emits `{resource_name}.created`
 - `service.update_by_id(id, payload, emit_outbox_event=True)` ➔ emits `{resource_name}.updated`
 - `service.delete_by_id(id, emit_outbox_event=True)` ➔ emits `{resource_name}.deleted`
 
 **Pattern 2 — Domain action helper (`self._enqueue_outbox_event`).** For custom service methods that mutate state (adjusting inventory, toggling a status), call the inherited helper:
+
 ```python
 # app/services/product.py
 class ProductService(BaseService[Product, ...]):
@@ -2339,6 +2293,7 @@ class ProductService(BaseService[Product, ...]):
 ```
 
 **Pattern 3 — Explicit CloudEvents triggering (`OutboxEvent` direct addition).** For inter-microservice workflows requiring rich, strongly-typed event contracts:
+
 ```python
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2395,6 +2350,7 @@ class OrderService:
 ```
 
 **Developer triggering scenarios** (the service-method and manual-trigger shapes you'll actually write):
+
 ```python
 # A. Standard CRUD with opt-in event emission
 user = await user_service.create(
@@ -2499,6 +2455,7 @@ class OrderNotificationConsumer(BaseConsumer):
 Kafka provides **at-least-once delivery**. A network blip during offset commit can cause Kafka to re-deliver the same event, so downstream consumers **must be idempotent**.
 
 **Pattern A — database unique constraint (recommended).** Maintain a `processed_events` table:
+
 ```sql
 CREATE TABLE processed_events (
     event_id VARCHAR(64) NOT NULL,
@@ -2507,7 +2464,9 @@ CREATE TABLE processed_events (
     PRIMARY KEY (event_id, consumer_group)
 );
 ```
+
 Check and record the event atomically inside the business transaction:
+
 ```python
 from sqlalchemy.dialects.postgresql import insert
 
@@ -2526,6 +2485,7 @@ async with session.begin():
 ```
 
 **Pattern B — natural business state (conditional updates).** For an inventory hold:
+
 ```sql
 UPDATE products
 SET reserved_quantity = reserved_quantity + :qty
@@ -2535,6 +2495,7 @@ WHERE id = :product_id AND (stock - reserved_quantity) >= :qty;
 #### 9.11.7 Step 6: Error Handling, Retries & Dead Letter Queue (DLQ)
 
 `BaseConsumer` (`app/kafka/consumer.py`) differentiates **transient** and **permanent** failures (full mechanics in [§7.8](#-deep-dive-apache-kafka-transactional-outbox--event-driven-architecture)):
+
 1. **Transient errors** (deadlock, connection timeout): retried up to `max_retries=3` with exponential backoff (`delay = 2.0 * (2 ** attempt)`). If retries succeed, the offset commits normally.
 2. **Permanent errors** (`ValidationError`, malformed JSON, corrupted data): escalated immediately to `DeadLetterQueueService`, routed to `{topic}.DLQ` with diagnostic headers (`x-error-message`, `x-original-topic`, `x-failed-timestamp`, `x-retry-count`). The offset commits, unblocking the partition for SREs to inspect and replay.
 
@@ -2572,6 +2533,7 @@ class WorkerSupervisor:
 ```
 
 Run it in development or production with:
+
 ```bash
 python -m app.workers.main
 ```
@@ -2607,6 +2569,7 @@ def test_order_placed_event_serialization():
 ```
 
 Integration test verifying the database outbox event staging (`tests/test_kafka_outbox.py`):
+
 ```python
 import pytest
 from sqlalchemy import select
@@ -2645,6 +2608,7 @@ async def test_service_triggers_outbox_event(async_session, mock_redis):
 ```
 
 ---
+
 ## 📡 API Reference with Full Examples
 
 ### Users Endpoints (`/api/v1/users`)
@@ -2796,37 +2760,38 @@ pytest -v
 
 ### Coverage Breakdown
 
-| Test Suite               | File                                                                                       | What is Validated                                                                                              |
-| ------------------------ | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| **Repository & Service** | [`test_repository.py`](tests/test_repository.py) | BaseRepository CRUD, BaseService caching, per-call `cache_enabled=False` override, list cache invalidation     |
-| **Catalog Domain**       | [`test_products.py`](tests/test_products.py)     | Product entity creation, keyset listing, 404 NotFoundError verification, category eager-loading & N+1 regressions |
-| **User Domain**          | [`test_users.py`](tests/test_users.py)           | Strict E.164 phone regex validation, Base64 cursor encoding and decoding                                       |
-| **Employee Domain**      | [`test_employees.py`](tests/test_employees.py)   | 1-to-1 User relationship CRUD, schema validation                                                               |
-| **Cryptography**         | [`test_encryption.py`](tests/test_encryption.py) | AES-256-GCM roundtrip, fresh random nonces, AAD tamper detection, key rotation across versions, blind indexing |
-| **Rate Limiter**         | [`test_rate_limit.py`](tests/test_rate_limit.py) | Trusted proxy IP resolution, Redis Lua script execution, 429 quota enforcement, fail-open resilience           |
-| **Cache Engine**         | [`test_cache.py`](tests/test_cache.py) / [`test_redis_advanced.py`](tests/test_redis_advanced.py) | Dynamic feature flags, negative caching sentinel, namespace versioning, stampede mutex locks |
-| **CRUD Router & Search** | [`test_crud_router_and_elasticsearch.py`](tests/test_crud_router_and_elasticsearch.py) | Dynamic filter/sort model generation, Elasticsearch search offload, graceful degradation |
-| **Logging & Search**     | [`test_logging_and_elasticsearch.py`](tests/test_logging_and_elasticsearch.py) | Structured log formatting, async log buffer, log search API |
-| **Kafka Events & Outbox**| [`test_kafka_events.py`](tests/test_kafka_events.py) / [`test_kafka_outbox.py`](tests/test_kafka_outbox.py) | CloudEvents (de)serialization, transactional outbox staging |
-| **Kafka Consumer**       | [`test_kafka_consumer.py`](tests/test_kafka_consumer.py) | Manual offset commit, retry/backoff, DLQ routing |
-| **Inventory Reservations**| [`test_inventory_reservations.py`](tests/test_inventory_reservations.py) | Conditional stock holds, TTL expiry sweeper, idempotent reservation handling |
-| **Database Init & Seeders**| [`test_database_initialization.py`](tests/test_database_initialization.py) / [`test_database_seeders.py`](tests/test_database_seeders.py) / [`test_database_seeders_cli.py`](tests/test_database_seeders_cli.py) | Table-creation diffing, topological seeder resolution, CLI behavior |
-| **API Route Registration**| [`test_api_route_registration.py`](tests/test_api_route_registration.py) | All versioned routers mount correctly under `/api/v1` |
+| Test Suite                  | File                                                                                                                                                                                                             | What is Validated                                                                                                 |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Repository & Service**    | [`test_repository.py`](tests/test_repository.py)                                                                                                                                                                 | BaseRepository CRUD, BaseService caching, per-call `cache_enabled=False` override, list cache invalidation        |
+| **Catalog Domain**          | [`test_products.py`](tests/test_products.py)                                                                                                                                                                     | Product entity creation, keyset listing, 404 NotFoundError verification, category eager-loading & N+1 regressions |
+| **User Domain**             | [`test_users.py`](tests/test_users.py)                                                                                                                                                                           | Strict E.164 phone regex validation, Base64 cursor encoding and decoding                                          |
+| **Employee Domain**         | [`test_employees.py`](tests/test_employees.py)                                                                                                                                                                   | 1-to-1 User relationship CRUD, schema validation                                                                  |
+| **Cryptography**            | [`test_encryption.py`](tests/test_encryption.py)                                                                                                                                                                 | AES-256-GCM roundtrip, fresh random nonces, AAD tamper detection, key rotation across versions, blind indexing    |
+| **Rate Limiter**            | [`test_rate_limit.py`](tests/test_rate_limit.py)                                                                                                                                                                 | Trusted proxy IP resolution, Redis Lua script execution, 429 quota enforcement, fail-open resilience              |
+| **Cache Engine**            | [`test_cache.py`](tests/test_cache.py) / [`test_redis_advanced.py`](tests/test_redis_advanced.py)                                                                                                                | Dynamic feature flags, negative caching sentinel, namespace versioning, stampede mutex locks                      |
+| **CRUD Router & Search**    | [`test_crud_router_and_elasticsearch.py`](tests/test_crud_router_and_elasticsearch.py)                                                                                                                           | Dynamic filter/sort model generation, Elasticsearch search offload, graceful degradation                          |
+| **Logging & Search**        | [`test_logging_and_elasticsearch.py`](tests/test_logging_and_elasticsearch.py)                                                                                                                                   | Structured log formatting, async log buffer, log search API                                                       |
+| **Kafka Events & Outbox**   | [`test_kafka_events.py`](tests/test_kafka_events.py) / [`test_kafka_outbox.py`](tests/test_kafka_outbox.py)                                                                                                      | CloudEvents (de)serialization, transactional outbox staging                                                       |
+| **Kafka Consumer**          | [`test_kafka_consumer.py`](tests/test_kafka_consumer.py)                                                                                                                                                         | Manual offset commit, retry/backoff, DLQ routing                                                                  |
+| **Inventory Reservations**  | [`test_inventory_reservations.py`](tests/test_inventory_reservations.py)                                                                                                                                         | Conditional stock holds, TTL expiry sweeper, idempotent reservation handling                                      |
+| **Database Init & Seeders** | [`test_database_initialization.py`](tests/test_database_initialization.py) / [`test_database_seeders.py`](tests/test_database_seeders.py) / [`test_database_seeders_cli.py`](tests/test_database_seeders_cli.py) | Table-creation diffing, topological seeder resolution, CLI behavior                                               |
+| **API Route Registration**  | [`test_api_route_registration.py`](tests/test_api_route_registration.py)                                                                                                                                         | All versioned routers mount correctly under `/api/v1`                                                             |
 
 ---
+
 ## 🗃️ Database Initialization, Migrations & Seeders
 
 Automatic initialization is opt-in. `AUTO_MIGRATE`, `AUTO_CREATE_TABLES`, and `AUTO_SEED` all default to `false`. Startup checks database connectivity and reports missing registered tables; it does not generate migrations or create schema unless explicitly enabled. Set `MIGRATION_DATABASE_URL` to a direct database connection when applying migrations, especially when the application URL goes through PgBouncer.
 
-| Variable | Default | Behavior |
-| --- | --- | --- |
-| `DATABASE_URL` | project async PostgreSQL URL | Application connection URL. PostgreSQL uses `asyncpg`, MySQL uses `asyncmy`, and SQLite uses `aiosqlite`. Common `mysql+pymysql://...` URLs are normalized to the supported async driver. |
-| `MIGRATION_DATABASE_URL` | unset | Optional direct URL used by Alembic and the migration CLI; falls back to `DATABASE_URL`. |
-| `ENVIRONMENT` | `development` | Environment label for deployment configuration. |
-| `AUTO_MIGRATE` | `false` | Applies existing Alembic revisions at startup. Never generates revisions. |
-| `AUTO_CREATE_TABLES` | `false` | Creates only missing metadata tables for an unmanaged development/test database. It refuses to bypass an existing `alembic_version` history. |
-| `AUTO_SEED` | `false` | Runs registered idempotent seeders after the schema is ready. |
-| `SEED_CATEGORIES` | `[]` | Optional JSON list of category names for the safe reference-data example seeder. Existing rows are not updated. No demo users/accounts or RBAC tables are seeded. |
+| Variable                 | Default                      | Behavior                                                                                                                                                                                  |
+| ------------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`           | project async PostgreSQL URL | Application connection URL. PostgreSQL uses `asyncpg`, MySQL uses `asyncmy`, and SQLite uses `aiosqlite`. Common `mysql+pymysql://...` URLs are normalized to the supported async driver. |
+| `MIGRATION_DATABASE_URL` | unset                        | Optional direct URL used by Alembic and the migration CLI; falls back to `DATABASE_URL`.                                                                                                  |
+| `ENVIRONMENT`            | `development`                | Environment label for deployment configuration.                                                                                                                                           |
+| `AUTO_MIGRATE`           | `false`                      | Applies existing Alembic revisions at startup. Never generates revisions.                                                                                                                 |
+| `AUTO_CREATE_TABLES`     | `false`                      | Creates only missing metadata tables for an unmanaged development/test database. It refuses to bypass an existing `alembic_version` history.                                              |
+| `AUTO_SEED`              | `false`                      | Runs registered idempotent seeders after the schema is ready.                                                                                                                             |
+| `SEED_CATEGORIES`        | `[]`                         | Optional JSON list of category names for the safe reference-data example seeder. Existing rows are not updated. No demo users/accounts or RBAC tables are seeded.                         |
 
 Production deployments should use the existing one-shot Compose migration job or a dedicated deployment job rather than enabling `AUTO_MIGRATE` in each API worker. PostgreSQL and MySQL migrations acquire a database-level lock, so concurrent CLI/startup migration attempts serialize; the one-shot deployment job remains preferred. Automatic initialization never drops tables or downgrades migrations. `create_all()` only runs when explicitly enabled and is not a substitute for Alembic. A database bootstrapped with `create-tables` is unmanaged and has no Alembic revision recorded; do not later run migrations against it without reviewing and explicitly baselining that schema.
 
@@ -2906,17 +2871,17 @@ If tables are absent, `python -m app.database check` and `status` print the miss
 
 ### Host vs. Docker networking & port matrix
 
-| Service | Container Name | Host Access Port | Container Network Port | Internal Network Address |
-| :--- | :--- | :--- | :--- | :--- |
-| **PostgreSQL 16** | `demo_postgres` | `5432` *(external)* | `5432` | `postgres:5432` |
-| **PgBouncer 1.21+** | `demo_pgbouncer` | `6432` | `5432` | `pgbouncer:5432` |
-| **Redis Node 1** | `demo_redis_1` | `7000` | `7000` | `redis-1:7000` |
-| **Redis Node 2** | `demo_redis_2` | `7001` | `7001` | `redis-2:7001` |
-| **Redis Node 3** | `demo_redis_3` | `7002` | `7002` | `redis-3:7002` |
-| **Elasticsearch 8** | `demo_elasticsearch` | `9200` | `9200` | `elasticsearch:9200` |
-| **Apache Kafka** | `demo_kafka` | *(Internal)* | `9092` | `kafka:9092` |
-| **FastAPI App** | `demo_app` | `8000` | `8000` | `app:8000` |
-| **Nginx Proxy** | `demo_nginx` | `80` | `80` | `nginx:80` |
+| Service             | Container Name       | Host Access Port    | Container Network Port | Internal Network Address |
+| :------------------ | :------------------- | :------------------ | :--------------------- | :----------------------- |
+| **PostgreSQL 16**   | `demo_postgres`      | `5432` _(external)_ | `5432`                 | `postgres:5432`          |
+| **PgBouncer 1.21+** | `demo_pgbouncer`     | `6432`              | `5432`                 | `pgbouncer:5432`         |
+| **Redis Node 1**    | `demo_redis_1`       | `7000`              | `7000`                 | `redis-1:7000`           |
+| **Redis Node 2**    | `demo_redis_2`       | `7001`              | `7001`                 | `redis-2:7001`           |
+| **Redis Node 3**    | `demo_redis_3`       | `7002`              | `7002`                 | `redis-3:7002`           |
+| **Elasticsearch 8** | `demo_elasticsearch` | `9200`              | `9200`                 | `elasticsearch:9200`     |
+| **Apache Kafka**    | `demo_kafka`         | _(Internal)_        | `9092`                 | `kafka:9092`             |
+| **FastAPI App**     | `demo_app`           | `8000`              | `8000`                 | `app:8000`               |
+| **Nginx Proxy**     | `demo_nginx`         | `80`                | `80`                   | `nginx:80`               |
 
 ### Environment variable dictionary (`.env`)
 
@@ -3011,12 +2976,14 @@ TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 ### Dynamic service URL assembly in Pydantic settings
 
 In [`app/core/config.py`](app/core/config.py), the `Settings` class uses a Pydantic `@model_validator(mode="after")` to automatically assemble and synchronize connection URLs:
+
 - If individual variables (`DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`) are supplied, `DATABASE_URL` is dynamically updated.
 - If individual Redis parameters (`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`) are supplied and `REDIS_URL` is empty, `REDIS_URL` is automatically assembled.
 - If `ELASTICSEARCH_HOST` and `ELASTICSEARCH_PORT` are supplied, `ELASTICSEARCH_URL` is assembled accordingly.
 - This gives full flexibility between local single-variable shell overrides, containerized deployments, and standard `.env` configuration files.
 
 ---
+
 ## 🚀 Local Development & Production Deployment Guide
 
 ```
@@ -3085,6 +3052,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 The fastest and most consistent way to deploy on a Linux server is using Docker Compose.
 
 **Step 1 — Server preparation & repository setup**:
+
 ```bash
 # Clone the repository onto the server
 git clone https://github.com/your-org/fastapi-repo-pattern.git /opt/fastapi-app
@@ -3096,6 +3064,7 @@ chmod 600 .env  # Restrict permissions so only owner can read secrets
 ```
 
 **Step 2 — Configure production secrets in `.env`**: set hardened `DB_PASSWORD`, `REDIS_PASSWORD`, `ELASTICSEARCH_PASSWORD`; generate secure 32-byte (64 hex character) encryption keys:
+
 ```bash
 # Generate AES-256-GCM encryption key
 openssl rand -hex 32
@@ -3103,14 +3072,17 @@ openssl rand -hex 32
 # Generate HMAC-SHA256 blind index key
 openssl rand -hex 32
 ```
+
 Configure `TRUSTED_PROXIES` with your load balancer or Nginx private IP addresses.
 
 **Step 3 — Launch services via Docker Compose**:
+
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
 **Step 4 — Verify database health & run migrations**:
+
 ```bash
 docker compose -f deploy/docker-compose.yml exec app python -m app.database status
 docker compose -f deploy/docker-compose.yml exec app python -m app.database migrate
@@ -3118,11 +3090,13 @@ docker compose -f deploy/docker-compose.yml exec app python -m app.database.seed
 ```
 
 **Step 5 — Scale web application workers**:
+
 ```bash
 docker compose -f deploy/docker-compose.yml up -d --scale app=4
 ```
 
 **Step 6 — Run the dedicated background Kafka worker daemon**:
+
 ```bash
 docker compose -f deploy/docker-compose.yml exec -d app python -m app.workers.main
 ```
@@ -3136,11 +3110,14 @@ For maximum performance on dedicated Linux hardware, deploy natively using Syste
 #### Step 1: Linux kernel & socket OS tuning
 
 By default, standard Linux operating systems limit socket backlogs to 128 and open file descriptors to 1024, causing `ECONNRESET`, `connection refused`, and `too many open files` errors under load. Apply the kernel tuning profile from [`deploy/sysctl.conf`](deploy/sysctl.conf) (full parameter breakdown in [Phase 1](#phase-1-ingress-network-sockets--linux-kernel-tcp-tuning)):
+
 ```bash
 sudo cp deploy/sysctl.conf /etc/sysctl.d/99-high-concurrency.conf
 sudo sysctl -p /etc/sysctl.d/99-high-concurrency.conf
 ```
+
 Then edit `/etc/security/limits.conf` to allow worker processes to hold 1,000,000+ open descriptors:
+
 ```ini
 * soft nofile 1048576
 * hard nofile 1048576
@@ -3269,6 +3246,7 @@ sudo systemctl reload fastapi-app
 ```
 
 **What Gunicorn does under the hood**:
+
 1. The Gunicorn master process receives `SIGHUP`.
 2. It re-reads `deploy/gunicorn.conf.py` and application code, spawning a new generation of Uvicorn workers.
 3. The new workers bind to the existing listening socket and warm up.
@@ -3283,6 +3261,7 @@ sudo systemctl reload fastapi-app
 ### Production Day-2 Management & Observability
 
 **1. Health & liveness inspection**:
+
 ```bash
 # Liveness Check (Kubernetes / Load Balancer ping)
 curl -i http://localhost:8000/livez
@@ -3294,6 +3273,7 @@ curl -i http://localhost:8000/readyz
 ```
 
 **2. Executing schema migrations in production**:
+
 ```bash
 # 1. Inspect current migration version
 python -m app.database status
@@ -3303,6 +3283,7 @@ python -m app.database migrate
 ```
 
 **3. Log stream monitoring**:
+
 ```bash
 # Follow live application logs in Systemd journal
 sudo journalctl -u fastapi-app -f --output=cat
@@ -3310,9 +3291,98 @@ sudo journalctl -u fastapi-app -f --output=cat
 # Follow live background worker logs
 sudo journalctl -u fastapi-worker -f --output=cat
 ```
+
 Structured JSON logs are automatically streamed to the Elasticsearch `app-logs` index for visualization in Kibana or querying via the Log Search API (see [§6.6](#-deep-dive-elasticsearch-8-search--structured-logging)).
 
 **4. Monitoring the Kafka Dead Letter Queue (DLQ)**: when a consumer encounters a corrupted payload or unrecoverable error, the message is routed to `{topic}.DLQ` (e.g. `orders.events.DLQ`). SREs inspect the DLQ topic to diagnose failed events:
+
+```bash
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/fastapi.conf
+sudo ln -s /etc/nginx/sites-available/fastapi.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+#### Step 6: Enable and start services
+
+```bash
+sudo systemctl daemon-reload
+
+# Enable auto-start on boot
+sudo systemctl enable fastapi-app
+sudo systemctl enable fastapi-worker
+
+# Start services
+sudo systemctl start fastapi-app
+sudo systemctl start fastapi-worker
+
+# Verify status
+sudo systemctl status fastapi-app
+sudo systemctl status fastapi-worker
+```
+
+---
+
+### Zero-Downtime Rolling Reloads & Worker Recycling
+
+When deploying new code or updating `.env` secrets on a live server, client requests must not be dropped.
+
+```bash
+# Gracefully reload the live Gunicorn master process
+sudo systemctl reload fastapi-app
+# (or kill -HUP <GUNICORN_MASTER_PID>)
+```
+
+**What Gunicorn does under the hood**:
+
+1. The Gunicorn master process receives `SIGHUP`.
+2. It re-reads `deploy/gunicorn.conf.py` and application code, spawning a new generation of Uvicorn workers.
+3. The new workers bind to the existing listening socket and warm up.
+4. Once new workers report ready, the master sends `SIGTERM` to the old workers.
+5. Old workers finish servicing existing in-flight HTTP requests (`graceful_timeout=30s`) and terminate.
+6. **Result**: zero dropped packets, zero 502 Bad Gateway responses, and continuous 100k throughput during deployment.
+
+**Worker recycling (anti-fragmentation defense)** — in [`deploy/gunicorn.conf.py`](deploy/gunicorn.conf.py): `max_requests = 10_000` with `max_requests_jitter = 1_000`. Workers automatically restart after processing ~10,000 requests to reclaim memory fragmentation and prevent slow Python memory leaks; the randomized jitter prevents all workers from restarting at the exact same second.
+
+---
+
+### Production Day-2 Management & Observability
+
+**1. Health & liveness inspection**:
+
+```bash
+# Liveness Check (Kubernetes / Load Balancer ping)
+curl -i http://localhost:8000/livez
+# HTTP 200: {"status": "alive"}
+
+# Readiness Check (Validates PostgreSQL, Redis, Elasticsearch, Kafka)
+curl -i http://localhost:8000/readyz
+# HTTP 200: {"status": "ready", "components": {"database": "connected", "redis": "connected", "elasticsearch": "connected", "kafka": "connected"}}
+```
+
+**2. Executing schema migrations in production**:
+
+```bash
+# 1. Inspect current migration version
+python -m app.database status
+
+# 2. Run pending migrations safely (protected by PostgreSQL advisory lock)
+python -m app.database migrate
+```
+
+**3. Log stream monitoring**:
+
+```bash
+# Follow live application logs in Systemd journal
+sudo journalctl -u fastapi-app -f --output=cat
+
+# Follow live background worker logs
+sudo journalctl -u fastapi-worker -f --output=cat
+```
+
+Structured JSON logs are automatically streamed to the Elasticsearch `app-logs` index for visualization in Kibana or querying via the Log Search API (see [§6.6](#-deep-dive-elasticsearch-8-search--structured-logging)).
+
+**4. Monitoring the Kafka Dead Letter Queue (DLQ)**: when a consumer encounters a corrupted payload or unrecoverable error, the message is routed to `{topic}.DLQ` (e.g. `orders.events.DLQ`). SREs inspect the DLQ topic to diagnose failed events:
+
 ```bash
 docker compose -f deploy/docker-compose.yml exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 \

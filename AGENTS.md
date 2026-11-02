@@ -10,7 +10,7 @@ This repository implements an enterprise-grade, clean architecture backend desig
   - Dynamic `CRUDRouter` (`app/api/crud_router.py`) dynamically generates validated list query models and routes full-text searches to Elasticsearch.
   - Endpoints always return fast binary serialized responses (`ORJSONResponse`).
 - **Domain Services (`app/services/`)**: Centralizes business rules, transaction boundaries (`commit()`, `rollback()`), dynamic cache invalidation, and PII cryptography.
-  - Domain services (`UserService`, `ProductService`, `CategoryService`) **must inherit from `BaseService`** and implement pluggable lifecycle hooks (`before_create`, `before_update`, `to_read_schema`, `to_cache_dict`).
+  - Domain services (`UserService`, `ProductService`, `CategoryService`) **must inherit from `BaseService`** and implement pluggable lifecycle hooks (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`, `to_cache_dict`). The `after_*` hooks run only once their corresponding mutation has committed.
   - Polymorphic cache handling via `NullCache` eliminates defensive `if self.cache is not None:` branches.
   - Never duplicate generic CRUD queries or transaction commits in domain services.
 - **Repository Persistence (`app/repositories/`)**: Encapsulates all SQLAlchemy 2.0 Async queries, dynamic filtering (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `like`, `ilike`), ordering, and Keyset cursor pagination.
