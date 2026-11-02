@@ -1296,6 +1296,14 @@ alembic history
 alembic revision -m "custom migration"
 ```
 
+#### Recommended Production Best Practice (Hybrid Migration Approach)
+
+In production microservices, developers use a **hybrid approach**:
+
+1. **Run autogenerate**: Run `alembic revision --autogenerate -m "your_change"` to let Alembic generate the initial DDL diff.
+2. **Open and inspect**: Inspect the file in `alembic/versions/` to verify constraint names (e.g. `uq_employees_user_id`), cascade rules (`ondelete="CASCADE"`), and pagination indexes (`(created_at, id)`).
+3. **Apply migration**: Run `alembic upgrade head` to apply it safely.
+
 Seeders run in a single transaction, in dependency order, behind a database lock on PostgreSQL/MySQL. Implementations must insert only missing records and must not commit the session themselves. The included `category_seeder` reads `SEED_CATEGORIES`; it is empty by default and never overwrites existing categories. No development users, passwords, role/permission catalog, or demo accounts are inserted. A failing seeder rolls back the seeding transaction.
 
 #### Standalone Seeder CLI

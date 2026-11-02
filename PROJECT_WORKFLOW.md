@@ -2590,6 +2590,31 @@ Production systems require safe schema bootstrap, automatic migration locks, and
   - Executes `alembic.command.upgrade(config, "head")`.
   - Releases lock in `finally` block via `SELECT pg_advisory_unlock(738291046);`.
 
+### 4.2.1 Recommended Production Best Practice (Hybrid Migration Approach)
+
+In production microservices, developers use a **hybrid approach** combining automated detection with human inspection:
+
+1. **Auto-Generate Initial DDL Skeleton**:
+   Run Alembic autogenerate to detect the schema diff from your SQLAlchemy models:
+   ```bash
+   alembic revision --autogenerate -m "create_employees_table"
+   ```
+2. **Inspect and Refine the Migration File**:
+   Open and inspect the generated file in `alembic/versions/`:
+   - Verify explicit, clean constraint names (e.g. `uq_employees_user_id`).
+   - Verify foreign key delete rules (e.g. `ondelete="CASCADE"`).
+   - Ensure composite indexes (e.g. `Index("ix_employees_created_at_id", "created_at", "id")`) are present for keyset pagination.
+   - Ensure clean sequential naming (e.g. `0005_create_employees_table.py`) to match repo conventions.
+3. **Apply the Migration**:
+   ```bash
+   alembic upgrade head
+   ```
+4. **Verify Schema State**:
+   ```bash
+   alembic current
+   python -m app.database status
+   ```
+
 ---
 
 ## 4.3 Idempotent Seeder Engine & Topological Dependency Resolution
