@@ -29,4 +29,16 @@ class BaseEvent(BaseModel, Generic[PayloadT]):
     payload: PayloadT
 
 
-__all__ = ["BaseEvent"]
+__all__ = ["BaseEvent", "make_event_name"]
+
+
+def make_event_name(service: str, event: str, event_name: str) -> str:
+    """Format an event string conforming to the standard '<service name>.<event>.<event name>' convention.
+
+    Example:
+        make_event_name("inventory", "event", "reserved") -> "inventory.event.reserved"
+        make_event_name("order", "event", "created") -> "order.event.created"
+        make_event_name("user", "event", "registered") -> "user.event.registered"
+    """
+    parts = [service.strip().lower(), event.strip().lower(), event_name.strip().lower()]
+    return ".".join(parts)

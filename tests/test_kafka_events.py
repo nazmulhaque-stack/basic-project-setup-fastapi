@@ -31,3 +31,11 @@ def test_kafka_retry_policy():
     assert policy.calculate_backoff(3) == 4.0
     assert policy.is_retryable(ValueError("invalid")) is False
     assert policy.is_retryable(ConnectionError("timeout")) is True
+
+
+def test_make_event_name_convention():
+    from app.kafka.events.base import make_event_name
+
+    assert make_event_name("inventory", "event", "reserved") == "inventory.event.reserved"
+    assert make_event_name("order", "event", "created") == "order.event.created"
+    assert make_event_name("user", "event", "registered") == "user.event.registered"

@@ -2508,9 +2508,8 @@ KAFKA_ENABLED=true
 KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 KAFKA_EVENTS_TOPIC=domain.events
 KAFKA_CONSUMER_GROUP=highperf-fastapi
-KAFKA_INVENTORY_TOPIC=inventory.events
-KAFKA_INVENTORY_CONSUMER_GROUP=highperf-inventory
-KAFKA_INVENTORY_DLQ_TOPIC=inventory.events.dlq
+# Domain events adhere to the "<service name>.<event>.<event name>" convention in code
+# without polluting .env files with individual topic names.
 OUTBOX_POLL_INTERVAL=1.0
 OUTBOX_BATCH_SIZE=100
 INVENTORY_RESERVATION_SWEEP_INTERVAL=30.0

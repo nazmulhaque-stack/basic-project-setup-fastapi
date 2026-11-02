@@ -85,7 +85,12 @@ async def handle_inventory_reserved(
     """
     try:
         envelope = InventoryReservedEvent.model_validate(event)
-        if envelope.event_type != "inventory.reserved.v1":
+        # Accept versioned identifier or developer convention <service>.<event>.<event name>
+        is_convention = (
+            envelope.event_type.startswith("inventory.")
+            and len(envelope.event_type.split(".")) >= 3
+        )
+        if envelope.event_type != "inventory.reserved.v1" and not is_convention:
             raise ValueError(f"Unsupported inventory event type: {envelope.event_type}")
     except (ValidationError, ValueError) as exc:
         await _dead_letter(event, str(exc), producer, dead_letter_topic)
