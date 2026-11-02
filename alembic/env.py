@@ -69,6 +69,7 @@ def do_run_migrations(connection) -> None:
         )
         with context.begin_transaction():
             context.run_migrations()
+        connection.commit()
     finally:
         if lock_acquired and dialect == "postgresql":
             connection.exec_driver_sql(
@@ -92,6 +93,7 @@ async def run_async_migrations() -> None:
     try:
         async with connectable.connect() as connection:
             await connection.run_sync(do_run_migrations)
+            await connection.commit()
     finally:
         await connectable.dispose()
 

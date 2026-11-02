@@ -314,6 +314,7 @@ services:
       KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-highperf-fastapi}
       OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-1.0}
       OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
+      AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-true}
     depends_on:
       pgbouncer:
         condition: service_started

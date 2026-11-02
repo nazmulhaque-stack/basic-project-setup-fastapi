@@ -94,7 +94,7 @@ async def test_initialize_creates_tables_only_when_enabled() -> None:
 
 
 def test_auto_initialization_flags_default_to_false() -> None:
-    settings = Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:")
+    settings = Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:", _env_file=None)
     assert settings.AUTO_MIGRATE is False
     assert settings.AUTO_CREATE_TABLES is False
     assert settings.AUTO_SEED is False
