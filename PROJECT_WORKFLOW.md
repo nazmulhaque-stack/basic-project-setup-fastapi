@@ -2241,14 +2241,52 @@ async with session.begin():
 
 ---
 
-### 3.3.3 Event Naming Convention & Developer Triggering Guide
+### 3.3.3 Deep-Dive: Transactional Outbox & Event-Driven Architecture
 
-#### Event Type Standard: `<service_name>.<model_name>.<action_name>[.<version>]`
-All domain events follow a standardized naming convention:
-- **`service_name`**: Automatically defaults to `APP_NAME` from `.env` / configuration (e.g., `HighPerfStatelessService`).
-- **`model_name`**: Normalized lowercase model or resource name (e.g., `user`, `category`, `product`).
-- **`action_name`**: Normalized lowercase action (e.g., `created`, `updated`, `deleted`).
-- **`version`**: Optional version tag (e.g., `v1`). Only appended if explicitly specified by the developer.
+#### 1. Architectural Motivation: The Dual-Write Problem
+
+In a distributed microservice architecture, performing a database write and publishing a Kafka event over the network inside the same request creates a distributed dual-write risk:
+- **Database commits, Kafka fails**: Downstream consumers never receive the event (Silent Data Inconsistency).
+- **Kafka publishes, Database rolls back**: Downstream consumers react to phantom data that never actually existed.
+
+```
+[Client Request]
+       │
+       ▼  BEGIN TRANSACTION (Atomic ACID Boundary)
+ ├── 1. INSERT INTO users (id, name, email) ...
+ └── 2. INSERT INTO outbox_events (id, topic, event_key, event_type, payload) ...
+       ▲  COMMIT TRANSACTION
+       │
+[PostgreSQL Database]  <=== 100% Atomic: Both succeed or both rollback
+       │
+       ▼ (Asynchronous polling via SELECT ... FOR UPDATE SKIP LOCKED)
+[Outbox Dispatcher Daemon] (`app/services/outbox.py`)
+       │
+       ▼ AIOKafkaProducer.send_and_wait(key=aggregate_id)
+[Kafka Broker (Cluster)]
+```
+
+---
+
+#### 2. Event Naming Convention Standard
+
+All events conform to the standardized convention:
+$$\mathbf{Event\ Type} = \texttt{<service\_name>.<model\_name>.<action\_name>[.<version>]}$$
+
+```
+HighPerfStatelessService . user . created [ . v1 ]
+│                          │      │           │
+├── Service Name (APP_NAME) │      │           └── Optional Version Tag
+│                          └── Model (Lowercase)
+│                                 └── Action (Lowercase)
+```
+
+- **`service_name`**: Automatically defaults to `APP_NAME` from `.env` via `get_settings().APP_NAME` (`HighPerfStatelessService`). Preserves original casing.
+- **`model_name`**: Extracted directly from the SQLAlchemy model (`self.repo.model.__name__`, e.g., `User` -> `user`, `Category` -> `category`, `Product` -> `product`).
+- **`action_name`**: Normalized lowercase action string (e.g., `created`, `updated`, `deleted`, `reservation_failed`).
+- **`version` (Optional)**:
+  - If omitted or `None`: **No version segment is appended** (e.g. `HighPerfStatelessService.user.created`).
+  - If provided (e.g. `"v1"` or `"1"`): Appended to the event type (e.g. `HighPerfStatelessService.user.created.v1`).
 
 ```json
 {
@@ -2262,63 +2300,198 @@ All domain events follow a standardized naming convention:
 }
 ```
 
-#### Flags to Enable / Disable & Dynamic Trigger Control
-- **`auto_outbox_events: bool = False` (Default)**: Generic CRUD operations (`create()`, `update_by_id()`, `delete_by_id()`) do **not** dynamically trigger outbox events by default.
-- **`outbox_enabled: bool`**: Master flag on service instances to enable or disable outbox capabilities.
+---
 
-#### How Developers Trigger Outbox Events:
+#### 3. Multi-Tiered Flag Controls (No Dynamic Triggers by Default)
 
-1. **Option 1: Trigger during CRUD using `emit_outbox_event=True`**
-   ```python
-   # Only emits an outbox event when explicitly requested by developer:
-   user = await user_service.create(
-       UserCreate(name="Alice", email="alice@example.com", phone="+1234567890"),
-       emit_outbox_event=True,
-   )
-   # Emits event_type: "HighPerfStatelessService.user.created"
-   ```
+To prevent bulk imports, migrations, and internal housekeeping updates from accidentally producing unwanted Kafka traffic, generic CRUD methods do **not** trigger outbox events dynamically.
 
-2. **Option 2: Manually trigger domain events using `service.enqueue_outbox_event()`**
-   ```python
-   # Without version:
-   user_service.enqueue_outbox_event("registered", user)
-   # -> "HighPerfStatelessService.user.registered"
+```
+                            [outbox_enabled: bool]
+                            Master On/Off Switch
+                                      │
+                   ┌──────────────────┴──────────────────┐
+                   ▼                                     ▼
+                [False]                                [True]
+         (All Outbox Bypassed)              (Outbox Capable Service)
+                                                         │
+                                    ┌────────────────────┴────────────────────┐
+                                    ▼                                         ▼
+                 [auto_outbox_events: False] (DEFAULT)      [auto_outbox_events: True]
+                 Generic CRUD does NOT trigger events.      Generic CRUD auto-triggers.
+                 Developer triggers explicitly.             Can suppress with False.
+```
 
-   # With version:
-   user_service.enqueue_outbox_event("password_reset", user, version="v1")
-   # -> "HighPerfStatelessService.user.password_reset.v1"
+- **`outbox_enabled: bool = False`**: Master switch enabling/disabling outbox persistence.
+- **`auto_outbox_events: bool = False` (Default)**: Disables dynamic outbox event creation during standard `create()`, `update()`, and `delete()` operations.
+- **`emit_outbox_event: Optional[bool] = None`**: Per-method parameter enabling events only when explicitly requested.
+- **`enqueue_outbox_event()`**: Public developer method on `BaseService` to manually queue events for custom domain sagas.
 
-   # With extra metadata:
-   user_service.enqueue_outbox_event(
-       "role_changed",
-       user,
-       extra_data={"previous_role": "user", "new_role": "admin"},
-   )
-   ```
+---
 
-3. **Option 3: Standalone Helper Function (`format_event_type`)**
-   ```python
-   from app.services.base import format_event_type
+#### 4. Developer Triggering Scenarios & Code Examples
 
-   # Default service prefix without version:
-   format_event_type("user", "created")
-   # -> "HighPerfStatelessService.user.created"
+##### Scenario A: Standard CRUD with Opt-In Event Emission
+```python
+# In your FastAPI endpoint or service caller:
+user = await user_service.create(
+    UserCreate(name="Alice", email="alice@example.com", phone="+1234567890"),
+    emit_outbox_event=True,  # <--- Explicit trigger flag
+)
+# Outbox row generated:
+# event_type = "HighPerfStatelessService.user.created"
+```
 
-   # With version:
-   format_event_type("user", "created", version="v1")
-   # -> "HighPerfStatelessService.user.created.v1"
+##### Scenario B: Explicit Manual Trigger for Custom Business Actions
+```python
+# Custom business logic in UserService:
+async def verify_user_email(self, user_id: uuid.UUID) -> UserRead:
+    user = await self.repo.get(user_id)
+    user.is_verified = True
+    await self.repo.update(user)
 
-   # Custom service name override:
-   format_event_type("AuthService", "user", "created")
-   # -> "AuthService.user.created"
-   ```
+    # Manually enqueue domain event:
+    self.enqueue_outbox_event(
+        action="verified",
+        entity=user,
+        extra_data={"verified_at": datetime.now(timezone.utc).isoformat()},
+    )
+    # Generated event_type: "HighPerfStatelessService.user.verified"
 
-| Goal | Code | Generated `event_type` |
+    await self.db.commit()
+    return await self.to_read_schema(user)
+```
+
+##### Scenario C: Specifying Contract Versions for Breaking Changes
+```python
+user_service.enqueue_outbox_event(
+    action="registered",
+    entity=user,
+    version="v2",  # <--- Appends version tag
+    extra_data={"schema_version": 2},
+)
+# Generated event_type: "HighPerfStatelessService.user.registered.v2"
+```
+
+##### Scenario D: Standalone Event Formatting Helper
+```python
+from app.services.base import format_event_type
+
+# Default APP_NAME without version:
+format_event_type("order", "placed")
+# -> "HighPerfStatelessService.order.placed"
+
+# Default APP_NAME with version:
+format_event_type("order", "placed", version="v1")
+# -> "HighPerfStatelessService.order.placed.v1"
+
+# Cross-service event formatting:
+format_event_type("BillingService", "invoice", "paid")
+# -> "BillingService.invoice.paid"
+```
+
+##### Scenario E: Complete Real-World FastAPI Router Implementation
+```python
+from fastapi import APIRouter, Depends, status
+from app.api.deps import get_user_service
+from app.schemas.user import UserCreate, UserRead
+from app.services.user import UserService
+
+router = APIRouter(prefix="/users", tags=["Users"])
+
+@router.post("/", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+async def register_user(
+    payload: UserCreate,
+    service: UserService = Depends(get_user_service),
+) -> UserRead:
+    # 1. Mutate database state (no event emitted yet)
+    user = await service.create(payload)
+
+    # 2. Explicitly trigger domain event if required by business logic
+    service.enqueue_outbox_event(
+        action="registered",
+        entity=user,
+    )
+    # Transaction commits both user record and outbox event atomically
+    return user
+```
+
+---
+
+#### 5. PostgreSQL Schema, High-Throughput Indexing & Sequential Safety
+
+The `outbox_events` table ([`app/models/outbox.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/models/outbox.py)) is designed for non-blocking concurrent polling:
+
+```sql
+CREATE TABLE outbox_events (
+    id UUID PRIMARY KEY,
+    topic VARCHAR(255) NOT NULL,
+    event_key VARCHAR(255) NOT NULL,       -- Partition key (Aggregate ID, e.g. user_id)
+    event_type VARCHAR(255) NOT NULL,      -- "HighPerfStatelessService.user.created"
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    published_at TIMESTAMPTZ,              -- NULL when pending, populated on publish
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+-- Fast scan of unpublished events:
+CREATE INDEX ix_outbox_events_unpublished 
+ON outbox_events (published_at, created_at);
+
+-- FIFO sequential ordering protection per aggregate:
+CREATE INDEX ix_outbox_events_aggregate_pending 
+ON outbox_events (topic, event_key, published_at, created_at);
+```
+
+##### Non-Blocking Worker Concurrency (`SKIP LOCKED`):
+The background dispatcher polls pending records using PostgreSQL row-level locks:
+```sql
+SELECT * FROM outbox_events AS o
+WHERE o.published_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM outbox_events AS older
+      WHERE older.topic = o.topic
+        AND older.event_key = o.event_key
+        AND older.published_at IS NULL
+        AND older.created_at < o.created_at
+  )
+ORDER BY o.created_at, o.id
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+```
+- **`SKIP LOCKED`**: Multiple worker instances poll concurrently without locking conflicts or deadlocks.
+- **`NOT EXISTS`**: Guarantees strict FIFO ordering per aggregate: if Event 1 fails, Event 2 for the same entity will wait until Event 1 succeeds.
+
+---
+
+#### 6. Kafka Partitioning & Downstream Deduplication
+
+1. **Partition Keying**: All events are produced to Kafka using `key=event.event_key` (the entity ID). Kafka guarantees that messages with the identical key land on the same partition, guaranteeing **strict in-order delivery**.
+2. **At-Least-Once Deduplication**: Because network retries can resend events, downstream consumers must deduplicate using `event_id`:
+```python
+async def handle_user_created(event: dict) -> None:
+    event_id = event["event_id"]
+    # Atomic Redis check-and-set with 24-hour TTL:
+    if not await redis.set(f"processed_event:{event_id}", "1", nx=True, ex=86400):
+        return  # Duplicate event skipped safely
+    
+    user_id = event["data"]["id"]
+    await send_welcome_email(user_id)
+```
+
+---
+
+#### 7. Quick Developer Cheat Sheet
+
+| Use Case | Method / Call | Resulting `event_type` |
 | :--- | :--- | :--- |
-| **CRUD with flag** | `service.create(..., emit_outbox_event=True)` | `HighPerfStatelessService.user.created` |
-| **Manual Action** | `service.enqueue_outbox_event("logged_in", user)` | `HighPerfStatelessService.user.logged_in` |
-| **With Version** | `service.enqueue_outbox_event("logged_in", user, version="v1")` | `HighPerfStatelessService.user.logged_in.v1` |
-| **Helper Function** | `format_event_type("order", "placed")` | `HighPerfStatelessService.order.placed` |
+| **Standard CRUD (Opt-In)** | `service.create(payload, emit_outbox_event=True)` | `HighPerfStatelessService.user.created` |
+| **Standard CRUD (Default)** | `service.create(payload)` | *No event generated* |
+| **Custom Action** | `service.enqueue_outbox_event("verified", user)` | `HighPerfStatelessService.user.verified` |
+| **Versioned Action** | `service.enqueue_outbox_event("verified", user, version="v1")` | `HighPerfStatelessService.user.verified.v1` |
+| **Helper Call** | `format_event_type("order", "placed")` | `HighPerfStatelessService.order.placed` |
+| **Cross-Service Helper** | `format_event_type("AuthService", "user", "created")` | `AuthService.user.created` |
 
 ---
 
