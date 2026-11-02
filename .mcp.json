@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "postgres-inspector": {
+      "command": "python3",
+      "args": ["-m", "app.repositories.base"],
+      "env": {
+        "DB_POOL_SIZE": "5"
+      }
+    }
+  }
+}

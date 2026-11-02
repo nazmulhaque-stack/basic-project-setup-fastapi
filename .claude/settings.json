@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest*)",
+      "Bash(python3 -m pytest*)",
+      "Bash(python3 -m py_compile*)",
+      "Bash(bash .agents/agents/developer-agent/skills/run_linter.sh)",
+      "Bash(python3 .agents/agents/developer-agent/skills/db_migration_helper.py)",
+      "Bash(python3 .agents/agents/reviewer-agent/skills/security_audit.py)",
+      "Bash(python3 .agents/agents/system-architect-agent/skills/verify_infrastructure.py)",
+      "Bash(python3 .agents/agents/developer-agent/skills/scaffold_crud.py* --dry-run*)",
+      "Bash(python3 .agents/common/skills/git_helper.py status)",
+      "Bash(python3 .agents/common/skills/git_helper.py check-secrets)",
+      "Bash(alembic current*)",
+      "Bash(alembic history*)",
+      "Bash(alembic heads*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/secret_leak_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m py_compile app/services/base.py 2>/dev/null || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
