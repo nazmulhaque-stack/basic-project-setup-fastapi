@@ -2241,23 +2241,84 @@ async with session.begin():
 
 ---
 
-### 3.3.3 CloudEvents Schema Standard ([`app/kafka/events/base.py`](file:///home/nazmul/Downloads/fastapi-repo-pattern/app/kafka/events/base.py))
+### 3.3.3 Event Naming Convention & Developer Triggering Guide
 
-All events adhere to a structured, versioned CloudEvents-compliant envelope:
+#### Event Type Standard: `<service_name>.<model_name>.<action_name>[.<version>]`
+All domain events follow a standardized naming convention:
+- **`service_name`**: Automatically defaults to `APP_NAME` from `.env` / configuration (e.g., `HighPerfStatelessService`).
+- **`model_name`**: Normalized lowercase model or resource name (e.g., `user`, `category`, `product`).
+- **`action_name`**: Normalized lowercase action (e.g., `created`, `updated`, `deleted`).
+- **`version`**: Optional version tag (e.g., `v1`). Only appended if explicitly specified by the developer.
+
 ```json
 {
   "event_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
   "aggregate_id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a",
-  "event_type": "user.created.v1",
-  "version": 1,
-  "timestamp": "2026-11-01T14:30:00.000Z",
-  "correlation_id": "req-987654",
-  "payload": {
-    "user_id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a"
+  "event_type": "HighPerfStatelessService.user.created",
+  "occurred_at": "2026-11-02T05:25:35.961836Z",
+  "data": {
+    "id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a"
   }
 }
 ```
-*Note: Payload contains entity IDs only. PII is excluded to ensure compliance with privacy regulations.*
+
+#### Flags to Enable / Disable & Dynamic Trigger Control
+- **`auto_outbox_events: bool = False` (Default)**: Generic CRUD operations (`create()`, `update_by_id()`, `delete_by_id()`) do **not** dynamically trigger outbox events by default.
+- **`outbox_enabled: bool`**: Master flag on service instances to enable or disable outbox capabilities.
+
+#### How Developers Trigger Outbox Events:
+
+1. **Option 1: Trigger during CRUD using `emit_outbox_event=True`**
+   ```python
+   # Only emits an outbox event when explicitly requested by developer:
+   user = await user_service.create(
+       UserCreate(name="Alice", email="alice@example.com", phone="+1234567890"),
+       emit_outbox_event=True,
+   )
+   # Emits event_type: "HighPerfStatelessService.user.created"
+   ```
+
+2. **Option 2: Manually trigger domain events using `service.enqueue_outbox_event()`**
+   ```python
+   # Without version:
+   user_service.enqueue_outbox_event("registered", user)
+   # -> "HighPerfStatelessService.user.registered"
+
+   # With version:
+   user_service.enqueue_outbox_event("password_reset", user, version="v1")
+   # -> "HighPerfStatelessService.user.password_reset.v1"
+
+   # With extra metadata:
+   user_service.enqueue_outbox_event(
+       "role_changed",
+       user,
+       extra_data={"previous_role": "user", "new_role": "admin"},
+   )
+   ```
+
+3. **Option 3: Standalone Helper Function (`format_event_type`)**
+   ```python
+   from app.services.base import format_event_type
+
+   # Default service prefix without version:
+   format_event_type("user", "created")
+   # -> "HighPerfStatelessService.user.created"
+
+   # With version:
+   format_event_type("user", "created", version="v1")
+   # -> "HighPerfStatelessService.user.created.v1"
+
+   # Custom service name override:
+   format_event_type("AuthService", "user", "created")
+   # -> "AuthService.user.created"
+   ```
+
+| Goal | Code | Generated `event_type` |
+| :--- | :--- | :--- |
+| **CRUD with flag** | `service.create(..., emit_outbox_event=True)` | `HighPerfStatelessService.user.created` |
+| **Manual Action** | `service.enqueue_outbox_event("logged_in", user)` | `HighPerfStatelessService.user.logged_in` |
+| **With Version** | `service.enqueue_outbox_event("logged_in", user, version="v1")` | `HighPerfStatelessService.user.logged_in.v1` |
+| **Helper Function** | `format_event_type("order", "placed")` | `HighPerfStatelessService.order.placed` |
 
 ---
 

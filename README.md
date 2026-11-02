@@ -31,9 +31,21 @@ This repository is a real FastAPI backend project rather than a toy scaffold. Th
 
 The current test result is maintained by running `pytest -q`; the earlier 58-test snapshot predates Kafka inventory consumption and database initialization.
 
-### Kafka service-to-service events
+### Kafka service-to-service events & Developer Event Triggering
 
-When `KAFKA_ENABLED=true`, create/update/delete operations write a versioned event envelope to `outbox_events` in the same PostgreSQL transaction as the domain mutation. The background dispatcher publishes committed rows to `KAFKA_EVENTS_TOPIC`, keyed by aggregate ID; it will not publish a later event for an aggregate while an earlier event remains unpublished. Delivery is at least once: downstream consumers should deduplicate using `event_id` and make handlers idempotent. Event payloads contain the entity ID only; do not add PII without an explicit event-contract and privacy review.
+When `KAFKA_ENABLED=true`, transactional outbox events can be staged to `outbox_events` within the same PostgreSQL transaction as the domain mutation. The background dispatcher publishes committed rows to `KAFKA_EVENTS_TOPIC`, keyed by aggregate ID; it will not publish a later event for an aggregate while an earlier event remains unpublished. Delivery is at least once: downstream consumers should deduplicate using `event_id` and make handlers idempotent. Event payloads contain the entity ID only; do not add PII without an explicit event-contract and privacy review.
+
+#### Event Type Convention: `<service_name>.<model_name>.<action_name>[.<version>]`
+- **`service_name`**: Automatically defaults to `APP_NAME` from `.env` (e.g., `HighPerfStatelessService`).
+- **`model_name`**: Normalized lowercase model name (e.g., `user`, `category`, `product`).
+- **`action_name`**: Normalized lowercase action (e.g., `created`, `updated`, `deleted`).
+- **`version`**: Optional version tag (e.g., `v1`). Only appended if explicitly passed.
+
+#### Developer Triggering Controls & Flags
+- **`auto_outbox_events: bool = False` (Default)**: Standard CRUD operations (`create()`, `update()`, `delete()`) do **not** dynamically trigger outbox events by default.
+- **Trigger during CRUD**: Pass `emit_outbox_event=True` (e.g., `await service.create(payload, emit_outbox_event=True)`).
+- **Trigger manually**: Call `service.enqueue_outbox_event("action", entity, version="v1")` for custom domain sagas or actions.
+- **Format helper**: Use `format_event_type("user", "created")` -> `"HighPerfStatelessService.user.created"`.
 
 `app.core.kafka.consume_events()` provides the async consumer primitive for additional topics. It commits each record only after its handler succeeds and seeks back to a failed record so a later offset cannot skip it. The API's inventory reservation handler is wired separately below.
 

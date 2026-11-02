@@ -11,6 +11,7 @@ from app.db.base import Base
 from app.models.inventory_reservation import InventoryReservation
 from app.models.outbox import OutboxEvent
 from app.models.product import Product
+from app.services.base import format_event_type
 from app.services.inventory_reservations import (
     handle_inventory_reserved,
     release_expired_reservations_once,
@@ -154,7 +155,7 @@ async def test_insufficient_stock_records_rejection_and_compensation(
         outbox_events = (
             await session.scalars(
                 select(OutboxEvent).where(
-                    OutboxEvent.event_type == "inventory.reservation_failed.v1"
+                    OutboxEvent.event_type == format_event_type("inventory", "reservation_failed", "v1")
                 )
             )
         ).all()
@@ -220,7 +221,7 @@ async def test_expired_reservation_releases_atp_without_changing_on_hand(
         reservation = await session.scalar(select(InventoryReservation))
         expired_event = await session.scalar(
             select(OutboxEvent).where(
-                OutboxEvent.event_type == "inventory.reservation_expired.v1"
+                OutboxEvent.event_type == format_event_type("inventory", "reservation_expired", "v1")
             )
         )
         assert product is not None

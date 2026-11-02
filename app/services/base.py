@@ -427,27 +427,79 @@ IdType = TypeVar("IdType")
 
 
 def format_event_type(
-    resource_or_service: str,
-    action_or_event: str,
-    version: str = "v1",
+    *args: str,
+    service: Optional[str] = None,
+    resource: Optional[str] = None,
+    model: Optional[str] = None,
+    action: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> str:
-    """Format and validate a standardized event_type following the '<service>.<action>.<version>' convention.
+    """Format and validate a standardized event_type conforming to:
+    '<service_name>.<model_name>.<action_name>[.<version>]'
 
-    Convention rules:
-    - All segments are stripped, lowercased, and joined with dots.
-    - If version is numeric or missing 'v', it is normalized (e.g., '1' -> 'v1').
+    Convention:
+    - service_name: Defaults to settings.APP_NAME (e.g. 'HighPerfStatelessService').
+    - model_name: Domain entity/model name, normalized to lowercase (e.g. 'user', 'category').
+    - action_name: Domain action, normalized to lowercase (e.g. 'created', 'updated', 'deleted').
+    - version: Optional version tag (e.g. 'v1'). Appended only if explicitly specified.
 
-    Example:
-        format_event_type("user", "created", "v1") -> "user.created.v1"
-        format_event_type("product", "updated", "v1") -> "product.updated.v1"
-        format_event_type("inventory", "reservation_failed", "v1") -> "inventory.reservation_failed.v1"
+    Examples:
+        format_event_type("user", "created") -> "HighPerfStatelessService.user.created"
+        format_event_type("user", "created", "v1") -> "HighPerfStatelessService.user.created.v1"
+        format_event_type("user", "created", version="v1") -> "HighPerfStatelessService.user.created.v1"
+        format_event_type("HighPerfStatelessService", "user", "created") -> "HighPerfStatelessService.user.created"
+        format_event_type("AuthService", "user", "created") -> "AuthService.user.created"
     """
-    clean_service = str(resource_or_service).strip().lower()
-    clean_action = str(action_or_event).strip().lower()
-    clean_version = str(version).strip().lower()
-    if clean_version.isdigit():
-        clean_version = f"v{clean_version}"
-    return f"{clean_service}.{clean_action}.{clean_version}"
+    srv: Optional[str] = service
+    res: Optional[str] = model or resource
+    act: Optional[str] = action
+    ver: Optional[str] = version
+
+    if len(args) == 1:
+        res = args[0]
+    elif len(args) == 2:
+        res, act = args[0], args[1]
+    elif len(args) == 3:
+        arg2_clean = str(args[2]).strip().lower()
+        is_version = arg2_clean.isdigit() or (
+            arg2_clean.startswith("v")
+            and len(arg2_clean) > 1
+            and (arg2_clean[1:].isdigit() or "." in arg2_clean)
+        )
+        if is_version:
+            res, act, ver = args[0], args[1], args[2]
+        else:
+            srv, res, act = args[0], args[1], args[2]
+    elif len(args) >= 4:
+        srv, res, act, ver = args[0], args[1], args[2], args[3]
+
+    if srv is None:
+        try:
+            from app.core.config import get_settings
+            srv = get_settings().APP_NAME
+        except Exception:
+            srv = os.getenv("APP_NAME", "HighPerfStatelessService")
+
+    clean_srv = str(srv).strip() if srv else ""
+    clean_res = str(res or "").strip().lower()
+    clean_act = str(act or "").strip().lower()
+
+    parts: list[str] = []
+    if clean_srv:
+        parts.append(clean_srv)
+    if clean_res:
+        parts.append(clean_res)
+    if clean_act:
+        parts.append(clean_act)
+
+    if ver is not None:
+        clean_ver = str(ver).strip().lower()
+        if clean_ver.isdigit():
+            clean_ver = f"v{clean_ver}"
+        if clean_ver:
+            parts.append(clean_ver)
+
+    return ".".join(parts)
 
 
 class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, ReadSchemaType, IdType]):
@@ -464,7 +516,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         db: Optional[AsyncSession] = None,
         session: Optional[AsyncSession] = None,
         outbox_enabled: bool = False,
+        auto_outbox_events: bool = False,
         outbox_topic: str = "domain.events",
+        service_name: Optional[str] = None,
     ) -> None:
         self.repo: IBaseRepository[ModelType, IdType] = repo
         self.repository: IBaseRepository[ModelType, IdType] = repo
@@ -482,7 +536,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         self.order_col: str = order_col
         self.id_col: str = id_col
         self.outbox_enabled = outbox_enabled
+        self.auto_outbox_events = auto_outbox_events
         self.outbox_topic = outbox_topic
+        self.service_name = service_name or get_settings().APP_NAME
 
     @property
     def resource_name(self) -> str:
@@ -543,13 +599,55 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         read_model: ReadSchemaType = await self.to_read_schema(entity)
         return read_model.model_dump(mode="json")
 
-    def build_event_type(self, action: str, version: str = "v1") -> str:
-        """Construct the standardized event_type following the '<resource>.<action>.<version>' convention.
+    def build_event_type(
+        self,
+        action: str,
+        resource: Optional[str] = None,
+        model: Optional[str] = None,
+        service: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> str:
+        """Construct the standardized event_type following the '<service_name>.<model_name>.<action_name>[.<version>]' convention.
 
-        Developers can call or override this method in custom domain services (e.g., UserService)
-        to maintain event naming consistency across microservices.
+        Pulls the service name from `self.service_name` (defaults to settings.APP_NAME)
+        and the model name from `self.resource_name.lower()`.
         """
-        return format_event_type(self.resource_name, action, version=version)
+        mod = model or resource or self.resource_name
+        srv = service or getattr(self, "service_name", None)
+        return format_event_type(model=mod, action=action, service=srv, version=version)
+
+    def enqueue_outbox_event(
+        self,
+        action: str,
+        entity: ModelType,
+        *,
+        event_type: Optional[str] = None,
+        model: Optional[str] = None,
+        resource: Optional[str] = None,
+        service: Optional[str] = None,
+        version: Optional[str] = None,
+        extra_data: Optional[Dict[str, Any]] = None,
+        force: bool = False,
+    ) -> Optional[OutboxEvent]:
+        """Explicitly enqueue an outbox event.
+
+        Allows developers to emit domain events on demand when needed,
+        without relying on automatic dynamic triggers from generic CRUD operations.
+
+        Convention: '<service_name>.<model_name>.<action_name>[.<version>]'
+        (e.g., 'HighPerfStatelessService.user.created').
+        """
+        if not self.outbox_enabled and not force:
+            return None
+        return self._enqueue_outbox_event(
+            action=action,
+            entity=entity,
+            event_type=event_type,
+            model=model or resource,
+            service=service,
+            version=version,
+            extra_data=extra_data,
+        )
 
     def _enqueue_outbox_event(
         self,
@@ -557,12 +655,15 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         entity: ModelType,
         event_type: Optional[str] = None,
         extra_data: Optional[Dict[str, Any]] = None,
-        version: str = "v1",
+        model: Optional[str] = None,
+        resource: Optional[str] = None,
+        service: Optional[str] = None,
+        version: Optional[str] = None,
     ) -> Optional[OutboxEvent]:
         """Adds a non-sensitive event envelope to the current DB transaction.
 
         Uses `build_event_type` to guarantee the standardized event_type convention:
-        '<resource>.<action>.<version>' (e.g., 'user.created.v1').
+        '<service_name>.<model_name>.<action_name>[.<version>]' (e.g., 'HighPerfStatelessService.user.created').
         """
         if not self.outbox_enabled:
             return None
@@ -571,7 +672,12 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
 
         entity_id = str(getattr(entity, self.id_col))
         event_id = uuid.uuid4()
-        resolved_event_type = event_type or self.build_event_type(action, version=version)
+        resolved_event_type = event_type or self.build_event_type(
+            action=action,
+            model=model or resource,
+            service=service,
+            version=version,
+        )
         outbox_event = OutboxEvent(
             id=event_id,
             topic=self.outbox_topic,
@@ -597,12 +703,17 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         self,
         payload: CreateSchemaType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> ReadSchemaType:
         """Creates entity, invalidates list cache, commits transaction, syncs to ES, and returns read schema."""
         entity: ModelType = await self.before_create(payload)
         try:
             await self.repo.create(entity)
-            self._enqueue_outbox_event("created", entity)
+            if self.outbox_enabled and (
+                emit_outbox_event is True
+                or (emit_outbox_event is None and self.auto_outbox_events is True)
+            ):
+                self._enqueue_outbox_event("created", entity)
             await self.cache.invalidate_lists(enabled=cache_enabled)
             if self.db is not None:
                 await self.db.commit()
@@ -613,7 +724,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 entity_id = getattr(entity, self.id_col, "")
                 await self.elasticsearch.index_document(
                     index=self.resource_name.lower(),
-                    id=str(entity_id),
+                    id_=str(entity_id),
                     document=doc,
                 )
             except Exception as es_err:
@@ -679,6 +790,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         entity_id: IdType,
         payload: UpdateSchemaType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> Optional[ReadSchemaType]:
         """Updates entity, commits transaction, and returns updated read schema or None if not found."""
         entity: Optional[ModelType] = await self.repo.get(entity_id)
@@ -691,7 +803,11 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 await self.repo.update(entity)
             else:
                 await self.repo.flush()
-            self._enqueue_outbox_event("updated", entity)
+            if self.outbox_enabled and (
+                emit_outbox_event is True
+                or (emit_outbox_event is None and self.auto_outbox_events is True)
+            ):
+                self._enqueue_outbox_event("updated", entity)
 
             # Invalidate item and list caches polymorphically
             await self.cache.delete_item(entity_id, enabled=cache_enabled)
@@ -703,9 +819,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
             # CQRS: update document in Elasticsearch
             try:
                 doc = await self.to_cache_dict(entity)
-                await self.elasticsearch.index_document(
+                await self.elasticsearch.update_document(
                     index=self.resource_name.lower(),
-                    id=str(entity_id),
+                    id_=str(entity_id),
                     document=doc,
                 )
             except Exception as es_err:
@@ -722,9 +838,15 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         entity_id: IdType,
         payload: UpdateSchemaType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> ReadSchemaType:
         """Updates entity by ID, raising NotFoundError if entity does not exist."""
-        updated = await self.update(entity_id, payload, cache_enabled=cache_enabled)
+        updated = await self.update(
+            entity_id,
+            payload,
+            cache_enabled=cache_enabled,
+            emit_outbox_event=emit_outbox_event,
+        )
         if updated is None:
             raise NotFoundError(f"{self.repo.model.__name__} with ID '{entity_id}' not found")
         return updated
@@ -733,6 +855,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         self,
         entity_id: IdType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> bool:
         """Deletes entity and invalidates item and list caches. Returns True if deleted, False if not found."""
         entity: Optional[ModelType] = await self.repo.get(entity_id)
@@ -741,7 +864,11 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
 
         await self.before_delete(entity)
         await self.repo.delete(entity)
-        self._enqueue_outbox_event("deleted", entity)
+        if self.outbox_enabled and (
+            emit_outbox_event is True
+            or (emit_outbox_event is None and self.auto_outbox_events is True)
+        ):
+            self._enqueue_outbox_event("deleted", entity)
 
         # Invalidate item and list caches polymorphically
         await self.cache.delete_item(entity_id, enabled=cache_enabled)
@@ -754,7 +881,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         try:
             await self.elasticsearch.delete_document(
                 index=self.resource_name.lower(),
-                id=str(entity_id),
+                id_=str(entity_id),
             )
         except Exception as es_err:
             logger.warning("Elasticsearch delete failed on delete (%s): %s", self.resource_name, es_err)
@@ -765,9 +892,14 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         self,
         entity_id: IdType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> None:
         """Deletes entity by ID, raising NotFoundError if entity not found."""
-        deleted = await self.delete(entity_id, cache_enabled=cache_enabled)
+        deleted = await self.delete(
+            entity_id,
+            cache_enabled=cache_enabled,
+            emit_outbox_event=emit_outbox_event,
+        )
         if not deleted:
             raise NotFoundError(f"{self.repo.model.__name__} with ID '{entity_id}' not found")
 

@@ -185,6 +185,7 @@ class IBaseService(ABC, Generic[ModelType, CreateSchemaType, UpdateSchemaType, R
         self,
         payload: CreateSchemaType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> ReadSchemaType:
         """Creates a domain entity and returns its read schema."""
         pass
@@ -223,6 +224,7 @@ class IBaseService(ABC, Generic[ModelType, CreateSchemaType, UpdateSchemaType, R
         entity_id: IdType,
         payload: UpdateSchemaType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> Optional[ReadSchemaType]:
         """Updates an entity by ID, returning updated read schema or None if not found."""
         pass
@@ -232,6 +234,7 @@ class IBaseService(ABC, Generic[ModelType, CreateSchemaType, UpdateSchemaType, R
         self,
         entity_id: IdType,
         cache_enabled: Optional[bool] = None,
+        emit_outbox_event: Optional[bool] = None,
     ) -> bool:
         """Deletes an entity by ID, returning True if deleted or False if not found."""
         pass

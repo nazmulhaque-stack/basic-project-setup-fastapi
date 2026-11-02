@@ -30,22 +30,50 @@ async def test_domain_mutation_and_event_share_transaction() -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     async with session_factory() as session:
+        # 1. Default: auto_outbox_events is False -> generic create does NOT trigger outbox event
         service = CategoryService(
             db=session,
             outbox_enabled=True,
             outbox_topic="domain.events",
         )
-        category = await service.create(CategoryCreate(name="Electronics"))
+        cat_default = await service.create(CategoryCreate(name="Clothing"))
+        res = await session.execute(select(OutboxEvent))
+        assert res.scalar_one_or_none() is None
 
+        # 2. Developer explicitly requests event triggering on create via emit_outbox_event=True
+        category = await service.create(
+            CategoryCreate(name="Electronics"),
+            emit_outbox_event=True,
+        )
         result = await session.execute(select(OutboxEvent))
         event = result.scalar_one()
 
         assert event.topic == "domain.events"
         assert event.event_key == str(category.id)
-        assert event.event_type == "category.created.v1"
+        assert event.event_type == "HighPerfStatelessService.category.created"
+        assert event.payload["event_type"] == "HighPerfStatelessService.category.created"
         assert event.payload["aggregate_id"] == str(category.id)
         assert event.payload["data"] == {"id": str(category.id)}
         assert event.published_at is None
+
+        # 3. Developer explicitly enqueues manual event via enqueue_outbox_event
+        manual_event = service.enqueue_outbox_event(
+            "created",
+            cat_default,
+            version="v1",
+        )
+        assert manual_event is not None
+        assert manual_event.event_type == "HighPerfStatelessService.category.created.v1"
+
+    # 4. Outbox disabled flag prevents all outbox events
+    async with session_factory() as session:
+        disabled_service = CategoryService(
+            db=session,
+            outbox_enabled=False,
+        )
+        await disabled_service.create(CategoryCreate(name="Books"), emit_outbox_event=True)
+        manual = disabled_service.enqueue_outbox_event("created", cat_default)
+        assert manual is None
 
     await engine.dispose()
 
@@ -131,10 +159,39 @@ async def test_outbox_dispatcher_preserves_order_for_each_aggregate() -> None:
 def test_format_event_type_convention() -> None:
     from app.services.base import format_event_type
 
-    assert format_event_type("user", "created", "v1") == "user.created.v1"
-    assert format_event_type("User", "CREATED", "1") == "user.created.v1"
-    assert format_event_type(" product ", " updated ", "v2") == "product.updated.v2"
+    # Format: <service_name>.<model_name>.<action_name>[.<version>]
+    # 1. Default service prefix from APP_NAME (HighPerfStatelessService) without version
+    assert format_event_type("user", "created") == "HighPerfStatelessService.user.created"
+    assert format_event_type("User", "CREATED") == "HighPerfStatelessService.user.created"
+    assert format_event_type("Category", "created") == "HighPerfStatelessService.category.created"
+    assert format_event_type(model="user", action="created") == "HighPerfStatelessService.user.created"
+
+    # 2. When version is provided:
+    assert format_event_type("user", "created", "v1") == "HighPerfStatelessService.user.created.v1"
+    assert format_event_type("User", "CREATED", "1") == "HighPerfStatelessService.user.created.v1"
+    assert (
+        format_event_type(" product ", " updated ", "v2")
+        == "HighPerfStatelessService.product.updated.v2"
+    )
     assert (
         format_event_type("inventory", "reservation_failed", "v1")
-        == "inventory.reservation_failed.v1"
+        == "HighPerfStatelessService.inventory.reservation_failed.v1"
+    )
+    assert (
+        format_event_type("user", "created", version="v1")
+        == "HighPerfStatelessService.user.created.v1"
+    )
+
+    # 3. Custom service name override:
+    assert (
+        format_event_type("AuthService", "user", "created")
+        == "AuthService.user.created"
+    )
+    assert (
+        format_event_type("AuthService", "user", "created", "v1")
+        == "AuthService.user.created.v1"
+    )
+    assert (
+        format_event_type(service="BillingService", model="invoice", action="paid")
+        == "BillingService.invoice.paid"
     )

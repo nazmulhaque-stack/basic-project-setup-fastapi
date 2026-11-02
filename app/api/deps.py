@@ -85,6 +85,9 @@ def provide(service_cls: type[ServiceT], cache_prefix: Optional[str] = None) -> 
         if "outbox_enabled" in init_sig.parameters:
             kwargs["outbox_enabled"] = settings.KAFKA_ENABLED
 
+        if "auto_outbox_events" in init_sig.parameters:
+            kwargs["auto_outbox_events"] = False
+
         if "outbox_topic" in init_sig.parameters:
             kwargs["outbox_topic"] = settings.KAFKA_EVENTS_TOPIC
 

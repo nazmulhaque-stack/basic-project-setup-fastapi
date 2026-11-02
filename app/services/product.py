@@ -30,7 +30,9 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         cache: Optional[ICacheService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
         outbox_enabled: bool = False,
+        auto_outbox_events: bool = False,
         outbox_topic: str = "domain.events",
+        service_name: Optional[str] = None,
     ) -> None:
         resolved_repo: ProductRepository
         if repo is not None:
@@ -49,7 +51,9 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
             id_col="id",
             db=db,
             outbox_enabled=outbox_enabled,
+            auto_outbox_events=auto_outbox_events,
             outbox_topic=outbox_topic,
+            service_name=service_name,
         )
         self.repository: ProductRepository = resolved_repo
 
