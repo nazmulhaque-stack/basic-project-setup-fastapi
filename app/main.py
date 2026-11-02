@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
 from fastapi.routing import APIRoute
@@ -56,7 +56,7 @@ from app.services.inventory_reservations import (
     handle_inventory_reserved,
     run_expiration_sweeper,
 )
-from app.services.redis_rate_limit import RATE_LIMIT_LUA_SCRIPT
+from app.services.redis_rate_limit import RATE_LIMIT_LUA_SCRIPT, rate_limiter
 
 # Setup structured application logging
 root_logger = logging.getLogger()
@@ -120,6 +120,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 group_id=settings.KAFKA_INVENTORY_CONSUMER_GROUP,
                 handler=handle_inventory_event,
                 stop_event=inventory_consumer_stop,
+                producer=kafka_producer,
+                dlq_topic=settings.KAFKA_INVENTORY_DLQ_TOPIC,
             ),
             name="kafka-inventory-reservation-consumer",
         )
@@ -398,6 +400,23 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> ORJSO
     )
 
 
-# Mount versioned API v1 router
-app.include_router(api_v1_router, prefix="/api/v1")
+# Mount versioned API v1 router behind the Redis Lua EVALSHA rate limiter (RateLimiter reads
+# `request.app.state.redis` / `request.app.state.rate_limit_lua_sha`, both set in `lifespan()`
+# above, so this dependency only becomes active once the app has actually started).
+# Health/readiness probes are mounted separately, unrated, so K8s liveness checks are never
+# throttled.
+_settings = get_settings()
+app.include_router(
+    api_v1_router,
+    prefix="/api/v1",
+    dependencies=[
+        Depends(
+            rate_limiter(
+                limit=_settings.RATE_LIMIT_DEFAULT,
+                window_seconds=_settings.RATE_LIMIT_WINDOW,
+                scope="api",
+            )
+        )
+    ],
+)
 app.include_router(health_router)

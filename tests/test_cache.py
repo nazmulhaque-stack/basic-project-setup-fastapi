@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 from app.core.config import CacheOperationFlags
-from app.services.base import (
+from app.services.cache import (
     NEGATIVE_CACHE_SENTINEL,
     DynamicRedisCache,
 )

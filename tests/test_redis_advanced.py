@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.core.redis import RedisTemporaryState, cached
-from app.services.base import DynamicRedisCache
+from app.services.cache import DynamicRedisCache
 from app.services.interface import NullCache
 
 

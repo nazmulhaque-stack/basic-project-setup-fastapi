@@ -1,4 +1,3 @@
-from app.services.base import format_event_type
 """Idempotent handling and expiration of inventory reservation events."""
 
 import asyncio
@@ -15,6 +14,7 @@ from app.core.kafka import KafkaEventProducer
 from app.models.inventory_reservation import InventoryReservation
 from app.models.outbox import OutboxEvent
 from app.models.product import Product
+from app.services.base import format_event_type
 
 logger = logging.getLogger(__name__)
 

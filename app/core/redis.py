@@ -69,6 +69,7 @@ async def create_redis_client(
         cluster_client = RedisCluster(
             startup_nodes=startup_nodes,
             password=redis_password,
+            ssl=cfg.REDIS_SSL,
             socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
             socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
             decode_responses=False,
@@ -82,6 +83,7 @@ async def create_redis_client(
             cluster_client = RedisCluster(
                 startup_nodes=startup_nodes,
                 password=None,
+                ssl=cfg.REDIS_SSL,
                 socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
                 socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
                 decode_responses=False,
@@ -101,6 +103,7 @@ async def create_redis_client(
                 host=first_host,
                 port=first_port,
                 password=redis_password,
+                ssl=cfg.REDIS_SSL,
                 max_connections=cfg.REDIS_MAX_CONNECTIONS,
                 socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
                 socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,
@@ -115,6 +118,7 @@ async def create_redis_client(
                     host=first_host,
                     port=first_port,
                     password=None,
+                    ssl=cfg.REDIS_SSL,
                     max_connections=cfg.REDIS_MAX_CONNECTIONS,
                     socket_timeout=cfg.REDIS_SOCKET_TIMEOUT,
                     socket_connect_timeout=cfg.REDIS_CONNECT_TIMEOUT,

@@ -7,7 +7,7 @@ This repository implements an enterprise-grade, clean architecture backend desig
 
 ## 1. Architectural Integrity & Layering
 - **API Transport (`app/api/`)**: Thin controllers handling HTTP requests, query parameters, and Pydantic schemas. Controllers only talk to the Service layer via `Annotated[Service, Depends(get_service)]`.
-  - Dynamic `CRUDRouter` (`app/api/crud_router.py`) dynamically generates validated list query models and routes full-text searches to Elasticsearch.
+  - Dynamic `CRUDRouter` (`app/api/crud_router/`: `router.py` composes `query_model.py`'s dynamic filter/sort model builder with `routes.py`'s CRUD route factories and `search.py`'s Elasticsearch search wiring) dynamically generates validated list query models and routes full-text searches to Elasticsearch.
   - Endpoints always return fast binary serialized responses (`ORJSONResponse`).
 - **Domain Services (`app/services/`)**: Centralizes business rules, transaction boundaries (`commit()`, `rollback()`), dynamic cache invalidation, and PII cryptography.
   - Domain services (`UserService`, `ProductService`, `CategoryService`) **must inherit from `BaseService`** and implement pluggable lifecycle hooks (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`, `to_cache_dict`). The `after_*` hooks run only once their corresponding mutation has committed.

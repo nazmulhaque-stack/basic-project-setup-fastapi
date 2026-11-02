@@ -47,9 +47,17 @@ def create_db_engine(custom_settings: Settings | None = None) -> AsyncEngine:
         "echo": custom_settings.DEBUG,
     }
 
-    # If using PostgreSQL with asyncpg through PgBouncer transaction pooling:
-    # 1. Disable client-side statement cache because PgBouncer transaction mode switches server connections
-    # 2. Use NullPool so PgBouncer manages the 10,000+ client connections to 50 real server connections
+    # If using PostgreSQL with asyncpg through PgBouncer transaction pooling, disable the
+    # client-side statement cache because PgBouncer transaction mode detaches/reassigns the
+    # physical server connection after every transaction, so a name-keyed prepared statement
+    # cached on the client can point at a backend that no longer has it prepared.
+    #
+    # Still use a bounded QueuePool (not NullPool) sized via DB_POOL_SIZE/DB_MAX_OVERFLOW: this
+    # is the pool the "Connection Sizing Formula" in AGENTS.md is computed against
+    # (pool_size(5) + max_overflow(5) per worker). NullPool would instead open a brand-new
+    # asyncpg connection (TCP handshake + startup protocol) to PgBouncer on every single
+    # checkout and tear it down on release — the opposite of "fast," and it would silently
+    # make that sizing math meaningless since no app-side pool would exist to bound.
     if "asyncpg" in database_url:
         if custom_settings.PGBOUNCER_ENABLED:
             connect_args.update({
@@ -58,15 +66,13 @@ def create_db_engine(custom_settings: Settings | None = None) -> AsyncEngine:
                 # Prevent name collisions when PgBouncer reuses backend connections.
                 "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4().hex}__",
             })
-            engine_kwargs["poolclass"] = NullPool
-        else:
-            engine_kwargs.update({
-                "pool_size": custom_settings.DB_POOL_SIZE,
-                "max_overflow": custom_settings.DB_MAX_OVERFLOW,
-                "pool_timeout": custom_settings.DB_POOL_TIMEOUT,
-                "pool_recycle": custom_settings.DB_POOL_RECYCLE,
-                "pool_pre_ping": True,
-            })
+        engine_kwargs.update({
+            "pool_size": custom_settings.DB_POOL_SIZE,
+            "max_overflow": custom_settings.DB_MAX_OVERFLOW,
+            "pool_timeout": custom_settings.DB_POOL_TIMEOUT,
+            "pool_recycle": custom_settings.DB_POOL_RECYCLE,
+            "pool_pre_ping": True,
+        })
     elif "sqlite" in database_url:
         engine_kwargs["poolclass"] = NullPool
     else:

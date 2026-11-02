@@ -11,7 +11,7 @@ from app.models.product import Product
 from app.repositories.product import ProductRepository
 from app.schemas.product import ProductCreate, ProductPage, ProductRead
 from app.services.product import ProductService
-from app.services.base import DynamicRedisCache
+from app.services.cache import DynamicRedisCache
 
 
 @pytest.fixture

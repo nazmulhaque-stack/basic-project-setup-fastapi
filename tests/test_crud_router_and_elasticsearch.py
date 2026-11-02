@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 import pytest
-from sqlalchemy.pool import NullPool
 
 from app.api.crud_router import CRUDRouter, build_list_query_model
 from app.core.config import Settings
@@ -200,11 +199,15 @@ async def test_category_service_crud_lifecycle() -> None:
     mock_es.delete_document.assert_awaited_once()
 
 
-def test_pgbouncer_nullpool_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifies that engine applies NullPool and disables statement caching when PgBouncer is enabled."""
+def test_pgbouncer_bounded_pool_and_statement_cache_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies the engine disables asyncpg statement caching for PgBouncer transaction pooling
+    while still using a bounded QueuePool sized from DB_POOL_SIZE/DB_MAX_OVERFLOW — NOT NullPool,
+    which would otherwise open a brand-new connection to PgBouncer on every single checkout."""
     settings = Settings(
         PGBOUNCER_ENABLED=True,
         DATABASE_URL="postgresql+asyncpg://user:pass@127.0.0.1:6432/demo_db",
+        DB_POOL_SIZE=5,
+        DB_MAX_OVERFLOW=5,
     )
     import app.db.session as db_session
 
@@ -217,7 +220,7 @@ def test_pgbouncer_nullpool_configuration(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(db_session, "create_async_engine", capture_engine_kwargs)
     engine = create_db_engine(settings)
-    assert isinstance(engine.pool, NullPool)
+    assert engine.pool.size() == 5
     connect_args = engine_kwargs["connect_args"]
     assert connect_args["statement_cache_size"] == 0
     assert connect_args["prepared_statement_cache_size"] == 0

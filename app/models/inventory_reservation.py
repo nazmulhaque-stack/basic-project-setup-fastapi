@@ -51,6 +51,7 @@ class InventoryReservation(Base):
         Uuid(as_uuid=True),
         ForeignKey("products.id", ondelete="RESTRICT"),
         nullable=False,
+        index=True,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     location_id: Mapped[str | None] = mapped_column(String(255))

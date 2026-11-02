@@ -147,8 +147,20 @@ class RateLimiter:
         # Redis Cluster hash tag {scope:identity} guarantees routing to single slot
         cache_key: str = f"rl:{{{self.scope}:{identity}}}:{window_start}"
 
-        redis_client: Union[RedisCluster, Redis] = request.app.state.redis
-        lua_sha: str = request.app.state.rate_limit_lua_sha
+        redis_client: Optional[Union[RedisCluster, Redis]] = getattr(request.app.state, "redis", None)
+        lua_sha: Optional[str] = getattr(request.app.state, "rate_limit_lua_sha", None)
+
+        if redis_client is None or not lua_sha:
+            # Rate-limiting infrastructure isn't initialized yet (e.g. lifespan hasn't run —
+            # an ASGI test transport driving the app without the lifespan protocol, or a
+            # request arriving mid-startup). Apply the same fail-open/fail-closed policy as a
+            # live Redis outage below, rather than raising an unrelated AttributeError.
+            if settings.RATE_LIMIT_FAIL_OPEN:
+                return
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiting service temporarily unavailable.",
+            )
 
         try:
             result: Any

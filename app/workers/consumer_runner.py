@@ -71,6 +71,8 @@ class WorkerSupervisor:
                 group_id=self.settings.KAFKA_INVENTORY_CONSUMER_GROUP,
                 handler=handle_inventory_event,
                 stop_event=self._stop_event,
+                producer=self._producer,
+                dlq_topic=self.settings.KAFKA_INVENTORY_DLQ_TOPIC,
             ),
             name="worker-kafka-inventory-consumer",
         )

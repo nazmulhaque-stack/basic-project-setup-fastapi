@@ -1,15 +1,6 @@
-"""API v1 package consolidating domain routers and dynamic CRUD generators."""
+"""API v1 package: see app.api.v1.router for the auto-discovered route mount."""
 
-from app.api.v1 import categories, health, logs, products, users
 from app.api.v1.router import api_router, api_v1_router
 
-__all__ = [
-    "api_router",
-    "api_v1_router",
-    "categories",
-    "health",
-    "logs",
-    "products",
-    "users",
-]
+__all__ = ["api_router", "api_v1_router"]
 

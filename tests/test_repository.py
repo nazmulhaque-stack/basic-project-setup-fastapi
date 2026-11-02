@@ -12,7 +12,8 @@ from app.models.user import User
 from app.repositories.base import BaseRepository
 from app.repositories.user import UserRepository
 from app.schemas.user import UserCreate, UserPage, UserRead
-from app.services.base import BaseService, DynamicRedisCache
+from app.services.base import BaseService
+from app.services.cache import DynamicRedisCache
 from app.services.interface import NullCache
 from app.services.user import UserService
 
