@@ -10,12 +10,16 @@ Design Rules:
 """
 
 from datetime import datetime
+from typing import TYPE_CHECKING, Optional
 import uuid
 
 from sqlalchemy import DateTime, Index, String, Text, Uuid, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
+
+if TYPE_CHECKING:
+    from app.models.employee import Employee
 
 
 class User(Base):
@@ -74,6 +78,15 @@ class User(Base):
     __table_args__ = (
         # Critical composite index for O(log N) keyset pagination (WHERE (created_at, id) > ...)
         Index("ix_users_created_at_id", "created_at", "id"),
+    )
+
+    # 1-to-1 relationship with Employee
+    employee: Mapped[Optional["Employee"]] = relationship(
+        "Employee",
+        back_populates="user",
+        uselist=False,
+        lazy="selectin",
+        cascade="all, delete-orphan",
     )
 
     def __repr__(self) -> str:

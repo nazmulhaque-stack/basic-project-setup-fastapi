@@ -8,6 +8,7 @@ from app.services.base import (
     get_cache,
 )
 from app.services.category import CategoryService
+from app.services.employee import EmployeeService
 from app.services.interface import IBaseService, ICacheService, NullCache
 from app.services.product import ProductService
 from app.services.user import UserService
@@ -24,4 +25,5 @@ __all__ = [
     "UserService",
     "ProductService",
     "CategoryService",
+    "EmployeeService",
 ]

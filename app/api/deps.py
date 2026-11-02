@@ -18,6 +18,7 @@ from app.db.session import get_session
 from app.services.base import BaseService, DynamicRedisCache
 from app.services.interface import ICacheService, NullCache
 from app.services.category import CategoryService
+from app.services.employee import EmployeeService
 from app.services.product import ProductService
 from app.services.user import UserService
 
@@ -101,10 +102,12 @@ def provide(service_cls: type[ServiceT], cache_prefix: Optional[str] = None) -> 
 get_user_service = provide(UserService, cache_prefix="users")
 get_product_service = provide(ProductService, cache_prefix="products")
 get_category_service = provide(CategoryService, cache_prefix="categories")
+get_employee_service = provide(EmployeeService, cache_prefix="employees")
 
 UserServiceDep = Annotated[UserService, Depends(get_user_service)]
 ProductServiceDep = Annotated[ProductService, Depends(get_product_service)]
 CategoryServiceDep = Annotated[CategoryService, Depends(get_category_service)]
+EmployeeServiceDep = Annotated[EmployeeService, Depends(get_employee_service)]
 
 
 def get_log_search_service(
@@ -136,11 +139,13 @@ __all__ = [
     "get_user_service",
     "get_product_service",
     "get_category_service",
+    "get_employee_service",
     "get_log_search_service",
     "get_temp_state",
     "UserServiceDep",
     "ProductServiceDep",
     "CategoryServiceDep",
+    "EmployeeServiceDep",
     "LogSearchServiceDep",
     "TempStateDep",
 ]
