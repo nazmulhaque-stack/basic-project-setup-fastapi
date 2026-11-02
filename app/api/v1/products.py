@@ -3,10 +3,10 @@
 from typing import Annotated, Union
 import uuid
 
-from fastapi import Body, Query
+from fastapi import Body, Depends, Query
 
 from app.api.crud_router import CRUDRouter
-from app.api.deps import ProductServiceDep, get_product_service
+from app.api.deps import provide
 from app.models.product import Product
 from app.schemas.product import (
     ProductCreate,
@@ -15,6 +15,12 @@ from app.schemas.product import (
     ProductUpdate,
     StockAdjust,
 )
+from app.services.product import ProductService
+
+# Cache-key prefix is explicit (not derived from the class name) so it never
+# silently drifts: `cache:products:...` is the production Redis namespace.
+get_product_service = provide(ProductService, cache_prefix="products")
+ProductServiceDep = Annotated[ProductService, Depends(get_product_service)]
 
 router = CRUDRouter(
     model=Product,

@@ -1,9 +1,19 @@
 """Employees: generated CRUD router using CRUDRouter with Redis caching."""
 
+from typing import Annotated
+
+from fastapi import Depends
+
 from app.api.crud_router import CRUDRouter
-from app.api.deps import get_employee_service
+from app.api.deps import provide
 from app.models.employee import Employee
 from app.schemas.employee import EmployeeCreate, EmployeeRead, EmployeeUpdate
+from app.services.employee import EmployeeService
+
+# Cache-key prefix is explicit (not derived from the class name) so it never
+# silently drifts: `cache:employees:...` is the production Redis namespace.
+get_employee_service = provide(EmployeeService, cache_prefix="employees")
+EmployeeServiceDep = Annotated[EmployeeService, Depends(get_employee_service)]
 
 router = CRUDRouter(
     model=Employee,
@@ -22,4 +32,4 @@ router = CRUDRouter(
     sort_fields=["id", "name", "age", "location", "created_at"],
 )
 
-__all__ = ["router", "get_employee_service"]
+__all__ = ["router", "get_employee_service", "EmployeeServiceDep"]

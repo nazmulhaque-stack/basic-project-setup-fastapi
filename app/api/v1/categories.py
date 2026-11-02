@@ -1,9 +1,19 @@
 """Categories: 100% generated CRUD using CRUDRouter."""
 
+from typing import Annotated
+
+from fastapi import Depends
+
 from app.api.crud_router import CRUDRouter
-from app.api.deps import get_category_service
+from app.api.deps import provide
 from app.models.category import Category
 from app.schemas.category import CategoryCreate, CategoryRead, CategoryUpdate
+from app.services.category import CategoryService
+
+# Cache-key prefix is explicit (not derived from the class name) so it never
+# silently drifts: `cache:categories:...` is the production Redis namespace.
+get_category_service = provide(CategoryService, cache_prefix="categories")
+CategoryServiceDep = Annotated[CategoryService, Depends(get_category_service)]
 
 router = CRUDRouter(
     model=Category,
@@ -20,4 +30,4 @@ router = CRUDRouter(
     sort_fields=["id", "name", "created_at"],
 )
 
-__all__ = ["router", "get_category_service"]
+__all__ = ["router", "get_category_service", "CategoryServiceDep"]
