@@ -85,8 +85,10 @@ The Compose Kafka broker is for local development. For production, provision dur
 
 ---
 
+<a id="-architecture--system-topology"></a>
 ## 🏛️ Architecture & System Topology
 
+<a id="high-contrast-visual-mermaid-architecture"></a>
 ### High-Contrast Visual Mermaid Architecture
 
 > **Note on Visibility**: Styled with explicit, high-contrast container fills, crisp outlines, and white typography so all nodes, subgraphs, and data flows render clearly in dark mode, light mode, and high-DPI displays.
@@ -97,6 +99,7 @@ The Compose Kafka broker is for local development. For production, provision dur
 
 ---
 
+<a id="unicode--ascii-architecture-diagram-100-theme-visible"></a>
 ### Unicode / ASCII Architecture Diagram (100% Theme Visible)
 
 For instant readability across raw terminals, plain-text viewers, and all IDE color schemes:
@@ -165,6 +168,7 @@ For instant readability across raw terminals, plain-text viewers, and all IDE co
 
 ---
 
+<a id="system-sizing-math--connection-budget-for-100k-concurrency"></a>
 ### System Sizing, Math & Connection Budget for 100k Concurrency
 
 Serving 100,000 simultaneous connections without resource exhaustion requires a strict connection budget across all tiers:
@@ -182,6 +186,7 @@ Serving 100,000 simultaneous connections without resource exhaustion requires a 
 
 ---
 
+<a id="-project-directory-layout"></a>
 ## 📁 Project Directory Layout
 
 The codebase enforces strict separation of concerns across HTTP controllers, domain business logic, data persistence, and core infrastructure:
@@ -247,8 +252,10 @@ tests/                      # API tests + unit tests (mocked repository)
 
 ---
 
+<a id="-1-lakh-100k-concurrent-requests-system-execution-flow"></a>
 ## ⚡ 1 Lakh (100k) Concurrent Requests: System Execution Flow
 
+<a id="visual-sequence-diagram-end-to-end-request-path"></a>
 ### Visual Sequence Diagram: End-to-End Request Path
 
 The following diagram tracks an incoming request step-by-step through network sockets, kernel buffers, proxy rate-limiting, tracing middleware, crypto operations, database multiplexing, cache invalidation, and response generation:
@@ -259,6 +266,7 @@ The following diagram tracks an incoming request step-by-step through network so
 
 ---
 
+<a id="phase-1-ingress-network-sockets--linux-kernel-tcp-tuning"></a>
 ### Phase 1: Ingress, Network Sockets & Linux Kernel TCP Tuning
 
 At 100,000 concurrent sockets, default Linux kernel settings cause catastrophic connection drops (standard `somaxconn` is 128; file descriptor limits default to 1,024).
@@ -291,6 +299,7 @@ In addition, `/etc/security/limits.conf` sets `nofile 1048576`, enabling worker 
 
 ---
 
+<a id="phase-2-multi-host--multi-container-distribution-l4--nginx"></a>
 ### Phase 2: Multi-Host / Multi-Container Distribution (L4 & Nginx)
 
 No single machine or process handles 100k concurrent requests. Traffic is distributed across tiers:
@@ -314,6 +323,7 @@ No single machine or process handles 100k concurrent requests. Traffic is distri
 
 ---
 
+<a id="phase-3-multi-process-asynchronous-worker-pool-gunicorn--uvicorn"></a>
 ### Phase 3: Multi-Process Asynchronous Worker Pool (Gunicorn + Uvicorn)
 
 Configured in [`deploy/gunicorn.conf.py`](deploy/gunicorn.conf.py):
@@ -332,6 +342,7 @@ Configured in [`deploy/gunicorn.conf.py`](deploy/gunicorn.conf.py):
 
 ---
 
+<a id="phase-4-step-by-step-function-execution-call-stack-write-path-post-users"></a>
 ### Phase 4: Step-by-Step Function Execution Call Stack (Write Path: POST /users)
 
 Here is the exact step-by-step function execution sequence when a client sends `POST /api/v1/users`:
@@ -439,6 +450,7 @@ Here is the exact step-by-step function execution sequence when a client sends `
 
 ---
 
+<a id="phase-5-step-by-step-function-execution-call-stack-read-path-get-usersid"></a>
 ### Phase 5: Step-by-Step Function Execution Call Stack (Read Path: GET /users/{id})
 
 <p align="center">
@@ -489,6 +501,7 @@ When 100,000 clients simultaneously request `GET /api/v1/users/{id}`, the cache-
 
 ---
 
+<a id="phase-6-high-concurrency-keyset-cursor-pagination-path"></a>
 ### Phase 6: High-Concurrency Keyset Cursor Pagination Path
 
 Traditional SQL pagination using `OFFSET 50000 LIMIT 50` requires PostgreSQL to scan and discard 50,000 rows on every call, causing query execution times to balloon from 2ms to 2,500ms.
@@ -516,6 +529,7 @@ Client-facing usage: `GET /api/v1/users?limit=50&cursor=<token>` → [`app/schem
 
 ---
 
+<a id="phase-7-elasticsearch-search--async-logging-lifecycle"></a>
 ### Phase 7: Elasticsearch Search & Async Logging Lifecycle
 
 The architecture implements **Command-Query Responsibility Segregation (CQRS)**: PostgreSQL is the authoritative system of record for all writes, while Elasticsearch 8 handles full-text fuzzy ranking, faceted search, and centralized high-throughput structured application logging. Full engine mechanics are in [§6 Deep Dive: Elasticsearch 8 Search & Structured Logging](#-deep-dive-elasticsearch-8-search--structured-logging).
@@ -589,6 +603,7 @@ To serve **100,000 concurrent requests** without disk I/O bottlenecks or Elastic
 
 ---
 
+<a id="phase-8-relational--nested-query-execution-lifecycle"></a>
 ### Phase 8: Relational & Nested Query Execution Lifecycle
 
 When querying complex nested structures (e.g. a `Product` and its associated `Category`), the async event loop imposes a hard constraint that this codebase enforces structurally.
@@ -648,6 +663,7 @@ To eliminate this hazard permanently, all relationships in this codebase declare
 
 ---
 
+<a id="-deep-dive-encryption-aad-key-rotation--blind-indexing"></a>
 ## 🔐 Deep Dive: Encryption, AAD, Key Rotation & Blind Indexing
 
 Implemented in [`app/core/security.py`](app/core/security.py).
@@ -709,6 +725,7 @@ def mask_phone(phone: str) -> str:
 
 ---
 
+<a id="-deep-dive-distributed-caching-stampede-locks--namespace-invalidation"></a>
 ## ⚡ Deep Dive: Distributed Caching, Stampede Locks & Namespace Invalidation
 
 Implemented in [`app/services/base.py`](app/services/base.py) (`DynamicRedisCache`) and [`app/core/redis.py`](app/core/redis.py) (cluster client + distributed lock primitive).
@@ -853,6 +870,7 @@ In [`app/core/redis.py`](app/core/redis.py):
 
 ---
 
+<a id="-deep-dive-elasticsearch-8-search--structured-logging"></a>
 ## 🔎 Deep Dive: Elasticsearch 8 Search & Structured Logging
 
 Elasticsearch provides distributed inverted indexing, BM25 scoring, and columnar Doc Values, decoupling analytical and full-text searches from PostgreSQL. Implemented in [`app/core/elasticsearch.py`](app/core/elasticsearch.py) and [`app/core/logging.py`](app/core/logging.py).
@@ -930,6 +948,7 @@ Structured logs can be inspected programmatically via [`app/services/log_search.
 
 ---
 
+<a id="-deep-dive-apache-kafka-transactional-outbox--event-driven-architecture"></a>
 ## 📨 Deep Dive: Apache Kafka, Transactional Outbox & Event-Driven Architecture
 
 Apache Kafka provides durable, distributed event streaming for inter-service communication, inventory reservation sagas, and asynchronous outbox dispatch, cooperating with PostgreSQL to sustain **100,000 concurrent requests** with strict data integrity and zero cross-process shared state.
@@ -1172,6 +1191,7 @@ Manages supervisor lifecycle, graceful shutdown on `SIGINT`/`SIGTERM`, and async
 
 ---
 
+<a id="-deep-dive-database-connection-multiplexing-pgbouncer"></a>
 ## 🗄️ Deep Dive: Database Connection Multiplexing (PgBouncer)
 
 ### 1. The Process vs Async Sockets Reality
@@ -1229,10 +1249,12 @@ $$80 \le 150 - 30 = 120 \quad \checkmark$$
 
 ---
 
+<a id="-developer-implementation-workflow-step-by-step-guide"></a>
 ## 🛠️ Developer Implementation Workflow (Step-by-Step Guide)
 
 This section is a complete, copy-pasteable reference for developers creating a new entity, CRUD operations, relationships, or Kafka events in the project.
 
+<a id="91-file-modification-checklist"></a>
 ### 9.1 File Modification Checklist
 
 When adding a new entity (for example, `Order`), follow this checklist:
@@ -1251,6 +1273,7 @@ When adding a new entity (for example, `Order`), follow this checklist:
 | **MODIFY** | `app/services/__init__.py`             | Re-export service                                                            |
 | **MODIFY** | `app/api/v1/router.py`                 | Mount `orders.router` under `/orders`                                        |
 
+<a id="92-how-developers-add-a-new-entity-order-example"></a>
 ### 9.2 How Developers Add a New Entity (Order Example)
 
 To demonstrate how the generic architecture eliminates boilerplate, here is the complete code to implement an `Order` entity with full CRUD, keyset pagination, caching, lifecycle hooks, and a custom domain action — end to end in about five minutes.
@@ -1568,6 +1591,7 @@ The new entity is immediately operational with keyset pagination, Redis caching,
 
 ---
 
+<a id="93-using-baserepository-primitives"></a>
 ### 9.3 Using BaseRepository Primitives
 
 [`BaseRepository[ModelType, IdType]`](app/repositories/base.py) implements the abstract [`IBaseRepository`](app/repositories/interface.py) interface and provides a **full dynamic query, filtering, and mutation engine**:
@@ -1604,6 +1628,7 @@ exists = await repo.exists_by(sku="KB-01", is_active=True)
 active_count = await repo.count(is_active=True)
 ```
 
+<a id="94-unit-of-work--multi-repository-transactions"></a>
 ### 9.4 Unit of Work & Multi-Repository Transactions
 
 If a business action must modify multiple entities atomically (for example, creating an order and reducing inventory), both repositories must share the exact same `AsyncSession`:
@@ -1655,10 +1680,12 @@ async def process_checkout(db: AsyncSession, user_id: uuid.UUID, sku: str, quant
 - Repositories only call `session.flush()`, pushing SQL to the transaction buffer without committing.
 - This design allows a service to update multiple repositories within a single atomic database transaction.
 
+<a id="95-the-nullcache--null-object-pattern"></a>
 ### 9.5 The NullCache / Null Object Pattern
 
 [`BaseService`](app/services/base.py) uses [`NullCache`](app/services/interface.py) whenever no distributed cache is provided. This completely eliminates fragile `if self.cache is not None:` branches, ensuring clean polymorphic execution across cached and non-cached environments — every cache call (`get_item`, `set_item`, `invalidate_lists`, ...) is simply a safe no-op when `NullCache` is active.
 
+<a id="96-overriding-service-lifecycle-hooks"></a>
 ### 9.6 Overriding Service Lifecycle Hooks
 
 [`BaseService`](app/services/base.py) exposes seven lifecycle hooks — three `before_*` hooks (run prior to the repository write), three `after_*` hooks (run after the transaction commits), and two serialization hooks:
@@ -1709,6 +1736,7 @@ class CustomService(BaseService[...]):
 
 All six `before_*`/`after_*` hooks default to a no-op (`before_create`/`before_update` instead have a sensible generic default implementation — see [`app/services/base.py`](app/services/base.py)); override only the ones a given domain service actually needs. The `after_*` hooks fire unconditionally once the surrounding `create`/`update`/`delete` call reaches that point — including when the service has no `db` session (e.g. in unit tests) — so they're always a reliable place to hook in side effects without duplicating `BaseService`'s transaction-commit logic.
 
+<a id="97-controlling-transactions--unit-of-work-boundary"></a>
 ### 9.7 Controlling Transactions & Unit of Work Boundary
 
 - **The Golden Rule**: Generic repositories **never call `session.commit()`**.
@@ -1718,6 +1746,7 @@ All six `before_*`/`after_*` hooks default to a no-op (`before_create`/`before_u
     - If any error or exception occurs, `get_db` executes `await session.rollback()`.
     - This design allows a service to update multiple repositories within a single atomic database transaction.
 
+<a id="98-controlling-cache-dynamically-per-operation--per-call"></a>
 ### 9.8 Controlling Cache Dynamically (Per-Operation & Per-Call)
 
 The caching layer can be toggled globally via environment variables or overridden per-call in code:
@@ -1746,6 +1775,7 @@ user = await service.get_user_by_id(user_id, cache_enabled=False)
 user = await service.get_user_by_id(user_id, cache_enabled=True)
 ```
 
+<a id="99-writing-automated-tests-for-a-new-entity"></a>
 ### 9.9 Writing Automated Tests for a New Entity
 
 Every new entity should have tests validating CRUD, caching, and error paths ([`tests/test_orders.py`](tests/test_orders.py)):
@@ -1780,6 +1810,7 @@ async def test_order_crud_lifecycle(async_session, mock_redis):
 
 ---
 
+<a id="910-nested-tables--entity-relationships-guide-category-in-product"></a>
 ### 9.10 Nested Tables & Entity Relationships Guide (Category in Product)
 
 This section details how to model, query, validate, cache, and migrate nested tables and relationships in this architecture, using the **Category ↔ Product** relationship as the canonical production reference.
@@ -2140,6 +2171,7 @@ async def test_product_category_inactive_rejected(async_session, mock_redis):
 
 ---
 
+<a id="911-building-service-to-service-events-with-kafka"></a>
 ### 9.11 Building Service-to-Service Events with Kafka
 
 This walkthrough guides developers through implementing end-to-end asynchronous service-to-service communication using Apache Kafka and the Transactional Outbox Pattern (mechanics covered in [§7 Deep Dive: Apache Kafka](#-deep-dive-apache-kafka-transactional-outbox--event-driven-architecture)).
@@ -2613,6 +2645,7 @@ async def test_service_triggers_outbox_event(async_session, mock_redis):
 
 ---
 
+<a id="-api-reference-with-full-examples"></a>
 ## 📡 API Reference with Full Examples
 
 ### Users Endpoints (`/api/v1/users`)
@@ -2754,6 +2787,7 @@ async def test_service_triggers_outbox_event(async_session, mock_redis):
 
 ---
 
+<a id="-testing-strategy"></a>
 ## 🧪 Testing Strategy
 
 The test suite runs with zero external dependencies by using in-memory async mocks:
@@ -2783,6 +2817,7 @@ pytest -v
 
 ---
 
+<a id="-database-initialization-migrations--seeders"></a>
 ## 🗃️ Database Initialization, Migrations & Seeders
 
 Automatic initialization is opt-in. `AUTO_MIGRATE`, `AUTO_CREATE_TABLES`, and `AUTO_SEED` all default to `false`. Startup checks database connectivity and reports missing registered tables; it does not generate migrations or create schema unless explicitly enabled. Set `MIGRATION_DATABASE_URL` to a direct database connection when applying migrations, especially when the application URL goes through PgBouncer.
@@ -2871,6 +2906,7 @@ If tables are absent, `python -m app.database check` and `status` print the miss
 
 ---
 
+<a id="-environment--container-networking-reference"></a>
 ## 🧩 Environment & Container Networking Reference
 
 ### Host vs. Docker networking & port matrix
@@ -2988,6 +3024,7 @@ In [`app/core/config.py`](app/core/config.py), the `Settings` class uses a Pydan
 
 ---
 
+<a id="-local-development--production-deployment-guide"></a>
 ## 🚀 Local Development & Production Deployment Guide
 
 ```
@@ -3397,6 +3434,7 @@ docker compose -f deploy/docker-compose.yml exec kafka /opt/kafka/bin/kafka-cons
 
 ---
 
+<a id="-why-this-stack-is-fast--technology-choices--best-practice-rationale"></a>
 ## ⚙️ Why This Stack Is Fast — Technology Choices & Best-Practice Rationale
 
 Every section above describes *how* a piece of this architecture works. This section is the *why*: for each major technology choice, what specifically makes it fast, why it's considered the standard best practice over the obvious alternative, and exactly where in this codebase it's implemented — so the claim is checkable, not marketing copy.
@@ -3420,6 +3458,7 @@ Every section above describes *how* a piece of this architecture works. This sec
 | **Redis Lua (`EVALSHA`) rate limiting** | `EVALSHA` runs the whole increment-and-check as one atomic script server-side — one round trip, zero race condition between the `INCR` and the `EXPIRE`. The `SHA`-keyed variant avoids re-sending the script's source text on every single request once it's cached server-side. | The naive client-side approach — `GET` the counter, check it, `INCR` it in separate round trips — has a race window where two concurrent requests can both read "under limit" and both proceed, and costs 2-3 round trips instead of 1. | **This audit found and fixed a real gap**: `RateLimiter`/`rate_limiter()` in [`app/services/redis_rate_limit.py`](app/services/redis_rate_limit.py) was fully built and its Lua script preloaded at startup, but no router or endpoint actually depended on it — zero requests were being rate-limited. Now wired in globally for every `/api/v1/*` route in [`app/main.py`](app/main.py) (health/readiness probes are deliberately excluded so K8s liveness checks are never throttled). |
 | **Null Object Pattern** (`NullCache`, `NullElasticsearch`) | Every call site in the hot path (`self.cache.get_item(...)`, `self.elasticsearch.index_document(...)`) is an unconditional method call, never an `if self.cache is not None:` branch — one fewer branch per cache/search operation, and it reads cleaner. | The obvious alternative, defensive `None`-checks scattered through every service method, is easy to forget in a new method and makes "caching disabled" a special case the rest of the code has to remember to handle. Here, "disabled" is just a different object implementing the same interface as a no-op — polymorphism absorbs the special case instead of `if` statements. | [`app/services/interface.py`](app/services/interface.py) `NullCache`; [`app/core/elasticsearch.py`](app/core/elasticsearch.py) `NullElasticsearch`. |
 
+<a id="audit-fixes-applied-to-match-the-claims-below"></a>
 ### Audit Fixes Applied to Match the Claims Below
 
 A full-codebase pass against every claim in the table above found these concrete gaps between documentation and running code, all fixed as part of this pass (not just documented around):
