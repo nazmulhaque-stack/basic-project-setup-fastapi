@@ -83,11 +83,20 @@ def do_run_migrations(connection) -> None:
 
 async def run_async_migrations() -> None:
     configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = get_database_url()
+    url = get_database_url()
+    configuration["sqlalchemy.url"] = url
+    engine_kwargs = {
+        "prefix": "sqlalchemy.",
+        "poolclass": pool.NullPool,
+    }
+    if "asyncpg" in url:
+        engine_kwargs["connect_args"] = {
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+        }
     connectable = async_engine_from_config(
         configuration,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
+        **engine_kwargs,
     )
 
     try:

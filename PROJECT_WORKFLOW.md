@@ -2427,7 +2427,7 @@ Comprehensive reference for multi-container deployment, host networking, and env
 
 | Service | Container Name | Host Access Port | Container Network Port | Internal Network Address |
 | :--- | :--- | :--- | :--- | :--- |
-| **PostgreSQL 16** | `demo_postgres` | *(Internal)* | `5432` | `postgres:5432` |
+| **PostgreSQL 16** | `demo_postgres` | `5432` *(external)* | `5432` | `postgres:5432` |
 | **PgBouncer 1.21+** | `demo_pgbouncer` | `6432` | `5432` | `pgbouncer:5432` |
 | **Redis Node 1** | `demo_redis_1` | `7000` | `7000` | `redis-1:7000` |
 | **Redis Node 2** | `demo_redis_2` | `7001` | `7001` | `redis-2:7001` |
@@ -2464,6 +2464,8 @@ DB_USER=postgres
 DB_PASSWORD=postgrespassword
 DB_HOST=127.0.0.1
 DB_PORT=6432
+POSTGRES_PORT=5432              # Host access port to PostgreSQL engine directly
+PGBOUNCER_PORT=6432             # Host access port to PgBouncer connection pooler
 DB_NAME=app_db
 DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@127.0.0.1:6432/app_db
 MIGRATION_DATABASE_URL=
