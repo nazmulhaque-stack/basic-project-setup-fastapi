@@ -1,3 +1,4 @@
+from app.services.base import format_event_type
 """Idempotent handling and expiration of inventory reservation events."""
 
 import asyncio
@@ -183,7 +184,7 @@ async def handle_inventory_reserved(
                     )
                     if not is_reserved:
                         failure_id = uuid.uuid4()
-                        failure_type = "inventory.reservation_failed.v1"
+                        failure_type = format_event_type("inventory", "reservation_failed", "v1")
                         session.add(
                             OutboxEvent(
                                 id=failure_id,
@@ -268,7 +269,7 @@ async def release_expired_reservations_once(
 
                 reservation.status = "expired"
                 event_id = uuid.uuid4()
-                event_type = "inventory.reservation_expired.v1"
+                event_type = format_event_type("inventory", "reservation_expired", "v1")
                 session.add(
                     OutboxEvent(
                         id=event_id,

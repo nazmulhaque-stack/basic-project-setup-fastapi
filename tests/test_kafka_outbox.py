@@ -127,3 +127,14 @@ async def test_outbox_dispatcher_preserves_order_for_each_aggregate() -> None:
     ]
 
     await engine.dispose()
+
+def test_format_event_type_convention() -> None:
+    from app.services.base import format_event_type
+
+    assert format_event_type("user", "created", "v1") == "user.created.v1"
+    assert format_event_type("User", "CREATED", "1") == "user.created.v1"
+    assert format_event_type(" product ", " updated ", "v2") == "product.updated.v2"
+    assert (
+        format_event_type("inventory", "reservation_failed", "v1")
+        == "inventory.reservation_failed.v1"
+    )

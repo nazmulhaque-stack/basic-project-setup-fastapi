@@ -426,6 +426,30 @@ ReadSchemaType = TypeVar("ReadSchemaType", bound=BaseModel)
 IdType = TypeVar("IdType")
 
 
+def format_event_type(
+    resource_or_service: str,
+    action_or_event: str,
+    version: str = "v1",
+) -> str:
+    """Format and validate a standardized event_type following the '<service>.<action>.<version>' convention.
+
+    Convention rules:
+    - All segments are stripped, lowercased, and joined with dots.
+    - If version is numeric or missing 'v', it is normalized (e.g., '1' -> 'v1').
+
+    Example:
+        format_event_type("user", "created", "v1") -> "user.created.v1"
+        format_event_type("product", "updated", "v1") -> "product.updated.v1"
+        format_event_type("inventory", "reservation_failed", "v1") -> "inventory.reservation_failed.v1"
+    """
+    clean_service = str(resource_or_service).strip().lower()
+    clean_action = str(action_or_event).strip().lower()
+    clean_version = str(version).strip().lower()
+    if clean_version.isdigit():
+        clean_version = f"v{clean_version}"
+    return f"{clean_service}.{clean_action}.{clean_version}"
+
+
 class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, ReadSchemaType, IdType]):
     """Generic domain service orchestrator implementing IBaseService with polymorphic caching and Elasticsearch search offloading."""
 
@@ -519,32 +543,51 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         read_model: ReadSchemaType = await self.to_read_schema(entity)
         return read_model.model_dump(mode="json")
 
-    def _enqueue_outbox_event(self, action: str, entity: ModelType) -> None:
-        """Adds a non-sensitive event envelope to the current DB transaction."""
+    def build_event_type(self, action: str, version: str = "v1") -> str:
+        """Construct the standardized event_type following the '<resource>.<action>.<version>' convention.
+
+        Developers can call or override this method in custom domain services (e.g., UserService)
+        to maintain event naming consistency across microservices.
+        """
+        return format_event_type(self.resource_name, action, version=version)
+
+    def _enqueue_outbox_event(
+        self,
+        action: str,
+        entity: ModelType,
+        event_type: Optional[str] = None,
+        extra_data: Optional[Dict[str, Any]] = None,
+        version: str = "v1",
+    ) -> Optional[OutboxEvent]:
+        """Adds a non-sensitive event envelope to the current DB transaction.
+
+        Uses `build_event_type` to guarantee the standardized event_type convention:
+        '<resource>.<action>.<version>' (e.g., 'user.created.v1').
+        """
         if not self.outbox_enabled:
-            return
+            return None
         if self.db is None:
             raise RuntimeError("Kafka outbox events require an active database session.")
 
         entity_id = str(getattr(entity, self.id_col))
         event_id = uuid.uuid4()
-        event_type = f"{self.resource_name.lower()}.{action}.v1"
-        self.db.add(
-            OutboxEvent(
-                id=event_id,
-                topic=self.outbox_topic,
-                event_key=entity_id,
-                event_type=event_type,
-                payload={
-                    "event_id": str(event_id),
-                    "event_type": event_type,
-                    "aggregate_type": self.resource_name,
-                    "aggregate_id": entity_id,
-                    "occurred_at": datetime.now(timezone.utc).isoformat(),
-                    "data": {"id": entity_id},
-                },
-            )
+        resolved_event_type = event_type or self.build_event_type(action, version=version)
+        outbox_event = OutboxEvent(
+            id=event_id,
+            topic=self.outbox_topic,
+            event_key=entity_id,
+            event_type=resolved_event_type,
+            payload={
+                "event_id": str(event_id),
+                "event_type": resolved_event_type,
+                "aggregate_type": self.resource_name,
+                "aggregate_id": entity_id,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "data": {"id": entity_id, **(extra_data or {})},
+            },
         )
+        self.db.add(outbox_event)
+        return outbox_event
 
     # --------------------------------------------------------------------------
     # Generic CRUD Operations
@@ -844,4 +887,5 @@ __all__ = [
     "DynamicRedisCache",
     "get_cache",
     "BaseService",
+    "format_event_type",
 ]

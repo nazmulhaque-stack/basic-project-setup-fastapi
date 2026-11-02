@@ -4,6 +4,7 @@ from app.services.base import (
     BaseService,
     DynamicRedisCache,
     NEGATIVE_CACHE_SENTINEL,
+    format_event_type,
     get_cache,
 )
 from app.services.category import CategoryService
@@ -19,6 +20,7 @@ __all__ = [
     "DynamicRedisCache",
     "NEGATIVE_CACHE_SENTINEL",
     "get_cache",
+    "format_event_type",
     "UserService",
     "ProductService",
     "CategoryService",
