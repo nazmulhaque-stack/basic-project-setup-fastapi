@@ -1550,12 +1550,12 @@ __all__ = ["router", "get_order_service", "OrderServiceDep"]
     from app.api.v1.products import router as products_router
     from app.api.v1.users import router as users_router
 
-    api_router = APIRouter()
-    api_router.include_router(users_router)
-    api_router.include_router(products_router)
-    api_router.include_router(categories_router)
-    api_router.include_router(orders_router)  # <-- Mounts /orders CRUD + custom actions
-    api_router.include_router(health_router)
+    api_v1_router = APIRouter()
+    api_v1_router.include_router(users_router)
+    api_v1_router.include_router(products_router)
+    api_v1_router.include_router(categories_router)
+    api_v1_router.include_router(orders_router)  # <-- Mounts /orders CRUD + custom actions
+    api_v1_router.include_router(health_router)
     ```
 
 2. **Re-export in package inits**:
