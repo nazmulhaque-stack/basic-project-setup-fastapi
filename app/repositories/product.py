@@ -1,4 +1,7 @@
-"""Product repository: hand-written asyncpg SQL (no generic query engine)."""
+"""Product repository: entity-specific SQL + sort/filter logic, executed
+through BaseRepository's dynamic fetch_one/fetch_all/insert/update_row/
+delete_row/execute primitives (shared Redis caching + automatic Elasticsearch
+sync)."""
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -7,7 +10,7 @@ import uuid
 
 from app.models.category import Category
 from app.models.product import Product
-from app.repositories.base import BaseRepository
+from app.repositories.base import BaseRepository, SQLExpr
 from app.repositories.sql_helpers import keyset_seek_clause
 
 _SORTABLE = {"id", "name", "price_cents", "stock", "created_at"}
@@ -32,17 +35,24 @@ def _row_to_product(row: Any) -> Product:
 class ProductRepository(BaseRepository[Product, uuid.UUID]):
     """Concrete repository for the Product entity."""
 
+    table = "products"
+    primary_key = "id"
+
     @property
     def model(self) -> type[Product]:
         return Product
 
     async def get(self, entity_id: Union[uuid.UUID, int, str]) -> Optional[Product]:
-        row = await self.db.fetchrow("SELECT * FROM products WHERE id = $1", entity_id)
+        row = await self.fetch_one("SELECT * FROM products WHERE id = $1", (entity_id,))
         return _row_to_product(row) if row else None
 
     async def get_by_sku(self, sku: str) -> Optional[Product]:
-        """Finds product by unique SKU."""
-        row = await self.db.fetchrow("SELECT * FROM products WHERE sku = $1", sku)
+        """Finds product by unique SKU. Cached: a hot per-write validation
+        lookup (SKU-uniqueness checks on create/update) with no service-layer
+        cache wrapping it, unlike the generic `.get(id)` path above."""
+        row = await self.fetch_one(
+            "SELECT * FROM products WHERE sku = $1", (sku,), cache=True, cache_ttl=120
+        )
         return _row_to_product(row) if row else None
 
     async def get_with_category(self, product_id: Union[uuid.UUID, int, str]) -> Optional[Product]:
@@ -51,8 +61,8 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
         product = await self.get(product_id)
         if product is None or product.category_id is None:
             return product
-        cat_row = await self.db.fetchrow(
-            "SELECT * FROM categories WHERE id = $1", product.category_id
+        cat_row = await self.fetch_one(
+            "SELECT * FROM categories WHERE id = $1", (product.category_id,)
         )
         if cat_row:
             product.category_rel = Category(
@@ -68,75 +78,75 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
     async def change_stock_atomic(self, product_id: Union[uuid.UUID, int, str], delta: int) -> bool:
         """Atomically updates inventory stock without race conditions:
         UPDATE products SET stock = stock + delta WHERE id = :id AND stock + delta >= reserved_quantity.
+
+        Routed through `execute()` (not `update_row()`) because the WHERE
+        clause here is a computed inequality, not a plain equality the
+        generic dict-based `update_row()` can express — but it still goes
+        through the shared engine for query-cache invalidation and
+        Elasticsearch auto-sync.
         """
-        result = await self.db.execute(
+        result = await self.execute(
             """
             UPDATE products
             SET stock = stock + $2, updated_at = now()
             WHERE id = $1 AND stock + $2 >= reserved_quantity
             """,
-            product_id,
-            delta,
+            (product_id, delta),
+            auto_sync=True,
+            sync_op="upsert",
+            entity_id=product_id,
         )
         # asyncpg execute() returns a status string like "UPDATE 1"
         return result.endswith(" 1")
 
     async def low_stock(self, threshold: int = 5, limit: int = 50) -> Sequence[Product]:
         """Fetches active products with inventory stock under or equal to threshold."""
-        rows = await self.db.fetch(
+        rows = await self.fetch_all(
             """
             SELECT * FROM products
             WHERE is_active = true AND (stock - reserved_quantity) <= $1
             ORDER BY (stock - reserved_quantity) ASC, id ASC
             LIMIT $2
             """,
-            threshold,
-            limit,
+            (threshold, limit),
         )
         return [_row_to_product(r) for r in rows]
 
     async def create(self, entity: Product) -> Product:
-        row = await self.db.fetchrow(
-            """
-            INSERT INTO products (id, name, sku, price_cents, category, category_id, is_active, stock, reserved_quantity)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.sku,
-            entity.price_cents,
-            entity.category,
-            entity.category_id,
-            entity.is_active,
-            entity.stock,
-            entity.reserved_quantity,
+        result = await self.insert(
+            {
+                "id": entity.id,
+                "name": entity.name,
+                "sku": entity.sku,
+                "price_cents": entity.price_cents,
+                "category": entity.category,
+                "category_id": entity.category_id,
+                "is_active": entity.is_active,
+                "stock": entity.stock,
+                "reserved_quantity": entity.reserved_quantity,
+            }
         )
-        return _row_to_product(row)
+        return _row_to_product(result)
 
     async def update(self, entity: Product) -> Product:
-        row = await self.db.fetchrow(
-            """
-            UPDATE products
-            SET name = $2, sku = $3, price_cents = $4, category = $5, category_id = $6,
-                is_active = $7, stock = $8, reserved_quantity = $9, updated_at = now()
-            WHERE id = $1
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.sku,
-            entity.price_cents,
-            entity.category,
-            entity.category_id,
-            entity.is_active,
-            entity.stock,
-            entity.reserved_quantity,
+        result = await self.update_row(
+            {
+                "name": entity.name,
+                "sku": entity.sku,
+                "price_cents": entity.price_cents,
+                "category": entity.category,
+                "category_id": entity.category_id,
+                "is_active": entity.is_active,
+                "stock": entity.stock,
+                "reserved_quantity": entity.reserved_quantity,
+                "updated_at": SQLExpr("now()"),
+            },
+            {"id": entity.id},
         )
-        return _row_to_product(row)
+        return _row_to_product(result)
 
     async def delete(self, entity: Product) -> None:
-        await self.db.execute("DELETE FROM products WHERE id = $1", entity.id)
+        await self.delete_row({"id": entity.id})
 
     def _build_where(self, filters: Mapping[str, Any]) -> Tuple[str, List[Any]]:
         """Hand-written WHERE builder for exactly the filters ProductsRouter declares."""
@@ -193,13 +203,13 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
         order_by = self._build_order_by(sort)
         safe_limit = min(100, max(1, limit))
         query = f"SELECT * FROM products {where} {order_by} OFFSET ${len(params) + 1} LIMIT ${len(params) + 2}"
-        rows = await self.db.fetch(query, *params, max(0, offset), safe_limit)
+        rows = await self.fetch_all(query, (*params, max(0, offset), safe_limit))
         return [_row_to_product(r) for r in rows]
 
     async def count(self, filters: Optional[Mapping[str, Any]] = None) -> int:
         where, params = self._build_where(filters or {})
-        query = f"SELECT count(*) FROM products {where}"
-        return int(await self.db.fetchval(query, *params) or 0)
+        row = await self.fetch_one(f"SELECT count(*) AS count FROM products {where}", params)
+        return int(row["count"]) if row else 0
 
     async def list_keyset(
         self,
@@ -221,7 +231,7 @@ class ProductRepository(BaseRepository[Product, uuid.UUID]):
             f"SELECT * FROM products {where} "
             f"ORDER BY {order_col} ASC, {id_col} ASC LIMIT ${len(params) + 1}"
         )
-        rows = await self.db.fetch(query, *params, safe_limit + 1)
+        rows = await self.fetch_all(query, (*params, safe_limit + 1))
         has_next = len(rows) > safe_limit
         items = [_row_to_product(r) for r in rows[:safe_limit]]
         return items, has_next

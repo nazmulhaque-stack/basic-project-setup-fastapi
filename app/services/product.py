@@ -37,7 +37,9 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         if repo is not None:
             resolved_repo = repo
         elif db is not None:
-            resolved_repo = ProductRepository(db)
+            # Thread cache/Elasticsearch into the repository too — see the
+            # identical note in UserService.__init__.
+            resolved_repo = ProductRepository(db, cache=cache, elasticsearch=elasticsearch)
         else:
             raise ValueError("Either db session or repo must be provided to ProductService")
 
@@ -65,7 +67,11 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
     async def _ensure_active_category(self, category_id: int) -> None:
         if self.db is not None:
             from app.repositories.category import CategoryRepository
-            categories = CategoryRepository(self.db)
+            # CategoryRepository.table ("categories") namespaces its own cache
+            # keys, so passing this service's cache/ES instances through is
+            # safe (and lets `exists_active`'s cache=True actually cache)
+            # even though this is a Category lookup inside ProductService.
+            categories = CategoryRepository(self.db, cache=self.cache, elasticsearch=self.elasticsearch)
             if not await categories.exists_active(category_id):
                 raise BusinessRuleError(f"Category id={category_id} does not exist or is inactive.")
 

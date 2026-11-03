@@ -40,8 +40,14 @@ async def test_domain_mutation_and_event_share_transaction(pg_pool: Any) -> None
                 service = CategoryService(db=uow, outbox_enabled=True, outbox_topic="domain.events")
                 cat_default = await service.create(CategoryCreate(name=f"Clothing-{unique}"))
                 category_ids.append(cat_default.id)
+                # Scoped to the domain-events topic: CategoryRepository.create()
+                # always stages an *elasticsearch.sync* outbox row too (that's
+                # independent of outbox_enabled/emit_outbox_event — see
+                # app/repositories/base.py's auto_sync), so a plain event_key
+                # match would also catch that unrelated row.
                 no_event = await connection.fetchval(
-                    "SELECT count(*) FROM outbox_events WHERE event_key = $1", str(cat_default.id)
+                    "SELECT count(*) FROM outbox_events WHERE event_key = $1 AND topic = 'domain.events'",
+                    str(cat_default.id),
                 )
                 assert no_event == 0
 
@@ -52,7 +58,8 @@ async def test_domain_mutation_and_event_share_transaction(pg_pool: Any) -> None
                 )
                 category_ids.append(category.id)
                 event_row = await connection.fetchrow(
-                    "SELECT * FROM outbox_events WHERE event_key = $1", str(category.id)
+                    "SELECT * FROM outbox_events WHERE event_key = $1 AND topic = 'domain.events'",
+                    str(category.id),
                 )
                 assert event_row is not None
                 assert event_row["topic"] == "domain.events"
@@ -81,8 +88,11 @@ async def test_domain_mutation_and_event_share_transaction(pg_pool: Any) -> None
                 category_ids.append(book.id)
                 manual = await disabled_service.enqueue_outbox_event("created", cat_default)
                 assert manual is None
+                # Same domain.events scoping as above — CategoryRepository.create()
+                # still stages an elasticsearch.sync row even with outbox_enabled=False.
                 count = await connection.fetchval(
-                    "SELECT count(*) FROM outbox_events WHERE event_key = $1", str(book.id)
+                    "SELECT count(*) FROM outbox_events WHERE event_key = $1 AND topic = 'domain.events'",
+                    str(book.id),
                 )
                 assert count == 0
     finally:

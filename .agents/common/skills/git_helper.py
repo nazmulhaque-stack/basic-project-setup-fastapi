@@ -153,8 +153,9 @@ def main() -> int:
         if not clean:
             for v in violations:
                 print(v, file=sys.stderr)
+            print('{"decision": "deny", "reason": "Sensitive files staged"}')
             return 1
-        print("All staged files are clean.")
+        print('{"decision": "allow"}')
         return 0
     elif args.command == "commit":
         return cmd_commit(args.message, skip_tests=args.skip_tests)

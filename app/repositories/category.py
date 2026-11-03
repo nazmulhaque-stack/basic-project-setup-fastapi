@@ -1,11 +1,13 @@
-"""Category repository: hand-written asyncpg SQL (no generic query engine)."""
+"""Category repository: entity-specific SQL + sort/filter logic, executed
+through BaseRepository's dynamic fetch_one/fetch_all/insert/update_row/
+delete_row primitives (shared Redis caching + automatic Elasticsearch sync)."""
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
 from app.models.category import Category
-from app.repositories.base import BaseRepository
+from app.repositories.base import BaseRepository, SQLExpr
 from app.repositories.sql_helpers import keyset_seek_clause
 
 _SORTABLE = {"id", "name", "created_at"}
@@ -25,54 +27,50 @@ def _row_to_category(row: Any) -> Category:
 class CategoryRepository(BaseRepository[Category, int]):
     """Concrete repository for the Category entity."""
 
+    table = "categories"
+    primary_key = "id"
+
     @property
     def model(self) -> type[Category]:
         return Category
 
     async def get(self, entity_id: int) -> Optional[Category]:
-        row = await self.db.fetchrow("SELECT * FROM categories WHERE id = $1", entity_id)
+        row = await self.fetch_one("SELECT * FROM categories WHERE id = $1", (entity_id,))
         return _row_to_category(row) if row else None
 
     async def exists_active(self, category_id: int) -> bool:
         """Checks whether a category exists and is currently active
-        (used by ProductService to validate `category_id` on create/update)."""
-        return bool(
-            await self.db.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM categories WHERE id = $1 AND is_active = true)",
-                category_id,
-            )
+        (used by ProductService to validate `category_id` on create/update).
+        Cached: this is a hot per-write validation lookup with no service-layer
+        cache wrapping it, unlike the generic `.get(id)` path above."""
+        row = await self.fetch_one(
+            "SELECT EXISTS(SELECT 1 FROM categories WHERE id = $1 AND is_active = true) AS result",
+            (category_id,),
+            cache=True,
+            cache_ttl=60,
         )
+        return bool(row and row["result"])
 
     async def create(self, entity: Category) -> Category:
-        row = await self.db.fetchrow(
-            """
-            INSERT INTO categories (name, description, is_active)
-            VALUES ($1, $2, $3)
-            RETURNING *
-            """,
-            entity.name,
-            entity.description,
-            entity.is_active,
+        result = await self.insert(
+            {"name": entity.name, "description": entity.description, "is_active": entity.is_active}
         )
-        return _row_to_category(row)
+        return _row_to_category(result)
 
     async def update(self, entity: Category) -> Category:
-        row = await self.db.fetchrow(
-            """
-            UPDATE categories
-            SET name = $2, description = $3, is_active = $4, updated_at = now()
-            WHERE id = $1
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.description,
-            entity.is_active,
+        result = await self.update_row(
+            {
+                "name": entity.name,
+                "description": entity.description,
+                "is_active": entity.is_active,
+                "updated_at": SQLExpr("now()"),
+            },
+            {"id": entity.id},
         )
-        return _row_to_category(row)
+        return _row_to_category(result)
 
     async def delete(self, entity: Category) -> None:
-        await self.db.execute("DELETE FROM categories WHERE id = $1", entity.id)
+        await self.delete_row({"id": entity.id})
 
     def _build_where(self, filters: Mapping[str, Any]) -> Tuple[str, List[Any]]:
         """Hand-written WHERE builder for exactly the filters CategoriesRouter declares."""
@@ -117,13 +115,13 @@ class CategoryRepository(BaseRepository[Category, int]):
         order_by = self._build_order_by(sort)
         safe_limit = min(100, max(1, limit))
         query = f"SELECT * FROM categories {where} {order_by} OFFSET ${len(params) + 1} LIMIT ${len(params) + 2}"
-        rows = await self.db.fetch(query, *params, max(0, offset), safe_limit)
+        rows = await self.fetch_all(query, (*params, max(0, offset), safe_limit))
         return [_row_to_category(r) for r in rows]
 
     async def count(self, filters: Optional[Mapping[str, Any]] = None) -> int:
         where, params = self._build_where(filters or {})
-        query = f"SELECT count(*) FROM categories {where}"
-        return int(await self.db.fetchval(query, *params) or 0)
+        row = await self.fetch_one(f"SELECT count(*) AS count FROM categories {where}", params)
+        return int(row["count"]) if row else 0
 
     async def list_keyset(
         self,
@@ -145,7 +143,7 @@ class CategoryRepository(BaseRepository[Category, int]):
             f"SELECT * FROM categories {where} "
             f"ORDER BY {order_col} ASC, {id_col} ASC LIMIT ${len(params) + 1}"
         )
-        rows = await self.db.fetch(query, *params, safe_limit + 1)
+        rows = await self.fetch_all(query, (*params, safe_limit + 1))
         has_next = len(rows) > safe_limit
         items = [_row_to_category(r) for r in rows[:safe_limit]]
         return items, has_next

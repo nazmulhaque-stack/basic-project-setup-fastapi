@@ -176,12 +176,16 @@ async def test_category_service_crud_lifecycle() -> None:
     service = CategoryService(repo=mock_repo, db=mock_db, elasticsearch=mock_es)
 
     # 1. Create
+    # Elasticsearch sync is no longer a direct BaseService call — it's staged
+    # in the outbox by the real CategoryRepository.insert() (auto_sync=True),
+    # which this test bypasses via mock_repo. See test_category_repository_
+    # crud_against_real_postgres (and app/services/elasticsearch_sync.py) for
+    # coverage of the actual sync path against a real repository/DB.
     payload = CategoryCreate(name="Appliances", is_active=True)
     created = await service.create(payload)
     assert created.name == "Appliances"
     mock_repo.create.assert_awaited_once()
     mock_db.commit.assert_awaited_once()
-    mock_es.index_document.assert_awaited_once()
 
     # 2. Get
     fetched = await service.get_by_id(category_id)
@@ -194,9 +198,10 @@ async def test_category_service_crud_lifecycle() -> None:
     assert items[0].name == "Appliances"
 
     # 4. Delete
+    # Same note as Create above: ES delete-sync is staged by the real
+    # CategoryRepository.delete() -> delete_row(), not called directly here.
     await service.delete_by_id(category_id)
     mock_repo.delete.assert_awaited_once()
-    mock_es.delete_document.assert_awaited_once()
 
 
 @pytest.mark.asyncio

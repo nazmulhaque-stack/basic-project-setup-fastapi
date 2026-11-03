@@ -8,6 +8,7 @@ from typing import Optional
 import asyncpg
 
 from app.core.kafka import KafkaEventProducer
+from app.repositories.base import ES_SYNC_TOPIC
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +16,17 @@ logger = logging.getLogger(__name__)
 # (topic, event_key) is never dispatched while an earlier one is still
 # unpublished. `SKIP LOCKED` lets multiple dispatcher processes poll
 # concurrently without blocking on each other's in-flight batches.
-_SELECT_PENDING_SQL = """
+#
+# Excludes `elasticsearch.sync` rows (BaseRepository's own outbox-staged
+# auto-sync events, see app/repositories/base.py) — those belong exclusively
+# to `ElasticsearchSyncDispatcher`. Without this, this dispatcher would
+# "steal" them: publish them to Kafka under a topic nothing consumes, and
+# mark them `published_at`, making them permanently invisible to the
+# dispatcher that's actually supposed to apply them to Elasticsearch.
+_SELECT_PENDING_SQL = f"""
 SELECT * FROM outbox_events AS o
 WHERE o.published_at IS NULL
+  AND o.topic != '{ES_SYNC_TOPIC}'
   AND NOT EXISTS (
       SELECT 1 FROM outbox_events AS older
       WHERE older.topic = o.topic

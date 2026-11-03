@@ -1,4 +1,6 @@
-"""User repository: hand-written asyncpg SQL (no generic query engine)."""
+"""User repository: entity-specific SQL + sort/filter logic, executed through
+BaseRepository's dynamic fetch_one/fetch_all/insert/update_row/delete_row
+primitives (shared Redis caching + automatic Elasticsearch sync)."""
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -27,61 +29,65 @@ def _row_to_user(row: Any) -> User:
 class UserRepository(BaseRepository[User, uuid.UUID]):
     """Concrete repository for the User entity."""
 
+    table = "users"
+    primary_key = "id"
+
     @property
     def model(self) -> type[User]:
         return User
 
     async def get(self, entity_id: uuid.UUID) -> Optional[User]:
-        row = await self.db.fetchrow("SELECT * FROM users WHERE id = $1", entity_id)
+        row = await self.fetch_one("SELECT * FROM users WHERE id = $1", (entity_id,))
         return _row_to_user(row) if row else None
 
     async def get_by_email(self, email: str) -> Optional[User]:
-        """Finds user by unique email address."""
-        row = await self.db.fetchrow("SELECT * FROM users WHERE email = $1", email)
+        """Finds user by unique email address. Cached: a hot per-write
+        validation lookup with no service-layer cache wrapping it, unlike the
+        generic `.get(id)` path above."""
+        row = await self.fetch_one(
+            "SELECT * FROM users WHERE email = $1", (email,), cache=True, cache_ttl=120
+        )
         return _row_to_user(row) if row else None
 
     async def get_by_phone_blind_index(self, blind_index: str) -> Optional[User]:
-        """Finds user by deterministic blind index of encrypted phone."""
-        row = await self.db.fetchrow(
-            "SELECT * FROM users WHERE phone_blind_index = $1", blind_index
+        """Finds user by deterministic blind index of encrypted phone. Cached
+        for the same reason as `get_by_email`."""
+        row = await self.fetch_one(
+            "SELECT * FROM users WHERE phone_blind_index = $1",
+            (blind_index,),
+            cache=True,
+            cache_ttl=120,
         )
         return _row_to_user(row) if row else None
 
     async def create(self, entity: User) -> User:
-        row = await self.db.fetchrow(
-            """
-            INSERT INTO users (id, name, email, role, phone_encrypted, phone_blind_index)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.email,
-            entity.role,
-            entity.phone_encrypted,
-            entity.phone_blind_index,
+        result = await self.insert(
+            {
+                "id": entity.id,
+                "name": entity.name,
+                "email": entity.email,
+                "role": entity.role,
+                "phone_encrypted": entity.phone_encrypted,
+                "phone_blind_index": entity.phone_blind_index,
+            }
         )
-        return _row_to_user(row)
+        return _row_to_user(result)
 
     async def update(self, entity: User) -> User:
-        row = await self.db.fetchrow(
-            """
-            UPDATE users
-            SET name = $2, email = $3, role = $4, phone_encrypted = $5, phone_blind_index = $6
-            WHERE id = $1
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.email,
-            entity.role,
-            entity.phone_encrypted,
-            entity.phone_blind_index,
+        result = await self.update_row(
+            {
+                "name": entity.name,
+                "email": entity.email,
+                "role": entity.role,
+                "phone_encrypted": entity.phone_encrypted,
+                "phone_blind_index": entity.phone_blind_index,
+            },
+            {"id": entity.id},
         )
-        return _row_to_user(row)
+        return _row_to_user(result)
 
     async def delete(self, entity: User) -> None:
-        await self.db.execute("DELETE FROM users WHERE id = $1", entity.id)
+        await self.delete_row({"id": entity.id})
 
     def _build_where(self, filters: Mapping[str, Any]) -> Tuple[str, List[Any]]:
         """Hand-written WHERE builder for exactly the filters UsersRouter declares:
@@ -131,13 +137,13 @@ class UserRepository(BaseRepository[User, uuid.UUID]):
         order_by = self._build_order_by(sort)
         safe_limit = min(100, max(1, limit))
         query = f"SELECT * FROM users {where} {order_by} OFFSET ${len(params) + 1} LIMIT ${len(params) + 2}"
-        rows = await self.db.fetch(query, *params, max(0, offset), safe_limit)
+        rows = await self.fetch_all(query, (*params, max(0, offset), safe_limit))
         return [_row_to_user(r) for r in rows]
 
     async def count(self, filters: Optional[Mapping[str, Any]] = None) -> int:
         where, params = self._build_where(filters or {})
-        query = f"SELECT count(*) FROM users {where}"
-        return int(await self.db.fetchval(query, *params) or 0)
+        row = await self.fetch_one(f"SELECT count(*) AS count FROM users {where}", params)
+        return int(row["count"]) if row else 0
 
     async def list_keyset(
         self,
@@ -159,7 +165,7 @@ class UserRepository(BaseRepository[User, uuid.UUID]):
             f"SELECT * FROM users {where} "
             f"ORDER BY {order_col} ASC, {id_col} ASC LIMIT ${len(params) + 1}"
         )
-        rows = await self.db.fetch(query, *params, safe_limit + 1)
+        rows = await self.fetch_all(query, (*params, safe_limit + 1))
         has_next = len(rows) > safe_limit
         items = [_row_to_user(r) for r in rows[:safe_limit]]
         return items, has_next

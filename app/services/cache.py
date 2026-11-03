@@ -357,6 +357,20 @@ class DynamicRedisCache(ICacheService):
             logger.warning("Redis failure during ttl(%s): %s", key, exc)
             return -2
 
+    async def incr(self, key: str) -> int:
+        """Atomically increments a counter key (`INCR`), creating it at 1 if absent.
+
+        Used for O(1) namespace-version cache invalidation outside the
+        item/list helpers above — e.g. `BaseRepository`'s dynamic per-table
+        query cache bumps one of these on every write instead of tracking or
+        deleting individual cached query keys.
+        """
+        try:
+            return int(await self.redis.incr(key))
+        except (RedisError, ConnectionError, OSError) as exc:
+            logger.warning("Redis failure during incr(%s): %s. Failing open.", key, exc)
+            return 1
+
 
 def get_cache(
     prefix: str,

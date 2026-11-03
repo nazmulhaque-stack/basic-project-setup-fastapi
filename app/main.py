@@ -39,6 +39,7 @@ from app.core.elasticsearch import (
     create_elasticsearch_client,
 )
 from app.core.exceptions import AppException
+from app.core.metrics import setup_metrics
 from app.core.logging import (
     AsyncElasticsearchLogHandler,
     AsyncLogBuffer,
@@ -50,6 +51,7 @@ from app.core.redis import close_redis_client, create_redis_client
 from app.core.security import CryptoService
 from app.db.pool import close_db_pool, create_db_pool
 from app.schemas.base import ErrorDetail, ErrorResponse
+from app.services.elasticsearch_sync import ElasticsearchSyncDispatcher
 from app.services.outbox import OutboxDispatcher
 from app.services.inventory_reservations import (
     handle_inventory_reserved,
@@ -158,6 +160,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     es_service: IElasticsearchService
     log_buffer: Optional[AsyncLogBuffer] = None
     es_log_handler: Optional[AsyncElasticsearchLogHandler] = None
+    es_sync_dispatcher: Optional[ElasticsearchSyncDispatcher] = None
 
     if es_client is not None:
         full_log_index = f"{settings.ELASTICSEARCH_INDEX_PREFIX}_{settings.ELASTICSEARCH_LOG_INDEX}"
@@ -181,11 +184,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Ensure log index template in background
         asyncio.create_task(setup_log_index_template(es_client, full_log_index))
         logger.info("Configured Elasticsearch client pointing to %s with async log buffer", settings.ELASTICSEARCH_URL)
+
+        # Background consumer for BaseRepository's outbox-staged auto-sync
+        # events (see app/repositories/base.py, app/core/elasticsearch_registry.py).
+        es_sync_dispatcher = ElasticsearchSyncDispatcher(
+            db_pool,
+            es_service,
+            poll_interval=settings.ES_SYNC_POLL_INTERVAL,
+            batch_size=settings.ES_SYNC_BATCH_SIZE,
+            max_attempts=settings.ES_SYNC_MAX_ATTEMPTS,
+        )
+        es_sync_dispatcher.start()
     else:
         es_service = NullElasticsearch()
 
     app.state.elasticsearch = es_service
     app.state.log_buffer = log_buffer
+    app.state.es_sync_dispatcher = es_sync_dispatcher
 
     yield
 
@@ -199,6 +214,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await reservation_sweeper_task
     if outbox_dispatcher is not None:
         await outbox_dispatcher.stop()
+    if es_sync_dispatcher is not None:
+        await es_sync_dispatcher.stop()
     if kafka_producer is not None:
         await kafka_producer.stop()
 
@@ -412,3 +429,4 @@ app.include_router(
     ],
 )
 app.include_router(health_router)
+setup_metrics(app)

@@ -7,8 +7,10 @@ from typing import Any
 import asyncpg
 
 from app.core.config import Settings, get_settings
+from app.core.elasticsearch import create_elasticsearch_client, AsyncElasticsearchService
 from app.core.kafka import KafkaEventProducer, consume_events_forever
 from app.db.pool import close_db_pool, create_db_pool
+from app.services.elasticsearch_sync import ElasticsearchSyncDispatcher
 from app.services.inventory_reservations import (
     handle_inventory_reserved,
     run_expiration_sweeper,
@@ -32,23 +34,49 @@ class WorkerSupervisor:
         self._tasks: list[asyncio.Task] = []
         self._producer: KafkaEventProducer | None = None
         self._outbox_dispatcher: OutboxDispatcher | None = None
+        self._es_sync_dispatcher: ElasticsearchSyncDispatcher | None = None
 
     async def run(self) -> None:
         logger.info("Starting WorkerSupervisor daemon...")
 
-        if not self.settings.KAFKA_ENABLED:
-            logger.warning("KAFKA_ENABLED=false. Worker will idle.")
+        if not self.settings.KAFKA_ENABLED and not self.settings.ELASTICSEARCH_ENABLED:
+            logger.warning("KAFKA_ENABLED=false and ELASTICSEARCH_ENABLED=false. Worker will idle.")
             await self._stop_event.wait()
             return
 
         # 1. Initialize the raw asyncpg connection pool (PgBouncer transaction-pooling compatible)
         self.pool = await create_db_pool(self.settings)
 
-        # 2. Start Kafka Producer
+        # 2. Start the Elasticsearch sync dispatcher (independent of Kafka —
+        # it consumes BaseRepository's own outbox-staged sync events).
+        if self.settings.ELASTICSEARCH_ENABLED:
+            es_client = create_elasticsearch_client(self.settings)
+            if es_client is not None:
+                es_service = AsyncElasticsearchService(
+                    client=es_client, index_prefix=self.settings.ELASTICSEARCH_INDEX_PREFIX
+                )
+                self._es_sync_dispatcher = ElasticsearchSyncDispatcher(
+                    self.pool,
+                    es_service,
+                    poll_interval=self.settings.ES_SYNC_POLL_INTERVAL,
+                    batch_size=self.settings.ES_SYNC_BATCH_SIZE,
+                    max_attempts=self.settings.ES_SYNC_MAX_ATTEMPTS,
+                )
+                self._es_sync_dispatcher.start()
+
+        if not self.settings.KAFKA_ENABLED:
+            logger.info("KAFKA_ENABLED=false; running with Elasticsearch sync only.")
+            await self._stop_event.wait()
+            if self._es_sync_dispatcher:
+                await self._es_sync_dispatcher.stop()
+            await close_db_pool(self.pool)
+            return
+
+        # 3. Start Kafka Producer
         self._producer = KafkaEventProducer(self.settings.KAFKA_BOOTSTRAP_SERVERS)
         await self._producer.start()
 
-        # 3. Start Outbox Dispatcher
+        # 4. Start Outbox Dispatcher
         self._outbox_dispatcher = OutboxDispatcher(
             self.pool,
             self._producer,
@@ -57,7 +85,7 @@ class WorkerSupervisor:
         )
         self._outbox_dispatcher.start()
 
-        # 4. Inventory Consumer handler
+        # 5. Inventory Consumer handler
         async def handle_inventory_event(event: dict[str, Any]) -> None:
             await handle_inventory_reserved(
                 event,
@@ -67,7 +95,7 @@ class WorkerSupervisor:
                 dead_letter_topic=self.settings.KAFKA_INVENTORY_DLQ_TOPIC,
             )
 
-        # 5. Spawn consumer and sweeper tasks
+        # 6. Spawn consumer and sweeper tasks
         consumer_task = asyncio.create_task(
             consume_events_forever(
                 bootstrap_servers=self.settings.KAFKA_BOOTSTRAP_SERVERS,
@@ -100,6 +128,8 @@ class WorkerSupervisor:
         logger.info("Shutting down WorkerSupervisor tasks...")
         if self._outbox_dispatcher:
             await self._outbox_dispatcher.stop()
+        if self._es_sync_dispatcher:
+            await self._es_sync_dispatcher.stop()
 
         for t in self._tasks:
             t.cancel()

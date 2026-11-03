@@ -51,6 +51,22 @@ class IElasticsearchService(ABC):
         pass
 
     @abstractmethod
+    async def search(
+        self,
+        index: str,
+        query: Union[str, Dict[str, Any]],
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Short-name alias for `search_documents` — the name actually called
+        by `BaseService.search()` and `BaseRepository.search()`. Declared as
+        its own abstract method (not left as a bare post-hoc class attribute
+        alias) so `unittest.mock.Mock(spec=IElasticsearchService)` and any
+        other interface-shaped substitute actually exposes it.
+        """
+        pass
+
+    @abstractmethod
     async def ping(self) -> bool:
         """Checks cluster connectivity."""
     @abstractmethod

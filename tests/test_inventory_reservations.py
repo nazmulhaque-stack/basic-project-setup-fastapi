@@ -85,7 +85,7 @@ async def cleanup_product(pool: Any, product_id: uuid.UUID) -> None:
 
 @pytest.mark.asyncio
 async def test_reservation_reduces_available_stock_but_preserves_on_hand(pg_pool: Any) -> None:
-    sku = f"SKU-{uuid.uuid4().hex[:8]}"
+    sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
     product_id = await add_product(pg_pool, sku=sku)
     try:
         producer = FakeProducer()
@@ -135,7 +135,7 @@ async def test_reservation_reduces_available_stock_but_preserves_on_hand(pg_pool
 
 @pytest.mark.asyncio
 async def test_insufficient_stock_records_rejection_and_compensation(pg_pool: Any) -> None:
-    sku = f"SKU-{uuid.uuid4().hex[:8]}"
+    sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
     product_id = await add_product(pg_pool, sku=sku, stock=1)
     try:
         producer = FakeProducer()
@@ -198,7 +198,7 @@ async def test_unknown_product_is_dead_lettered(pg_pool: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_expired_reservation_releases_atp_without_changing_on_hand(pg_pool: Any) -> None:
-    sku = f"SKU-{uuid.uuid4().hex[:8]}"
+    sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
     product_id = await add_product(pg_pool, sku=sku, stock=5)
     try:
         async with pg_pool.acquire() as connection:

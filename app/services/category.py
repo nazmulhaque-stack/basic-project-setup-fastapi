@@ -35,7 +35,7 @@ class CategoryService(BaseService[Category, CategoryCreate, CategoryUpdate, Cate
         if repo is not None:
             resolved_repo = repo
         elif db is not None:
-            resolved_repo = CategoryRepository(db)
+            resolved_repo = CategoryRepository(db, cache=cache, elasticsearch=elasticsearch)
         else:
             raise ValueError("Either db session or repo must be provided to CategoryService")
 

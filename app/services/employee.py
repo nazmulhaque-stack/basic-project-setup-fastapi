@@ -37,7 +37,7 @@ class EmployeeService(BaseService[Employee, EmployeeCreate, EmployeeUpdate, Empl
         if repo is not None:
             resolved_repo = repo
         elif db is not None:
-            resolved_repo = EmployeeRepository(db)
+            resolved_repo = EmployeeRepository(db, cache=cache, elasticsearch=elasticsearch)
         else:
             raise ValueError("Either db session or repo must be provided to EmployeeService")
 

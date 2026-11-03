@@ -409,7 +409,17 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         cache_enabled: Optional[bool] = None,
         emit_outbox_event: Optional[bool] = None,
     ) -> ReadSchemaType:
-        """Creates entity, invalidates list cache, commits transaction, syncs to ES, and returns read schema."""
+        """Creates entity, invalidates list cache, commits transaction, and returns read schema.
+
+        Elasticsearch sync is no longer a direct call here: `self.repo.create()`
+        (via `BaseRepository.insert()`, `auto_sync=True` by default) already
+        staged a sync event in the SAME transaction this method commits below
+        — see `app.core.elasticsearch_registry` and
+        `app.services.elasticsearch_sync.ElasticsearchSyncDispatcher`. A
+        direct `self.elasticsearch.index_document(...)` call here, *after*
+        commit, would be exactly the unreliable dual write the outbox pattern
+        exists to avoid.
+        """
         entity: ModelType = await self.before_create(payload)
         try:
             entity = await self.repo.create(entity)
@@ -423,19 +433,6 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 await self.db.commit()
 
             await self.after_create(entity)
-
-            # CQRS: sync created document to Elasticsearch for text search offloading
-            try:
-                doc = await self.to_cache_dict(entity)
-                entity_id = getattr(entity, self.id_col, "")
-                await self.elasticsearch.index_document(
-                    index=self.resource_name.lower(),
-                    id_=str(entity_id),
-                    document=doc,
-                )
-            except Exception as es_err:
-                logger.warning("Elasticsearch index failed on create (%s): %s", self.resource_name, es_err)
-
             return await self.to_read_schema(entity)
         except asyncpg.exceptions.IntegrityConstraintViolationError as exc:
             if self.db is not None:
@@ -517,18 +514,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 await self.db.commit()
 
             await self.after_update(entity, payload)
-
-            # CQRS: update document in Elasticsearch
-            try:
-                doc = await self.to_cache_dict(entity)
-                await self.elasticsearch.update_document(
-                    index=self.resource_name.lower(),
-                    id_=str(entity_id),
-                    document=doc,
-                )
-            except Exception as es_err:
-                logger.warning("Elasticsearch index failed on update (%s): %s", self.resource_name, es_err)
-
+            # Elasticsearch sync: see the note in create() above — already
+            # staged in the outbox by `self.repo.update()` (`update_row()`,
+            # `auto_sync=True`), inside the same transaction just committed.
             return await self.to_read_schema(entity)
         except asyncpg.exceptions.IntegrityConstraintViolationError as exc:
             if self.db is not None:
@@ -580,16 +568,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
             await self.db.commit()
 
         await self.after_delete(entity)
-
-        # CQRS: remove document from Elasticsearch
-        try:
-            await self.elasticsearch.delete_document(
-                index=self.resource_name.lower(),
-                id_=str(entity_id),
-            )
-        except Exception as es_err:
-            logger.warning("Elasticsearch delete failed on delete (%s): %s", self.resource_name, es_err)
-
+        # Elasticsearch sync: see the note in create() above — already staged
+        # in the outbox by `self.repo.delete()` (`delete_row()`,
+        # `auto_sync=True`), inside the same transaction just committed.
         return True
 
     async def delete_by_id(

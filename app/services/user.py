@@ -40,7 +40,13 @@ class UserService(BaseService[User, UserCreate, UserUpdate, UserRead, uuid.UUID]
         if repo is not None:
             resolved_repo = repo
         elif db is not None:
-            resolved_repo = UserRepository(db)
+            # Thread the same cache/Elasticsearch instances into the repository
+            # so its dynamic fetch_one/fetch_all caching and insert/update_row/
+            # delete_row auto-sync actually reach real Redis/Elasticsearch
+            # when constructed through the DI chain (not just defaulted to
+            # NullCache/NullElasticsearch, which is what the repo falls back
+            # to when only `db` is given directly, e.g. in a script or test).
+            resolved_repo = UserRepository(db, cache=cache, elasticsearch=elasticsearch)
         else:
             raise ValueError("Either db session or repo must be provided to UserService")
 

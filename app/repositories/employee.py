@@ -1,4 +1,6 @@
-"""Employee repository: hand-written asyncpg SQL (no generic query engine)."""
+"""Employee repository: entity-specific SQL + sort/filter logic, executed
+through BaseRepository's dynamic fetch_one/fetch_all/insert/update_row/
+delete_row primitives (shared Redis caching + automatic Elasticsearch sync)."""
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -26,52 +28,52 @@ def _row_to_employee(row: Any) -> Employee:
 class EmployeeRepository(BaseRepository[Employee, uuid.UUID]):
     """Concrete repository for the Employee entity."""
 
+    table = "employees"
+    primary_key = "id"
+
     @property
     def model(self) -> type[Employee]:
         return Employee
 
     async def get(self, entity_id: uuid.UUID) -> Optional[Employee]:
-        row = await self.db.fetchrow("SELECT * FROM employees WHERE id = $1", entity_id)
+        row = await self.fetch_one("SELECT * FROM employees WHERE id = $1", (entity_id,))
         return _row_to_employee(row) if row else None
 
     async def get_by_user_id(self, user_id: uuid.UUID) -> Optional[Employee]:
-        """Fetch employee by associated user_id (enforces the 1-to-1 constraint)."""
-        row = await self.db.fetchrow("SELECT * FROM employees WHERE user_id = $1", user_id)
+        """Fetch employee by associated user_id (enforces the 1-to-1 constraint).
+        Cached: a hot per-write validation lookup with no service-layer cache
+        wrapping it, unlike the generic `.get(id)` path above."""
+        row = await self.fetch_one(
+            "SELECT * FROM employees WHERE user_id = $1", (user_id,), cache=True, cache_ttl=120
+        )
         return _row_to_employee(row) if row else None
 
     async def create(self, entity: Employee) -> Employee:
-        row = await self.db.fetchrow(
-            """
-            INSERT INTO employees (id, name, age, location, user_id)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.age,
-            entity.location,
-            entity.user_id,
+        result = await self.insert(
+            {
+                "id": entity.id,
+                "name": entity.name,
+                "age": entity.age,
+                "location": entity.location,
+                "user_id": entity.user_id,
+            }
         )
-        return _row_to_employee(row)
+        return _row_to_employee(result)
 
     async def update(self, entity: Employee) -> Employee:
-        row = await self.db.fetchrow(
-            """
-            UPDATE employees
-            SET name = $2, age = $3, location = $4, user_id = $5
-            WHERE id = $1
-            RETURNING *
-            """,
-            entity.id,
-            entity.name,
-            entity.age,
-            entity.location,
-            entity.user_id,
+        result = await self.update_row(
+            {
+                "name": entity.name,
+                "age": entity.age,
+                "location": entity.location,
+                "user_id": entity.user_id,
+            },
+            {"id": entity.id},
         )
-        return _row_to_employee(row)
+        return _row_to_employee(result)
 
     async def delete(self, entity: Employee) -> None:
-        await self.db.execute("DELETE FROM employees WHERE id = $1", entity.id)
+        await self.delete_row({"id": entity.id})
 
     def _build_where(self, filters: Mapping[str, Any]) -> Tuple[str, List[Any]]:
         """Hand-written WHERE builder for exactly the filters EmployeesRouter declares."""
@@ -126,13 +128,13 @@ class EmployeeRepository(BaseRepository[Employee, uuid.UUID]):
         order_by = self._build_order_by(sort)
         safe_limit = min(100, max(1, limit))
         query = f"SELECT * FROM employees {where} {order_by} OFFSET ${len(params) + 1} LIMIT ${len(params) + 2}"
-        rows = await self.db.fetch(query, *params, max(0, offset), safe_limit)
+        rows = await self.fetch_all(query, (*params, max(0, offset), safe_limit))
         return [_row_to_employee(r) for r in rows]
 
     async def count(self, filters: Optional[Mapping[str, Any]] = None) -> int:
         where, params = self._build_where(filters or {})
-        query = f"SELECT count(*) FROM employees {where}"
-        return int(await self.db.fetchval(query, *params) or 0)
+        row = await self.fetch_one(f"SELECT count(*) AS count FROM employees {where}", params)
+        return int(row["count"]) if row else 0
 
     async def list_keyset(
         self,
@@ -154,7 +156,7 @@ class EmployeeRepository(BaseRepository[Employee, uuid.UUID]):
             f"SELECT * FROM employees {where} "
             f"ORDER BY {order_col} ASC, {id_col} ASC LIMIT ${len(params) + 1}"
         )
-        rows = await self.db.fetch(query, *params, safe_limit + 1)
+        rows = await self.fetch_all(query, (*params, safe_limit + 1))
         has_next = len(rows) > safe_limit
         items = [_row_to_employee(r) for r in rows[:safe_limit]]
         return items, has_next

@@ -185,6 +185,15 @@ class Settings(BaseSettings):
     INVENTORY_RESERVATION_SWEEP_INTERVAL: float = Field(default=30.0, gt=0)
     OUTBOX_POLL_INTERVAL: float = Field(default=1.0, gt=0)
     OUTBOX_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
+    ES_SYNC_POLL_INTERVAL: float = Field(
+        default=1.0, gt=0,
+        description="Poll interval for ElasticsearchSyncDispatcher (outbox-driven auto-sync)",
+    )
+    ES_SYNC_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
+    ES_SYNC_MAX_ATTEMPTS: int = Field(
+        default=10, ge=1,
+        description="Dead-letters an Elasticsearch sync event after this many failed attempts",
+    )
 
     # Elasticsearch 8 Log & Search Engine
     ELASTICSEARCH_ENABLED: bool = Field(
