@@ -1,6 +1,6 @@
 # 🚀 High-Performance Stateless FastAPI Backend Architecture
 
-Production-grade, horizontally scalable, stateless FastAPI backend designed to serve **100,000 (1 lakh) concurrent requests** across self-managed Linux infrastructure without cloud vendor lock-in. Built with **Generic Repository Pattern + Service Layer + SQLAlchemy 2.0 Async + PgBouncer + Redis 7 Cluster + Elasticsearch 8 + Apache Kafka + AES-256-GCM AEAD Security**.
+Production-grade, horizontally scalable, stateless FastAPI backend designed to serve **100,000 (1 lakh) concurrent requests** across self-managed Linux infrastructure without cloud vendor lock-in. Built with **Repository Pattern + Service Layer + raw `asyncpg` (no ORM) + PgBouncer + Redis 7 Cluster + Elasticsearch 8 + Apache Kafka + AES-256-GCM AEAD Security**.
 
 This single document is the complete reference: architecture and sizing math, the full request execution lifecycle, every infrastructure deep dive (crypto, caching, search, streaming, connection pooling), and the step-by-step developer guide for extending the codebase.
 
@@ -13,17 +13,17 @@ This repository is a real FastAPI backend project rather than a toy scaffold. Th
 - [app/main.py](app/main.py): application bootstrap, lifespan lifecycle, structured logging, Redis startup, Elasticsearch startup, and rate-limiter initialization.
 - [app/api/v1](app/api/v1): versioned domain API routes for users, products, categories, employees, and logs, assembled through [app/api/v1/router.py](app/api/v1/router.py). Health probes remain at `/healthz` and `/readyz` for proxy and deployment checks.
 - [app/api/crud_router/](app/api/crud_router/): generic CRUD endpoint generator for list/create/get/update/delete flows with filtering, sorting, and search integration — split into `query_model.py` (dynamic filter/sort model builder), `routes.py` (CRUD route factories), `search.py` (Elasticsearch search wiring), and `router.py` (the `CRUDRouter` class composing them via a `ROUTE_BUILDERS` registry).
-- [app/repositories/base.py](app/repositories/base.py): generic async repository layer with filter operators, protection for reserved fields, integrity handling, and pagination logic.
+- [app/repositories/base.py](app/repositories/base.py): shared `UnitOfWork` plumbing only — each concrete repository hand-writes its own `asyncpg` SQL (no generic filter/operator engine), with pagination logic (`list_keyset`) following the same hand-written shape in every repository.
 - [app/services/base.py](app/services/base.py): generic service layer with Redis cache-aside logic, rate-limit hooks, transactional outbox hooks, and template-method flow for create/read/update/delete operations.
-- [app/models](app/models): declarative SQLAlchemy models for users, products, categories, employees, and related entities.
-- [app/core/config.py](app/core/config.py) and [app/db/session.py](app/db/session.py): environment-driven settings, async DB engine creation, and connection tuning for PostgreSQL/PgBouncer.
+- [app/models](app/models): plain `@dataclass` models (no ORM) for users, products, categories, employees, and related entities.
+- [app/core/config.py](app/core/config.py) and [app/db/pool.py](app/db/pool.py): environment-driven settings, async `asyncpg` pool creation, and connection tuning for PostgreSQL/PgBouncer.
 - [app/core/kafka.py](app/core/kafka.py) and [app/services/outbox.py](app/services/outbox.py): asynchronous Kafka publishing/consuming and transactional outbox dispatch for service-to-service domain events.
 - [app/core/security.py](app/core/security.py): AES-256-GCM encryption, key rotation helpers, masking utilities, and blind-index support for PII fields.
 
 ### Reality check from the current codebase
 
 - The project is designed for production-grade asynchronous operations and includes operational concerns such as Redis caching, Elasticsearch integration, request tracing, and structured log shipping.
-- The generic repository and service abstraction is implemented coherently, and the domain services follow the expected lifecycle pattern (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`, `to_cache_dict`).
+- The generic service abstraction (`BaseService`) is implemented coherently, and the domain services follow the expected lifecycle pattern (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`, `to_cache_dict`); repositories are intentionally **not** generic — each hand-writes its own SQL.
 - The code intentionally reflects a high-scale architecture narrative (PgBouncer, Redis Cluster, keyset pagination, rate limiting, TLS/PII handling), and the majority of the implementation is consistent with that design.
 - The codebase is not just documentation-only; it contains real endpoints, models, services, repositories, schemas, and tests.
 
@@ -77,7 +77,7 @@ The Compose Kafka broker is for local development. For production, provision dur
     - [9.11 Building Service-to-Service Events with Kafka](#911-building-service-to-service-events-with-kafka)
 10. [API Reference with Full Examples](#-api-reference-with-full-examples)
 11. [Testing Strategy](#-testing-strategy)
-12. [Database Initialization, Migrations & Seeders](#-database-initialization-migrations--seeders)
+12. [Database Setup (No Migration Tool, No Seeders)](#-database-setup-no-migration-tool-no-seeders)
 13. [Environment & Container Networking Reference](#-environment--container-networking-reference)
 14. [Local Development & Production Deployment Guide](#-local-development--production-deployment-guide)
 15. [Why This Stack Is Fast — Technology Choices & Best-Practice Rationale](#-why-this-stack-is-fast--technology-choices--best-practice-rationale)
@@ -195,15 +195,16 @@ The codebase enforces strict separation of concerns across HTTP controllers, dom
 app/
 ├── core/
 │   ├── config.py           # Settings (pydantic-settings, reads .env)
-│   ├── database.py         # async engine, session factory, get_session dependency
 │   ├── security.py         # AES-256-GCM CryptoService, blind indexing, masking
 │   ├── redis.py            # Redis Cluster client, distributed lock primitive
 │   ├── elasticsearch.py    # AsyncElasticsearchService + NullElasticsearch fallback
 │   ├── kafka.py            # Kafka producer/consumer primitives
 │   ├── logging.py          # Structured logging, AsyncLogBuffer, ECS formatter
 │   └── exceptions.py       # AppError → NotFound(404) / Conflict(409) / BusinessRule(422)
-├── models/                 # SQLAlchemy 2 typed models
-│   ├── base.py             # Base + IdMixin + TimestampMixin + constraint naming
+├── db/
+│   └── pool.py             # asyncpg pool creation, UnitOfWork, get_session dependency
+├── models/                 # plain @dataclass models (no ORM)
+│   ├── base.py             # Base marker dataclass
 │   ├── category.py
 │   ├── user.py
 │   ├── product.py
@@ -214,11 +215,12 @@ app/
 │   ├── category.py
 │   ├── user.py
 │   └── product.py
-├── repositories/           # data access only
-│   ├── base.py             # IBaseRepository (ABC) + generic BaseRepository[Model]/SQLAlchemyRepository[Model]
-│   ├── category.py
-│   ├── user.py             # 1 line: inherits everything
-│   └── product.py          # + custom queries (eager load, atomic stock update)
+├── repositories/           # data access only — hand-written asyncpg SQL, no ORM
+│   ├── base.py             # IBaseRepository (ABC) + BaseRepository (shared UnitOfWork plumbing only)
+│   ├── sql_helpers.py      # keyset_seek_clause() shared by every repository's list_keyset()
+│   ├── category.py         # hand-written CRUD + filters/sort for Category
+│   ├── user.py             # hand-written CRUD + filters/sort for User
+│   └── product.py          # + custom queries (get_with_category, atomic stock update)
 ├── services/               # business rules + transaction boundary
 │   ├── base.py             # BaseService[Model, Create, Update] template-method CRUD + hooks
 │   ├── cache.py            # DynamicRedisCache cache-aside manager (split out of base.py)
@@ -245,7 +247,6 @@ app/
 │       ├── employees.py
 │       └── logs.py         # Elasticsearch log search endpoints
 └── main.py                 # app factory, lifespan, exception handlers
-alembic/                    # Migration environment + versioned revisions
 deploy/                     # Dockerfile, nginx.conf, gunicorn.conf.py, sysctl.conf, docker-compose.yml, k8s/
 tests/                      # API tests + unit tests (mocked repository)
 ```
@@ -375,10 +376,10 @@ Here is the exact step-by-step function execution sequence when a client sends `
    └─► Injects response headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset
    └─► (If quota exceeded, raises HTTPException -> HTTP 429)
 
-5. app/core/database.py [L77]: get_db(request) (Dependency Injection)
-   └─► session_factory = request.app.state.session_factory
-   └─► async with session_factory() as session:
-       • Opens isolated SQLAlchemy AsyncSession(bind=engine, expire_on_commit=False, autoflush=False)
+5. app/db/pool.py [L134]: get_db(request) (Dependency Injection)
+   └─► pool = request.app.state.db_pool
+   └─► async with pool.acquire() as connection, UnitOfWork(connection) as uow:
+       • Opens one acquired asyncpg connection + one asyncpg transaction (no ORM session)
        • Unit of work transaction begins
 
 6. app/schemas/user.py [L22]: UserCreate validation (Pydantic v2)
@@ -608,15 +609,11 @@ To serve **100,000 concurrent requests** without disk I/O bottlenecks or Elastic
 
 When querying complex nested structures (e.g. a `Product` and its associated `Category`), the async event loop imposes a hard constraint that this codebase enforces structurally.
 
-#### The Async N+1 Dilemma & `lazy="raise"`
+#### The Async N+1 Dilemma & Explicit Eager-Load Methods
 
-In traditional synchronous frameworks (like Django or sync SQLAlchemy), accessing `product.category_rel.name` automatically issues a hidden synchronous query behind the scenes. In an async event-loop architecture serving 100k concurrency, **implicit lazy loading blocks the entire async thread worker** and crashes with:
+In traditional ORMs (Django, SQLAlchemy), accessing `product.category_rel.name` can automatically issue a hidden query behind the scenes the first time you touch the attribute — convenient, but it means a per-row relationship access inside a loop silently turns into $N$ extra round trips, one per row.
 
-```
-sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() using greenlet_spawn
-```
-
-To eliminate this hazard permanently, all relationships in this codebase declare `lazy="raise"`. Every relational attribute access that is not explicitly pre-loaded immediately raises an error during testing — turning a silent $N+1$ production incident into an immediate test failure. The full model/schema/repository/service pattern for this is in [§9.10 Nested Tables & Entity Relationships Guide](#910-nested-tables--entity-relationships-guide-category-in-product).
+This codebase has no ORM and therefore no lazy-loading machinery at all: `Product.category_rel` is a plain dataclass field that is `None` unless a repository method explicitly populates it. There is nothing to accidentally trigger. A relationship is only ever loaded by a dedicated, named repository method (e.g. `ProductRepository.get_with_category`) that issues one extra, explicit query — never a generic accessor, and never a per-row loop. The full model/schema/repository/service pattern for this is in [§9.10 Nested Tables & Entity Relationships Guide](#910-nested-tables--entity-relationships-guide-category-in-product).
 
 #### Eager Loaded Nested Path: `GET /api/v1/products/{id}/detail`
 
@@ -631,15 +628,14 @@ To eliminate this hazard permanently, all relationships in this codebase declare
    │ Calls: await self.repository.get_with_category(product_id)
    ▼
 [app/repositories/product.py: ProductRepository.get_with_category()]
-   │ Executes:
-   │ await self.get(product_id, options=[selectinload(Product.category_rel)])
+   │ Executes two hand-written fetchrow() calls:
+   │ 1. row = await self.db.fetchrow("SELECT * FROM products WHERE id = $1", product_id)
+   │ 2. cat_row = await self.db.fetchrow("SELECT * FROM categories WHERE id = $1", product.category_id)
    ▼
-[SQLAlchemy Async Engine & PgBouncer Multiplexer]
-   │ Issues EXACTLY 2 optimized queries:
-   │ 1. SELECT * FROM products WHERE id = 'f47ac10b-...'
-   │ 2. SELECT * FROM categories WHERE id IN (product.category_id)
+[Raw asyncpg over PgBouncer Multiplexer]
+   │ Issues EXACTLY 2 queries — no ORM, no identity map
    ▼
-[Entities Linked in Identity Map: product.category_rel is fully populated]
+[product.category_rel is manually set to the constructed Category dataclass]
    │
    ▼
 [Pydantic v2 DTO Serialization: ProductDetail.model_validate(product)]
@@ -1021,7 +1017,7 @@ HighPerfStatelessService . user . created [ . v1 ]
 ```
 
 - **`service_name`**: Automatically defaults to `APP_NAME` from `.env` via `get_settings().APP_NAME` (`HighPerfStatelessService`). Preserves original casing.
-- **`model_name`**: Extracted directly from the SQLAlchemy model (`self.repo.model.__name__`, e.g., `User` -> `user`, `Category` -> `category`, `Product` -> `product`).
+- **`model_name`**: Extracted directly from the dataclass model (`self.repo.model.__name__`, e.g., `User` -> `user`, `Category` -> `category`, `Product` -> `product`).
 - **`action_name`**: Normalized lowercase action string (e.g., `created`, `updated`, `deleted`, `reservation_failed`).
 - **`version` (Optional)**: If omitted or `None`, no version segment is appended (e.g. `HighPerfStatelessService.user.created`). If provided (e.g. `"v1"` or `"1"`), it's appended (e.g. `HighPerfStatelessService.user.created.v1`).
 
@@ -1261,9 +1257,9 @@ When adding a new entity (for example, `Order`), follow this checklist:
 
 | Action     | File Path                              | Purpose                                                                      |
 | ---------- | -------------------------------------- | ---------------------------------------------------------------------------- |
-| **CREATE** | `app/models/order.py`                  | SQLAlchemy 2.0 Declarative Table Model                                       |
+| **CREATE** | `app/models/order.py`                  | Plain `@dataclass` row model (no ORM)                                        |
 | **CREATE** | `app/schemas/order.py`                 | Pydantic v2 Schemas (`OrderCreate`, `OrderUpdate`, `OrderRead`, `OrderPage`) |
-| **CREATE** | `app/repositories/order_repository.py` | Subclass of `BaseRepository[Order, uuid.UUID]`                               |
+| **CREATE** | `app/repositories/order_repository.py` | Subclass of `BaseRepository[Order, uuid.UUID]`, hand-written `asyncpg` SQL    |
 | **CREATE** | `app/services/order_service.py`        | Subclass of `BaseService` with domain logic and hooks                        |
 | **CREATE** | `app/api/v1/orders.py`                 | Dynamic `CRUDRouter` with zero explicit boilerplate                          |
 | **CREATE** | `tests/test_orders.py`                 | Automated tests (CRUD, pagination, validation, 404s)                         |
@@ -1276,66 +1272,59 @@ When adding a new entity (for example, `Order`), follow this checklist:
 <a id="92-how-developers-add-a-new-entity-order-example"></a>
 ### 9.2 How Developers Add a New Entity (Order Example)
 
-To demonstrate how the generic architecture eliminates boilerplate, here is the complete code to implement an `Order` entity with full CRUD, keyset pagination, caching, lifecycle hooks, and a custom domain action — end to end in about five minutes.
+To demonstrate how the architecture eliminates boilerplate where it can (the service layer) while being explicit where it must be (hand-written SQL per repository, since this project has no migration tool and no generic query engine), here is the complete code to implement an `Order` entity with full CRUD, keyset pagination, caching, lifecycle hooks, and a custom domain action.
+
+Prefer scaffolding this instead of hand-typing it — `python3 .agents/agents/developer-agent/skills/scaffold_crud.py --model Order --fields "user_id:str,total_cents:int,status:str"` generates the model/schema/repository/service/router files below as a starting point you then fill in the domain-specific hooks and business rules for.
+
+#### Step 0: Create the table (No Migration Tool)
+
+There is no Alembic/migration tool in this project. Create the table directly against Postgres first:
+
+```sql
+CREATE TABLE orders (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    total_cents INTEGER NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_orders_user_id ON orders (user_id);
+CREATE INDEX ix_orders_status ON orders (status);
+-- MANDATORY: composite B-Tree index for O(log N) keyset pagination
+CREATE INDEX ix_orders_created_at_id ON orders (created_at, id);
+```
+
+Unlike the SQLAlchemy/Alembic version of this project, `id` has no database-side default — client code generates it (see `before_create` in Step 4) because there's no `gen_random_uuid()` default configured, and adding one now would require a migration tool this project doesn't have.
 
 #### Step 1: Model (`app/models/order.py`)
 
 ```python
-"""Order database entity with keyset pagination composite indexing."""
+"""Order dataclass model — no ORM, the real table is the SQL above."""
 
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 import uuid
-
-from sqlalchemy import DateTime, Index, Integer, String, func
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
 
 
+@dataclass
 class Order(Base):
-    __tablename__ = "orders"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        index=True,
-        nullable=False,
-    )
-    total_cents: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[str] = mapped_column(
-        String(50),
-        default="pending",
-        index=True,
-        nullable=False,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
-
-    # MANDATORY: Composite B-Tree index for O(log N) Keyset Pagination
-    __table_args__ = (
-        Index("ix_orders_created_at_id", "created_at", "id"),
-    )
+    id: uuid.UUID
+    user_id: uuid.UUID
+    total_cents: int
+    status: str = "pending"
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 ```
 
 **Key requirements**:
 
 1. Inherit from `app.models.base.Base`.
-2. Always define the composite index: `Index("ix_<table_name>_created_at_id", "created_at", "id")`.
-3. Use `UUID(as_uuid=True)` for native PostgreSQL UUIDs.
+2. Give the table a composite `(created_at, id)` index (created directly against Postgres, per Step 0) — it's what `list_keyset` seeks on.
+3. `id` is a plain `uuid.UUID` field — `BaseService.before_create`'s default implementation client-side-generates it before insert, since there is no database-side default.
 
 ---
 
@@ -1383,42 +1372,151 @@ class OrderPage(BaseModel):
 
 #### Step 3: Repository (`app/repositories/order_repository.py`)
 
+There is no generic CRUD/filter engine to inherit from — `BaseRepository` only holds the active `UnitOfWork` under `self.db`. Every method below is hand-written for `Order` specifically; copy the shape from `app/repositories/category.py` or `employee.py`, not from another entity's filter semantics.
+
 ```python
-"""Order repository inheriting generic CRUD and keyset pagination primitives."""
+"""Order repository: hand-written asyncpg SQL (no generic query engine)."""
 
-from typing import List
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import Any, List, Optional, Tuple
 import uuid
-
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.order import Order
 from app.repositories.base import BaseRepository
+from app.repositories.sql_helpers import keyset_seek_clause
+
+_SORTABLE = {"id", "status", "total_cents", "created_at"}
+
+
+def _row_to_order(row: Any) -> Order:
+    return Order(
+        id=row["id"],
+        user_id=row["user_id"],
+        total_cents=row["total_cents"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 class OrderRepository(BaseRepository[Order, uuid.UUID]):
-    def __init__(self, session: AsyncSession) -> None:
-        super().__init__(Order, session)
+    @property
+    def model(self) -> type[Order]:
+        return Order
 
-    # -------------------------------------------------------------------------
-    # Inherited automatically from BaseRepository:
-    # - get(id) / get_by(**kwargs) / exists_by(**kwargs)
-    # - create(entity) / update(entity, data) / delete(entity)
-    # - list(**filters) / count(**filters) / list_keyset(limit, cursor_dt, cursor_id, **filters)
-    # - bulk_create(items) / delete_where(**filters) / aggregate(func_name, column_name, **filters)
-    # -------------------------------------------------------------------------
+    async def get(self, entity_id: uuid.UUID) -> Optional[Order]:
+        row = await self.db.fetchrow("SELECT * FROM orders WHERE id = $1", entity_id)
+        return _row_to_order(row) if row else None
 
-    # Custom repository query example:
+    async def create(self, entity: Order) -> Order:
+        row = await self.db.fetchrow(
+            """
+            INSERT INTO orders (id, user_id, total_cents, status)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            """,
+            entity.id, entity.user_id, entity.total_cents, entity.status,
+        )
+        return _row_to_order(row)
+
+    async def update(self, entity: Order) -> Order:
+        row = await self.db.fetchrow(
+            """
+            UPDATE orders
+            SET user_id = $2, total_cents = $3, status = $4, updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            """,
+            entity.id, entity.user_id, entity.total_cents, entity.status,
+        )
+        return _row_to_order(row)
+
+    async def delete(self, entity: Order) -> None:
+        await self.db.execute("DELETE FROM orders WHERE id = $1", entity.id)
+
+    def _build_where(self, filters: Mapping[str, Any]) -> Tuple[str, List[Any]]:
+        """Hand-write a branch here for exactly the filters OrdersRouter declares."""
+        clauses: List[str] = []
+        params: List[Any] = []
+
+        def add(clause: str, value: Any) -> None:
+            params.append(value)
+            clauses.append(clause.format(n=len(params)))
+
+        if filters.get("user_id") is not None:
+            add("user_id = ${n}", filters["user_id"])
+        if filters.get("status") is not None:
+            add("status = ${n}", filters["status"])
+        if filters.get("status__in") is not None:
+            add("status = ANY(${n})", list(filters["status__in"]))
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def _build_order_by(self, sort: Optional[Sequence[str]]) -> str:
+        keys = list(sort or ("id",))
+        order_parts: List[str] = []
+        for key in keys:
+            desc = key.startswith("-")
+            col = key.lstrip("-+")
+            if col in _SORTABLE:
+                order_parts.append(f"{col} {'DESC' if desc else 'ASC'}")
+        if "id" not in {k.lstrip("-+") for k in keys}:
+            order_parts.append("id ASC")
+        return "ORDER BY " + ", ".join(order_parts)
+
+    async def list(
+        self,
+        *,
+        filters: Optional[Mapping[str, Any]] = None,
+        sort: Optional[Sequence[str]] = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Sequence[Order]:
+        where, params = self._build_where(filters or {})
+        order_by = self._build_order_by(sort)
+        safe_limit = min(100, max(1, limit))
+        query = f"SELECT * FROM orders {where} {order_by} OFFSET ${len(params) + 1} LIMIT ${len(params) + 2}"
+        rows = await self.db.fetch(query, *params, max(0, offset), safe_limit)
+        return [_row_to_order(r) for r in rows]
+
+    async def count(self, filters: Optional[Mapping[str, Any]] = None) -> int:
+        where, params = self._build_where(filters or {})
+        return int(await self.db.fetchval(f"SELECT count(*) FROM orders {where}", *params) or 0)
+
+    async def list_keyset(
+        self,
+        limit: int = 50,
+        cursor_dt: Optional[datetime] = None,
+        cursor_id: Optional[Any] = None,
+        order_col: str = "created_at",
+        id_col: str = "id",
+        **filters: Any,
+    ) -> Tuple[List[Order], bool]:
+        where, params = self._build_where(filters)
+        seek, seek_params = keyset_seek_clause(order_col, id_col, cursor_dt, cursor_id, len(params) + 1)
+        if seek:
+            where = f"{where} AND {seek}" if where else f"WHERE {seek}"
+            params += seek_params
+
+        safe_limit = min(100, max(1, limit))
+        query = (
+            f"SELECT * FROM orders {where} "
+            f"ORDER BY {order_col} ASC, {id_col} ASC LIMIT ${len(params) + 1}"
+        )
+        rows = await self.db.fetch(query, *params, safe_limit + 1)
+        has_next = len(rows) > safe_limit
+        return [_row_to_order(r) for r in rows[:safe_limit]], has_next
+
+    # Custom repository query example — a one-off, hand-written query, same as any other:
     async def list_by_user(self, user_id: uuid.UUID, limit: int = 100) -> List[Order]:
         """Custom query fetching recent orders for a specific customer."""
-        stmt = (
-            select(Order)
-            .where(Order.user_id == user_id)
-            .order_by(Order.created_at.desc())
-            .limit(limit)
+        rows = await self.db.fetch(
+            "SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+            user_id, limit,
         )
-        result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        return [_row_to_order(r) for r in rows]
 ```
 
 ---
@@ -1432,25 +1530,40 @@ from typing import Optional
 import uuid
 
 from app.core.exceptions import ConflictError, NotFoundError
+from app.db.pool import UnitOfWork
 from app.models.order import Order
 from app.repositories.order_repository import OrderRepository
 from app.schemas.order import OrderCreate, OrderPage, OrderRead, OrderUpdate
-from app.services.base import BaseService, DynamicRedisCache
+from app.services.base import BaseService
+from app.services.interface import ICacheService
 
 
 class OrderService(BaseService[Order, OrderCreate, OrderUpdate, OrderRead, uuid.UUID]):
+    repository_class = OrderRepository
+
     def __init__(
         self,
-        repo: OrderRepository,
-        cache: Optional[DynamicRedisCache] = None,
+        db: Optional[UnitOfWork] = None,
+        repo: Optional[OrderRepository] = None,
+        cache: Optional[ICacheService] = None,
     ) -> None:
-        super().__init__(repo=repo, read_schema_cls=OrderRead, cache=cache)
+        resolved_repo = repo if repo is not None else OrderRepository(db) if db is not None else None
+        if resolved_repo is None:
+            raise ValueError("Either db session or repo must be provided to OrderService")
+        super().__init__(repo=resolved_repo, read_schema_cls=OrderRead, cache=cache, db=db)
+        self.repository: OrderRepository = resolved_repo
 
     # -------------------------------------------------------------------------
     # Lifecycle Hooks
     # -------------------------------------------------------------------------
     async def before_create(self, payload: OrderCreate) -> Order:
-        """Called before repository insertion. Generate IDs, validate business rules."""
+        """Called before repository insertion. Generate IDs, validate business rules.
+
+        Client-side UUID generation here is explicit for clarity — `BaseService`'s
+        own default `before_create` would already do this automatically for any
+        UUID-typed `id` field, so this override is only needed because `Order`
+        also needs to set `user_id`/`total_cents`/`status` from the payload.
+        """
         return Order(
             id=uuid.uuid4(),
             user_id=payload.user_id,
@@ -1459,7 +1572,7 @@ class OrderService(BaseService[Order, OrderCreate, OrderUpdate, OrderRead, uuid.
         )
 
     async def before_update(self, entity: Order, payload: OrderUpdate) -> None:
-        """Called before database flush. Apply partial updates."""
+        """Called before the repository UPDATE. Apply partial updates."""
         update_data = payload.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             setattr(entity, field, value)
@@ -1497,12 +1610,15 @@ class OrderService(BaseService[Order, OrderCreate, OrderUpdate, OrderRead, uuid.
             raise ConflictError("Cannot cancel an already completed order")
 
         order.status = "cancelled"
-        updated_order = await self.repo.update(order, data={"status": "cancelled"})
+        updated_order = await self.repo.update(order)
+        if self.db is not None:
+            await self.db.commit()
 
-        # Invalidate cache for this item and versioned lists
-        if self.cache:
-            await self.cache.delete_item(order_id)
-            await self.cache.invalidate_lists()
+        # Invalidate cache for this item and versioned lists — no `if self.cache
+        # is not None:` guard needed; NullCache makes both calls safe no-ops
+        # when no Redis cache was injected.
+        await self.cache.delete_item(order_id)
+        await self.cache.invalidate_lists()
 
         return await self.to_read_schema(updated_order)
 ```
@@ -1527,7 +1643,7 @@ from app.models.order import Order
 from app.schemas.order import OrderCreate, OrderRead, OrderUpdate
 from app.services.order_service import OrderService
 
-# Dynamic dependency provider injecting AsyncSession, Redis Cluster, Crypto, and Elasticsearch
+# Dynamic dependency provider injecting the UnitOfWork, Redis Cluster, Crypto, and Elasticsearch
 get_order_service = provide(OrderService, cache_prefix="orders")
 OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]
 
@@ -1594,91 +1710,93 @@ The new entity is immediately operational with keyset pagination, Redis caching,
 <a id="93-using-baserepository-primitives"></a>
 ### 9.3 Using BaseRepository Primitives
 
-[`BaseRepository[ModelType, IdType]`](app/repositories/base.py) implements the abstract [`IBaseRepository`](app/repositories/interface.py) interface and provides a **full dynamic query, filtering, and mutation engine**:
+[`BaseRepository[ModelType, IdType]`](app/repositories/base.py) implements the abstract [`IBaseRepository`](app/repositories/interface.py) interface, but **deliberately provides no generic query, filtering, or mutation engine** — it only holds the active `UnitOfWork` under `self.db`/`self.session`. Every concrete repository (`UserRepository`, `ProductRepository`, `CategoryRepository`, `EmployeeRepository`) hand-writes its own SQL for exactly the operations and filters it needs:
 
 ```python
-# 1. Dynamic Exact & Operator-Based Filtering (Rich Lookups)
-# Supports: eq, ne, gt, gte, lt, lte, in, notin, like, ilike, contains, icontains, startswith, endswith, isnull
-products = await repo.list(
-    category="electronics",
-    price_cents__gte=5000,
-    price_cents__lte=20000,
-    status__in=["in_stock", "backorder"],
-    name__ilike="%wireless%",
-)
+# 1. Filtering is hand-written per repository, for exactly the fields that
+# entity's CRUDRouter declares in filter_fields — there is no generic
+# field__op dispatch across entities. ProductRepository, for example, supports:
+products = await product_repo.list(filters={
+    "category": "electronics",
+    "stock__lte": 5,
+    "is_active": True,
+})
 
-# 2. Dynamic Multi-Column Ordering (supports '-' prefix for descending)
-users = await repo.list(order_by=["-created_at", "email"])
+# 2. Ordering is also hand-written per repository, in that repository's own
+# _build_order_by() — it validates the column against a per-entity _SORTABLE set.
+users = await user_repo.list(sort=["-created_at", "email"])
 
-# 3. Dynamic Eager/Lazy Loading Options (joinedload, selectinload)
-orders = await repo.list(options=[selectinload(Order.items)])
+# 3. There is no generic bulk_create/delete_where/aggregate — need one? Add a
+# plain hand-written method to that specific repository, the same way
+# ProductRepository.change_stock_atomic() or low_stock() were added.
 
-# 4. Dynamic Bulk Operations (Single network round-trip)
-new_items = await repo.bulk_create([{"name": "Item 1"}, {"name": "Item 2"}])
-deleted_count = await repo.delete_where(is_active=False, role="guest")
+# 4. Keyset Cursor Pagination (O(log N) B-Tree seek with composite index) — the
+# seek clause itself is the one piece shared across repositories
+# (app/repositories/sql_helpers.py:keyset_seek_clause), but each repository's
+# list_keyset() still hand-writes its own SELECT/FROM/WHERE around it.
+items, has_next = await user_repo.list_keyset(limit=50, cursor_dt=last_ts, cursor_id=last_id, role="admin")
 
-# 5. Dynamic SQL Aggregation (sum, avg, min, max, count)
-total_revenue = await repo.aggregate("sum", "total_cents", status="completed")
-
-# 6. Keyset Cursor Pagination (O(log N) B-Tree seek with composite index)
-items, has_next = await repo.list_keyset(limit=50, cursor_dt=last_ts, cursor_id=last_id, role="admin")
-
-# 7. Fast Existence & Count Checks
-exists = await repo.exists_by(sku="KB-01", is_active=True)
-active_count = await repo.count(is_active=True)
+# 5. Existence/count checks are also hand-written per repository — e.g.
+# CategoryRepository.exists_active(category_id) (an EXISTS(...) query), or a
+# plain repo.count(filters={"is_active": True}).
 ```
 
 <a id="94-unit-of-work--multi-repository-transactions"></a>
 ### 9.4 Unit of Work & Multi-Repository Transactions
 
-If a business action must modify multiple entities atomically (for example, creating an order and reducing inventory), both repositories must share the exact same `AsyncSession`:
+If a business action must modify multiple entities atomically (for example, creating an order and reducing inventory), both repositories must share the exact same `UnitOfWork` — a thin wrapper around one acquired `asyncpg` connection and one open transaction (`app/db/pool.py`), giving asyncpg's connection a `commit()`/`rollback()` interface. There is no ORM identity map: a repository's `create`/`update` always returns a **freshly constructed** instance from the row `INSERT ... RETURNING *`/`UPDATE ... RETURNING *` gave back, so callers reassign (`product = await repo.update(product)`), never mutate-in-place and assume it's saved.
 
-**Pattern A — Shared `AsyncSession` via `get_db`** (preferred for request-scoped services):
+**Pattern A — Shared `UnitOfWork` via `get_db`** (preferred for request-scoped services):
 
 ```python
 class CheckoutService:
-    def __init__(self, order_repo: OrderRepository, product_repo: ProductRepository):
+    def __init__(self, order_repo: OrderRepository, product_repo: ProductRepository, db: UnitOfWork):
         self.order_repo = order_repo
         self.product_repo = product_repo
+        self.db = db
 
     async def checkout(self, user_id: uuid.UUID, sku: str, quantity: int) -> OrderRead:
-        # Both repositories share the SAME AsyncSession injected by get_db!
-        product = await self.product_repo.get_by(sku=sku)
+        # Both repositories share the SAME UnitOfWork (asyncpg connection + transaction)
+        # injected by get_db!
+        product = await self.product_repo.get_by_sku(sku)
         if not product:
             raise NotFoundError("Product not found")
 
         order = await self.order_repo.create(
-            Order(user_id=user_id, total_cents=product.price_cents * quantity)
+            Order(id=uuid.uuid4(), user_id=user_id, total_cents=product.price_cents * quantity)
         )
 
-        # Both changes were flushed (not committed).
-        # When get_db exits, it executes ONE single commit for both tables atomically!
+        # Both INSERT/UPDATE statements already ran inside the still-open
+        # transaction (asyncpg has no separate "flush" step). Commit once,
+        # atomically, for both tables:
+        await self.db.commit()
         return OrderRead.model_validate(order)
 ```
 
-**Pattern B — Explicit multi-repository transaction with a shared session**:
+**Pattern B — Explicit multi-repository transaction with a shared `UnitOfWork`**:
 
 ```python
-async def process_checkout(db: AsyncSession, user_id: uuid.UUID, sku: str, quantity: int):
+async def process_checkout(db: UnitOfWork, user_id: uuid.UUID, sku: str, quantity: int) -> None:
     product_repo = ProductRepository(db)
     order_repo = OrderRepository(db)
 
-    product = await product_repo.get_by(sku=sku)
+    product = await product_repo.get_by_sku(sku)
     if not product:
         raise NotFoundError("Product not found")
 
-    order = await order_repo.create(
-        Order(user_id=user_id, total_cents=product.price_cents * quantity)
+    await order_repo.create(
+        Order(id=uuid.uuid4(), user_id=user_id, total_cents=product.price_cents * quantity)
     )
-    await product_repo.update(product, data={"stock_count": product.stock_count - quantity})
+    product.stock -= quantity
+    await product_repo.update(product)
     await db.commit()  # Atomic single commit across all repositories
 ```
 
 **Golden Rules**:
 
-- Never call `session.commit()` inside repositories or services' repository calls — only `get_db` (or a `uow` context manager) commits.
-- Repositories only call `session.flush()`, pushing SQL to the transaction buffer without committing.
-- This design allows a service to update multiple repositories within a single atomic database transaction.
+- Never call `self.db.commit()`/`rollback()` inside repositories — only the service layer (via `get_db`'s own commit/rollback on exit, or an explicit `await self.db.commit()`) commits.
+- Repositories only `fetch`/`fetchrow`/`fetchval`/`execute` on the `UnitOfWork`. There is no separate flush step: asyncpg statements apply immediately inside the still-open transaction, and nothing is durable until `commit()`.
+- This design allows a service to update multiple repositories within a single atomic database transaction, as long as every repository involved was constructed from the same `UnitOfWork` instance.
 
 <a id="95-the-nullcache--null-object-pattern"></a>
 ### 9.5 The NullCache / Null Object Pattern
@@ -1819,86 +1937,82 @@ This section details how to model, query, validate, cache, and migrate nested ta
   <img src="assets/relational_nested_flow.png" alt="Relational Eager Loading Pipeline" width="100%" />
 </p>
 
-#### 9.10.1 The `lazy="raise"` Rule in Async SQLAlchemy
+#### 9.10.1 Why There's No Lazy Loading At All
 
-In an asynchronous high-concurrency architecture serving **100,000 concurrent requests**, implicit lazy loading is strictly prohibited:
+In an asynchronous high-concurrency architecture serving **100,000 concurrent requests**, implicit lazy loading is strictly prohibited — and this codebase doesn't merely discourage it, it has no mechanism capable of doing it:
 
-1. **The event loop trap**: in synchronous SQLAlchemy, accessing `product.category_rel` triggers a blocking synchronous I/O query. In an `asyncio` event loop, this blocks the worker process or raises `sqlalchemy.exc.MissingGreenlet`.
-2. **The $N+1$ database penalty**: in a list of 100 products, naive attribute access executes $1 + 100 = 101$ roundtrips to the database multiplexer, exhausting PgBouncer backend connections instantly.
-3. **The architectural fix**: all relationship attributes in this repository declare `lazy="raise"`. If a developer forgets to eager-load a relationship in the repository, SQLAlchemy immediately raises an exception at the query boundary rather than silently leaking queries into production.
+1. **No ORM, no lazy-loading machinery**: `Product.category_rel` is a plain `@dataclass` field, typed `Optional[Category]`, defaulting to `None`. Nothing watches attribute access; nothing can fire a hidden query behind your back. There is no `sqlalchemy.exc.MissingGreenlet` failure mode to guard against, because there is no greenlet-based lazy loader in the first place.
+2. **The $N+1$ database penalty still exists as a *developer* risk**: nothing stops someone from writing `for p in products: cat = await category_repo.get(p.category_id)` in a loop — that's still $1 + 100 = 101$ roundtrips for a list of 100 products, exhausting PgBouncer backend connections instantly. The difference from an ORM is that this mistake is visible in the code review as a loop around an `await`, not hidden behind attribute access.
+3. **The architectural fix**: a relationship that genuinely needs eager-loading gets exactly one dedicated, named repository method (e.g. `get_with_category`) that issues a small, fixed number of extra queries — never a generic relationship accessor, and never a per-row loop. Grep for `await.*\.get(` inside a `for`/`async for` block in review to catch the regression this would otherwise introduce.
 
-#### 9.10.2 Step 1: Model Definition with Foreign Keys & Relationships
+#### 9.10.2 Step 1: Model Definition & the Foreign Key Column
 
-Both sides of the relationship are mapped using SQLAlchemy 2.0 type-annotated columns:
+Both entities are plain dataclasses; there is no relationship-mapping DSL, no `back_populates`, no `lazy=` option — the "relationship" is just an optional dataclass field that a specific repository method populates on demand, plus an ordinary foreign-key *column* that Postgres itself enforces.
 
 **Parent entity: `Category`** (`app/models/category.py`):
 
 ```python
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
-from sqlalchemy import Boolean, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.db.base import Base, IdIntMixin, TimestampMixin
+
+from app.models.base import Base
 
 if TYPE_CHECKING:
     from app.models.product import Product
 
-class Category(IdIntMixin, TimestampMixin, Base):
-    __tablename__ = "categories"
 
-    name: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
-    # 1:N Relationship: one category has many products
-    # lazy="raise" prevents accidental N+1 queries
-    products: Mapped[List["Product"]] = relationship(
-        "Product",
-        back_populates="category_rel",
-        lazy="raise",
-    )
+@dataclass
+class Category(Base):
+    name: str
+    id: Optional[int] = None
+    description: Optional[str] = None
+    is_active: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    # Never populated by a generic relationship loader — only a repository
+    # method that explicitly needs a category's products would ever set this.
+    products: "List[Product]" = field(default_factory=list)
 ```
 
 **Child entity: `Product`** (`app/models/product.py`):
 
 ```python
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 import uuid
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from app.models.base import Base
 
 if TYPE_CHECKING:
     from app.models.category import Category
 
+
+@dataclass
 class Product(Base):
-    __tablename__ = "products"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    sku: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
-    price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    # 1. Foreign Key with ondelete="RESTRICT"
-    # RESTRICT blocks deleting a Category if products are assigned to it (raises 409 Conflict)
-    category_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("categories.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,  # Crucial: Always index foreign keys for join performance
-    )
-
-    # 2. Bidirectional Relationship with lazy="raise"
-    category_rel: Mapped[Optional["Category"]] = relationship(
-        "Category",
-        back_populates="products",
-        lazy="raise",
-    )
+    id: uuid.UUID
+    name: str
+    sku: str
+    price_cents: int
+    category: str = "general"
+    category_id: Optional[int] = None
+    is_active: bool = True
+    stock: int = 0
+    reserved_quantity: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    # Populated ONLY by ProductRepository.get_with_category() — never by a
+    # generic accessor, so there's nothing to accidentally trigger an N+1 on.
+    category_rel: "Optional[Category]" = None
 ```
+
+The real foreign-key constraint lives in Postgres, not in the dataclass — it was created once, directly against the database, with `category_id INTEGER REFERENCES categories(id) ON DELETE RESTRICT` and a B-Tree index on `category_id`. There is no migration tool in this project (see §9.10.7); the dataclass field and the database column are two things a developer keeps in sync by hand.
 
 > [!IMPORTANT]
 >
-> - Always place `index=True` on Foreign Key columns. Without a B-Tree index on the foreign key, PostgreSQL must execute a full-table scan on the child table whenever the parent table is queried or modified.
-> - Use `ondelete="RESTRICT"` for critical business hierarchies to prevent accidental cascading deletion of inventory or orders.
+> - Always index foreign-key columns. Without a B-Tree index on the foreign key, PostgreSQL must execute a full-table scan on the child table whenever the parent table is queried or modified.
+> - Use `ON DELETE RESTRICT` for critical business hierarchies to prevent accidental cascading deletion of inventory or orders.
 
 #### 9.10.3 Step 2: Nested Pydantic Schemas (Embedded DTOs & Validation)
 
@@ -1943,46 +2057,52 @@ class ProductDetail(ProductRead):
     category_rel: Optional[CategoryRead] = None
 ```
 
-#### 9.10.4 Step 3: Repository Eager Loading (`selectinload` vs `joinedload`)
+#### 9.10.4 Step 3: Repository Eager Loading (a Second Hand-Written Query)
 
-When querying entities with relationships, instruct SQLAlchemy to pre-load relations in the repository query:
+There is no query-builder DSL to instruct — "eager loading" a relationship here just means: write a repository method that runs the obvious second query.
 
-- **`selectinload` (recommended for 1:N collections and async N:1)**: executes two queries linked by primary keys:
+```sql
+SELECT * FROM products WHERE id = $1;
+SELECT * FROM categories WHERE id = $1;  -- keyed off the first query's category_id
+```
 
-    ```sql
-    SELECT * FROM products WHERE id = :id;
-    SELECT * FROM categories WHERE id IN (:category_id);
-    ```
-
-    Prevents Cartesian product duplicates across tables.
-
-- **`joinedload` (recommended for strict 1:1 foreign keys)**: uses an SQL `LEFT OUTER JOIN`. Do not use `joinedload` on large collections with `limit`/`offset`, since SQL joins multiply row counts before slicing.
+Two queries, every time, for exactly this one method — no hidden cost, nothing to configure per call site. A list endpoint that genuinely needs the same thing for N rows would batch the second query with `WHERE id = ANY($1)` rather than looping; this project doesn't currently have such a list endpoint (`get_with_category` is only used by the single-item product detail view), so that batched form isn't written yet — add it the same way if a real need for it shows up, rather than generalizing in advance.
 
 Implementation in `app/repositories/product.py`:
 
 ```python
-from sqlalchemy.orm import selectinload
+from app.models.category import Category
 from app.models.product import Product
 from app.repositories.base import BaseRepository
 
 class ProductRepository(BaseRepository[Product, uuid.UUID]):
-    def __init__(self, db: AsyncSession) -> None:
-        super().__init__(model=Product, db=db)
+    @property
+    def model(self) -> type[Product]:
+        return Product
+
+    async def get(self, entity_id: Union[uuid.UUID, int, str]) -> Optional[Product]:
+        row = await self.db.fetchrow("SELECT * FROM products WHERE id = $1", entity_id)
+        return _row_to_product(row) if row else None
 
     async def get_with_category(self, product_id: Union[uuid.UUID, int, str]) -> Optional[Product]:
-        """Eagerly loads product with its associated category using selectinload."""
-        return await self.get(
-            product_id,
-            options=[selectinload(Product.category_rel)],
+        """Eagerly loads product with its associated category via a second query
+        (the hand-written equivalent of `selectinload(Product.category_rel)`)."""
+        product = await self.get(product_id)
+        if product is None or product.category_id is None:
+            return product
+        cat_row = await self.db.fetchrow(
+            "SELECT * FROM categories WHERE id = $1", product.category_id
         )
-
-    async def list_with_category(self, limit: int = 50, **filters) -> Sequence[Product]:
-        """Lists products eagerly loading the category relation."""
-        return await self.list(
-            limit=limit,
-            options=[selectinload(Product.category_rel)],
-            **filters,
-        )
+        if cat_row:
+            product.category_rel = Category(
+                id=cat_row["id"],
+                name=cat_row["name"],
+                description=cat_row["description"],
+                is_active=cat_row["is_active"],
+                created_at=cat_row["created_at"],
+                updated_at=cat_row["updated_at"],
+            )
+        return product
 ```
 
 #### 9.10.5 Step 4: Service Layer Validation & Cross-Entity Cache Invalidation
@@ -2001,7 +2121,7 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         """Validates that the referenced category exists and is currently active."""
         if self.db is not None:
             categories = CategoryRepository(self.db)
-            if not await categories.exists(id=category_id, is_active=True):
+            if not await categories.exists_active(category_id):
                 raise BusinessRuleError(f"Category id={category_id} does not exist or is inactive.")
 
     async def before_create(self, payload: ProductCreate) -> Product:
@@ -2067,106 +2187,94 @@ async def product_detail(item_id: Union[uuid.UUID, int], service: ProductService
     return await service.get_detail(item_id)
 ```
 
-#### 9.10.7 Step 6: Database Migrations with Alembic
+#### 9.10.7 Step 6: Changing the Schema (No Migration Tool)
 
-Whenever foreign keys or relationship tables are added or modified:
+This project has **no migration tool** — Alembic was removed along with SQLAlchemy, and nothing replaces it yet. Whenever a foreign key or column is added or modified:
 
-1. **Generate the migration script**:
+1. **Write and run the DDL directly** against Postgres (e.g. via `psql`, or the project's own docker-compose Postgres container):
 
-    ```bash
-    alembic revision --autogenerate -m "add_category_fk_to_products"
+    ```sql
+    ALTER TABLE products ADD COLUMN category_id INTEGER REFERENCES categories(id) ON DELETE RESTRICT;
+    CREATE INDEX ix_products_category_id ON products (category_id);
     ```
 
-2. **Inspect the generated migration file** — verify that it correctly includes:
+    To undo it, write and run the inverse by hand:
 
-    ```python
-    # Inside alembic/versions/<hash>_add_category_fk_to_products.py
-    def upgrade() -> None:
-        op.add_column('products', sa.Column('category_id', sa.Integer(), nullable=True))
-        op.create_index('ix_products_category_id', 'products', ['category_id'], unique=False)
-        op.create_foreign_key(
-            'fk_products_category_id_categories',
-            'products',
-            'categories',
-            ['category_id'],
-            ['id'],
-            ondelete='RESTRICT'
-        )
-
-    def downgrade() -> None:
-        op.drop_constraint('fk_products_category_id_categories', 'products', type_='foreignkey')
-        op.drop_index('ix_products_category_id', table_name='products')
-        op.drop_column('products', 'category_id')
+    ```sql
+    ALTER TABLE products DROP CONSTRAINT products_category_id_fkey;
+    DROP INDEX ix_products_category_id;
+    ALTER TABLE products DROP COLUMN category_id;
     ```
 
-3. **Verify schema health**:
+2. **Update the dataclass model** (`app/models/product.py`) to add/remove the matching field, and update the repository's hand-written `SELECT`/`INSERT`/`UPDATE` column lists (`app/repositories/product.py`) to match — there's no `RETURNING *` auto-detection of new columns to rely on; the SQL strings are the schema contract now.
+
+3. **Verify model/repository consistency**:
 
     ```bash
     python3 .agents/agents/developer-agent/skills/db_migration_helper.py
     ```
 
-4. **Apply migration to database**:
-
-    ```bash
-    alembic upgrade head
-    ```
+    This checks every model has an `id` field, a `created_at` field, and a matching hand-written repository — it has no way to check the DDL you ran actually matches, so review that by hand (or against the user's own staging database) before shipping.
 
 #### 9.10.8 Step 7: Testing Relationships & Preventing N+1 Regressions
 
-Add automated test cases validating foreign key constraints and eager loading (`tests/test_products.py`):
+With no in-memory SQLite/SQLAlchemy substitute available, relationship tests run against a **real Postgres connection** via the `pg_pool` fixture (`tests/conftest.py`) — it builds a real `asyncpg` pool from `DATABASE_URL` and `pytest.skip()`s the test (not fails) when no database is reachable, so the suite stays green in a sandbox while still exercising real integration behavior wherever Postgres is actually configured (e.g. this project's own docker-compose Postgres). Add cases validating foreign key constraints and eager loading (`tests/test_crud_router_and_elasticsearch.py`, `tests/test_products.py`):
 
 ```python
 import pytest
 from app.core.exceptions import BusinessRuleError
-from app.models.category import Category
-from app.models.product import Product
+from app.db.pool import UnitOfWork
+from app.repositories.category import CategoryRepository
 from app.repositories.product import ProductRepository
-from app.schemas.product import ProductCreate, ProductDetail
+from app.models.category import Category
+from app.schemas.product import ProductCreate
 from app.services.product import ProductService
 
 @pytest.mark.asyncio
-async def test_product_with_category_eager_loading(async_session, mock_redis):
-    # 1. Create Parent Category
-    category = Category(name="Electronics", is_active=True)
-    async_session.add(category)
-    await async_session.flush()
+async def test_product_with_category_eager_loading(pg_pool, mock_redis):
+    async with pg_pool.acquire() as connection:
+        async with UnitOfWork(connection) as uow:
+            # 1. Create parent category directly via the repository
+            category = await CategoryRepository(uow).create(
+                Category(name="Electronics-test", is_active=True)
+            )
 
-    # 2. Create Child Product
-    repo = ProductRepository(async_session)
-    service = ProductService(repo=repo, cache=mock_redis, db=async_session)
-    payload = ProductCreate(
-        name="Mechanical Keyboard",
-        sku="KEY-001",
-        price_cents=7999,
-        category_id=category.id,
-    )
-    product = await service.create(payload)
-    await async_session.commit()
+            # 2. Create child product through the service
+            repo = ProductRepository(uow)
+            service = ProductService(repo=repo, cache=mock_redis, db=uow)
+            payload = ProductCreate(
+                name="Mechanical Keyboard",
+                sku="KEY-001-test",
+                price_cents=7999,
+                category_id=category.id,
+            )
+            product = await service.create(payload)
 
-    # 3. Verify Eager Loading via Detail Endpoint
-    detail = await service.get_detail(product.id)
-    assert isinstance(detail, ProductDetail)
-    assert detail.category_rel is not None
-    assert detail.category_rel.name == "Electronics"
+            # 3. Verify eager loading via the detail endpoint's service method
+            detail = await service.get_detail(product.id)
+            assert detail.category_rel is not None
+            assert detail.category_rel.name == "Electronics-test"
+        # async with UnitOfWork(...) commits on normal exit; clean up explicitly
+        # since this ran against a real, possibly-shared database.
+        await connection.execute("DELETE FROM products WHERE sku = $1", "KEY-001-test")
+        await connection.execute("DELETE FROM categories WHERE id = $1", category.id)
 
 @pytest.mark.asyncio
-async def test_product_category_inactive_rejected(async_session, mock_redis):
-    # Create inactive category
-    category = Category(name="Discontinued", is_active=False)
-    async_session.add(category)
-    await async_session.flush()
-
-    repo = ProductRepository(async_session)
-    service = ProductService(repo=repo, cache=mock_redis, db=async_session)
-    payload = ProductCreate(
-        name="Old Item",
-        sku="OLD-001",
-        price_cents=1000,
-        category_id=category.id,
-    )
-    # Business rule must reject inactive categories
-    with pytest.raises(BusinessRuleError):
-        await service.create(payload)
+async def test_product_category_inactive_rejected(pg_pool, mock_redis):
+    async with pg_pool.acquire() as connection:
+        async with UnitOfWork(connection) as uow:
+            category = await CategoryRepository(uow).create(
+                Category(name="Discontinued-test", is_active=False)
+            )
+            repo = ProductRepository(uow)
+            service = ProductService(repo=repo, cache=mock_redis, db=uow)
+            payload = ProductCreate(
+                name="Old Item", sku="OLD-001-test", price_cents=1000, category_id=category.id,
+            )
+            # Business rule must reject inactive categories
+            with pytest.raises(BusinessRuleError):
+                await service.create(payload)
+        await connection.execute("DELETE FROM categories WHERE id = $1", category.id)
 ```
 
 ---
@@ -2287,12 +2395,13 @@ Events are **never published directly to Kafka over the network inside an HTTP s
 │ 2. Domain Action Helper        │ Custom business methods on    │ `self._enqueue_outbox_│
 │    (`_enqueue_outbox_event`)   │ domain entities               │ event("action", item)`│
 ├────────────────────────────────┼───────────────────────────────┼───────────────────────┤
-│ 3. Explicit CloudEvents Envelop│ Multi-service sagas, complex  │ Direct `session.add(  │
-│    (`OutboxEvent` Direct Add)  │ payloads with custom DTOs     │ OutboxEvent(...))`    │
+│ 3. Explicit CloudEvents Envelop│ Multi-service sagas, complex  │ Direct `await self.db.│
+│    (hand-written INSERT)       │ payloads with custom DTOs     │ execute("INSERT INTO  │
+│                                │                                │ outbox_events ...")`  │
 └────────────────────────────────┴───────────────────────────────┴───────────────────────┘
 ```
 
-In `app/api/deps.py`, the FastAPI dependency provider dynamically inspects the service constructor. When `KAFKA_ENABLED=true` in `.env`, it automatically injects:
+In `app/api/deps/factory.py`, the FastAPI dependency provider dynamically inspects the service constructor. When `KAFKA_ENABLED=true` in `.env`, it automatically injects:
 
 ```python
 if "outbox_enabled" in init_sig.parameters:
@@ -2315,32 +2424,40 @@ if "outbox_topic" in init_sig.parameters:
 class ProductService(BaseService[Product, ...]):
 
     async def adjust_stock(self, product_id: uuid.UUID, delta: int) -> ProductRead:
-        async with self.db.begin():
-            # 1. Mutate domain entity
-            product = await self.repo.adjust_stock(product_id, delta)
-            if product is None:
-                raise NotFoundError(f"Product {product_id} not found")
+        # 1. Mutate domain entity
+        product = await self.repo.get(product_id)
+        if product is None:
+            raise NotFoundError(f"Product {product_id} not found")
+        success = await self.repository.change_stock_atomic(product_id, delta)
+        if not success:
+            raise BusinessRuleError(f"Not enough stock to remove {-delta} unit(s).")
 
-            # 2. Trigger custom domain event: "product.stock_adjusted.v1"
-            self._enqueue_outbox_event("stock_adjusted", product)
+        # 2. Trigger custom domain event: "product.stock_adjusted.v1" — must be
+        # awaited: it inserts the outbox row immediately within the still-open
+        # transaction (asyncpg has no sync "stage for later flush" primitive).
+        await self._enqueue_outbox_event("stock_adjusted", product)
+        product = await self.repo.get(product_id)  # re-fetch for the new stock/updated_at
 
         # 3. Atomic commit: Both stock update and outbox event commit together!
-        return await self.to_read_model(product)
+        if self.db is not None:
+            await self.db.commit()
+        return await self.to_read_schema(product)
 ```
 
-**Pattern 3 — Explicit CloudEvents triggering (`OutboxEvent` direct addition).** For inter-microservice workflows requiring rich, strongly-typed event contracts:
+**Pattern 3 — Explicit CloudEvents triggering (direct hand-written outbox insert).** For inter-microservice workflows requiring rich, strongly-typed event contracts:
 
 ```python
 import uuid
-from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.pool import UnitOfWork
 from app.kafka.events.order_events import OrderPlacedEvent, OrderPlacedPayload
 from app.models.order import Order
-from app.models.outbox import OutboxEvent
+from app.repositories.order_repository import OrderRepository
 
 class OrderService:
-    def __init__(self, session: AsyncSession, outbox_topic: str = "orders.events") -> None:
-        self.session = session
+    def __init__(self, db: UnitOfWork, outbox_topic: str = "orders.events") -> None:
+        self.db = db
+        self.repo = OrderRepository(db)
         self.outbox_topic = outbox_topic
 
     async def place_order(
@@ -2352,36 +2469,39 @@ class OrderService:
     ) -> Order:
         order_id = uuid.uuid4()
 
-        async with self.session.begin():
-            # 1. Mutate Domain Entity in PostgreSQL
-            order = Order(id=order_id, user_id=user_id, total_cents=total_cents, status="pending")
-            self.session.add(order)
-            await self.session.flush()
+        # 1. Mutate Domain Entity in PostgreSQL
+        order = await self.repo.create(
+            Order(id=order_id, user_id=user_id, total_cents=total_cents, status="pending")
+        )
 
-            # 2. Construct Typed CloudEvents Envelope
-            event = OrderPlacedEvent(
-                aggregate_id=str(order.id),
-                correlation_id=correlation_id,
-                payload=OrderPlacedPayload(
-                    order_id=str(order.id),
-                    user_id=str(order.user_id),
-                    total_cents=order.total_cents,
-                    item_count=item_count,
-                ),
-            )
+        # 2. Construct Typed CloudEvents Envelope
+        event = OrderPlacedEvent(
+            aggregate_id=str(order.id),
+            correlation_id=correlation_id,
+            payload=OrderPlacedPayload(
+                order_id=str(order.id),
+                user_id=str(order.user_id),
+                total_cents=order.total_cents,
+                item_count=item_count,
+            ),
+        )
 
-            # 3. Append to Transactional Outbox in the SAME Transaction
-            outbox_record = OutboxEvent(
-                id=uuid.UUID(event.event_id),
-                topic=self.outbox_topic,
-                # CRITICAL: event_key MUST be the aggregate_id to guarantee Kafka partition ordering!
-                event_key=str(order.id),
-                event_type=event.event_type,
-                payload=event.model_dump(mode="json"),
-            )
-            self.session.add(outbox_record)
+        # 3. Append to Transactional Outbox in the SAME (still-open) Transaction
+        await self.db.execute(
+            """
+            INSERT INTO outbox_events (id, topic, event_key, event_type, payload)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            uuid.UUID(event.event_id),
+            self.outbox_topic,
+            # CRITICAL: event_key MUST be the aggregate_id to guarantee Kafka partition ordering!
+            str(order.id),
+            event.event_type,
+            event.model_dump(mode="json"),
+        )
 
         # Atomic Commit: If anything fails above, neither the order nor the outbox record is saved.
+        await self.db.commit()
         return order
 ```
 
@@ -2439,7 +2559,8 @@ Downstream services consume events by subclassing `BaseConsumer` (`app/kafka/con
 
 import logging
 from typing import Any
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+
+import asyncpg
 
 from app.kafka.consumer import BaseConsumer
 from app.kafka.events.order_events import OrderPlacedEvent
@@ -2454,11 +2575,11 @@ class OrderNotificationConsumer(BaseConsumer):
 
     def __init__(
         self,
-        session_factory: async_sessionmaker[AsyncSession],
+        pool: asyncpg.Pool,
         producer: KafkaProducerService,
     ) -> None:
         super().__init__(producer=producer)
-        self.session_factory = session_factory
+        self.pool = pool
 
     async def process_event(
         self,
@@ -2470,9 +2591,9 @@ class OrderNotificationConsumer(BaseConsumer):
         event = OrderPlacedEvent.model_validate(raw_message.value)
         order_id = event.payload.order_id
 
-        # 2. Execute downstream business logic within an ACID session
-        async with self.session_factory() as session:
-            async with session.begin():
+        # 2. Execute downstream business logic within an ACID transaction
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
                 # Step A: Check Idempotency (Deduplicate) — see 9.11.6 below
 
                 # Step B: Execute Downstream Mutation
@@ -2504,16 +2625,17 @@ CREATE TABLE processed_events (
 Check and record the event atomically inside the business transaction:
 
 ```python
-from sqlalchemy.dialects.postgresql import insert
-
-async with session.begin():
-    stmt = (
-        insert(ProcessedEvent)
-        .values(event_id=event.event_id, consumer_group=self.group_id)
-        .on_conflict_do_nothing(index_elements=["event_id", "consumer_group"])
+async with connection.transaction():
+    result = await connection.execute(
+        """
+        INSERT INTO processed_events (event_id, consumer_group)
+        VALUES ($1, $2)
+        ON CONFLICT (event_id, consumer_group) DO NOTHING
+        """,
+        event.event_id,
+        self.group_id,
     )
-    result = await session.execute(stmt)
-    if result.rowcount == 0:
+    if result.endswith(" 0"):  # asyncpg execute() returns a status string like "INSERT 0 0"
         logger.warning("Event %s already processed; skipping duplicate.", event.event_id)
         return  # Deduplicated!
 
@@ -2604,43 +2726,43 @@ def test_order_placed_event_serialization():
     assert parsed.payload.item_count == 2
 ```
 
-Integration test verifying the database outbox event staging (`tests/test_kafka_outbox.py`):
+Integration test verifying the database outbox event staging (`tests/test_kafka_outbox.py`), run against a real Postgres connection via the `pg_pool` fixture (see §9.10.8 — there's no in-memory substitute for asyncpg):
 
 ```python
+import uuid
 import pytest
-from sqlalchemy import select
-from app.models.outbox import OutboxEvent
+from app.db.pool import UnitOfWork
 from app.models.product import Product
 from app.repositories.product import ProductRepository
 from app.services.product import ProductService
 
 @pytest.mark.asyncio
-async def test_service_triggers_outbox_event(async_session, mock_redis):
-    # 1. Arrange: Initialize service with outbox enabled
-    repo = ProductRepository(async_session)
-    service = ProductService(
-        repo=repo, cache=mock_redis, db=async_session,
-        outbox_enabled=True, outbox_topic="domain.events",
-    )
+async def test_service_triggers_outbox_event(pg_pool, mock_redis):
+    async with pg_pool.acquire() as connection:
+        async with UnitOfWork(connection) as uow:
+            # 1. Arrange: Initialize service with outbox enabled
+            repo = ProductRepository(uow)
+            service = ProductService(
+                repo=repo, cache=mock_redis, db=uow,
+                outbox_enabled=True, outbox_topic="domain.events",
+            )
 
-    # 2. Act: Trigger custom business action
-    product = Product(name="Gaming Mouse", sku="MOU-01", price_cents=4999, stock=10)
-    async_session.add(product)
-    await async_session.commit()
+            # 2. Act: Trigger custom business action
+            product = await repo.create(
+                Product(id=uuid.uuid4(), name="Gaming Mouse", sku="MOU-01-test", price_cents=4999, stock=10)
+            )
+            product_read = await service.adjust_stock(product.id, delta=-2)
 
-    await service.adjust_stock(product.id, delta=-2)
-
-    # 3. Assert: Verify the OutboxEvent row was added to PostgreSQL
-    stmt = select(OutboxEvent).where(
-        OutboxEvent.event_key == str(product.id),
-        OutboxEvent.event_type == "product.stock_adjusted.v1",
-    )
-    result = await async_session.execute(stmt)
-    outbox_event = result.scalar_one_or_none()
-
-    assert outbox_event is not None
-    assert outbox_event.topic == "domain.events"
-    assert outbox_event.published_at is None  # Awaiting background dispatcher
+            # 3. Assert: Verify the outbox_events row was added to PostgreSQL
+            row = await connection.fetchrow(
+                "SELECT * FROM outbox_events WHERE event_key = $1 AND event_type = $2",
+                str(product.id), "HighPerfStatelessService.product.stock_adjusted",
+            )
+            assert row is not None
+            assert row["topic"] == "domain.events"
+            assert row["published_at"] is None  # Awaiting background dispatcher
+        await connection.execute("DELETE FROM outbox_events WHERE event_key = $1", str(product.id))
+        await connection.execute("DELETE FROM products WHERE id = $1", product.id)
 ```
 
 ---
@@ -2817,82 +2939,28 @@ pytest -v
 
 ---
 
-<a id="-database-initialization-migrations--seeders"></a>
-## 🗃️ Database Initialization, Migrations & Seeders
+<a id="-database-setup-no-migration-tool-no-seeders"></a>
+## 🗃️ Database Setup (No Migration Tool, No Seeders)
 
-Automatic initialization is opt-in. `AUTO_MIGRATE`, `AUTO_CREATE_TABLES`, and `AUTO_SEED` all default to `false`. Startup checks database connectivity and reports missing registered tables; it does not generate migrations or create schema unless explicitly enabled. Set `MIGRATION_DATABASE_URL` to a direct database connection when applying migrations, especially when the application URL goes through PgBouncer.
+This project has **no migration tool and no seeder framework** — Alembic, and the `app/database/` package built on top of it (table-diffing initialization, the topological seeder runner), were removed along with SQLAlchemy and nothing replaces them yet. Schema changes and any reference data are applied directly against Postgres, by hand, outside of this codebase.
 
-| Variable                 | Default                      | Behavior                                                                                                                                                                                  |
-| ------------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`           | project async PostgreSQL URL | Application connection URL. PostgreSQL uses `asyncpg`, MySQL uses `asyncmy`, and SQLite uses `aiosqlite`. Common `mysql+pymysql://...` URLs are normalized to the supported async driver. |
-| `MIGRATION_DATABASE_URL` | unset                        | Optional direct URL used by Alembic and the migration CLI; falls back to `DATABASE_URL`.                                                                                                  |
-| `ENVIRONMENT`            | `development`                | Environment label for deployment configuration.                                                                                                                                           |
-| `AUTO_MIGRATE`           | `false`                      | Applies existing Alembic revisions at startup. Never generates revisions.                                                                                                                 |
-| `AUTO_CREATE_TABLES`     | `false`                      | Creates only missing metadata tables for an unmanaged development/test database. It refuses to bypass an existing `alembic_version` history.                                              |
-| `AUTO_SEED`              | `false`                      | Runs registered idempotent seeders after the schema is ready.                                                                                                                             |
-| `SEED_CATEGORIES`        | `[]`                         | Optional JSON list of category names for the safe reference-data example seeder. Existing rows are not updated. No demo users/accounts or RBAC tables are seeded.                         |
+| Variable                 | Default                                                | Behavior                                                                                                                             |
+| ------------------------ | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`           | `postgresql://postgres:postgres@127.0.0.1:6432/app_db` | Connection string for `asyncpg`. A SQLAlchemy-style `postgresql+asyncpg://` prefix is also accepted and normalized away.              |
+| `MIGRATION_DATABASE_URL` | unset                                                   | Optional direct URL (bypassing PgBouncer) kept in sync with `DATABASE_URL`'s credentials; nothing in this codebase reads it today — it's a slot for whatever tooling is added later. |
+| `ENVIRONMENT`            | `development`                                           | Environment label for deployment configuration.                                                                                       |
 
-Production deployments should use the existing one-shot Compose migration job or a dedicated deployment job rather than enabling `AUTO_MIGRATE` in each API worker. PostgreSQL and MySQL migrations acquire a database-level lock, so concurrent CLI/startup migration attempts serialize; the one-shot deployment job remains preferred. Automatic initialization never drops tables or downgrades migrations. `create_all()` only runs when explicitly enabled and is not a substitute for Alembic. A database bootstrapped with `create-tables` is unmanaged and has no Alembic revision recorded; do not later run migrations against it without reviewing and explicitly baselining that schema.
+What this means day to day:
 
-### Mechanics behind the CLI
+- **Creating or changing the schema**: write and run the DDL (`CREATE TABLE`/`ALTER TABLE`/...) directly against Postgres — via `psql`, a one-off script, or the project's own docker-compose Postgres container — then update the matching dataclass model (`app/models/`) and the hand-written SQL in its repository (`app/repositories/`) to match. See §9.10.7 for a worked example.
+- **Verifying model/repository consistency** (not schema correctness — there's no DDL to check it against):
 
-- **Table inspection & diffing** ([`app/database/initialization.py`](app/database/initialization.py)): inspects existing tables via `sa.inspect(connection).get_table_names()`, diffs against SQLAlchemy metadata (`missing = [t for t in Base.metadata.tables.values() if t.name not in existing]`), and creates **only the missing tables** via `Base.metadata.create_all(tables=missing)`. If `alembic_version` already exists, this refuses to run — protecting migration history from schema drift.
-- **Distributed migration advisory lock** ([`alembic/env.py`](alembic/env.py)): multiple Gunicorn workers booting simultaneously must not run concurrent schema migrations. Acquired via a PostgreSQL session advisory lock (`SELECT pg_advisory_lock(738291046);`), runs `alembic.command.upgrade(config, "head")`, and releases it in a `finally` block (`SELECT pg_advisory_unlock(738291046);`).
-- **Idempotent seeder engine with topological dependency resolution** ([`app/database/seeders/base.py`](app/database/seeders/base.py), [`app/database/seeders/runner.py`](app/database/seeders/runner.py)): each seeder declares a `name` and prerequisite `dependencies`; the runner builds a directed dependency graph and sorts seeders so parents seed before children (e.g. `category_seeder` before `user_seeder`), raising `RuntimeError` on a detected cycle. Seeders verify existing records before inserting and never overwrite or mutate existing records. All seeders run in a single transaction, in dependency order, behind a database lock on PostgreSQL/MySQL; a failing seeder rolls back the entire seeding transaction.
+    ```bash
+    python3 .agents/agents/developer-agent/skills/db_migration_helper.py
+    ```
 
-```bash
-# Inspect connectivity, tables, and migration state
-python -m app.database status
-python -m app.database check
-
-# Create missing tables only for an unmanaged development/test schema
-python -m app.database create-tables
-
-# Apply existing migrations, create an autogenerate revision, or roll back explicitly
-python -m app.database migrate
-python -m app.database revision "add product index"
-python -m app.database rollback
-python -m app.database history
-
-# List registered seeders, run all, or run one seeder and its dependencies
-python -m app.database seed list
-python -m app.database seed
-python -m app.database seed category_seeder
-python -m app.database seed run category_seeder
-```
-
-Equivalent direct Alembic commands are supported:
-
-```bash
-alembic revision --autogenerate -m "create users table"
-alembic upgrade head
-alembic downgrade -1
-alembic current
-alembic history
-alembic revision -m "custom migration"
-```
-
-### Recommended production best practice (hybrid migration approach)
-
-1. **Run autogenerate**: `alembic revision --autogenerate -m "your_change"` to let Alembic generate the initial DDL diff.
-2. **Open and inspect**: inspect the file in `alembic/versions/` to verify constraint names (e.g. `uq_employees_user_id`), cascade rules (`ondelete="CASCADE"`), and pagination indexes (`(created_at, id)`), and clean sequential naming (e.g. `0005_create_employees_table.py`) matching repo conventions.
-3. **Apply the migration**: `alembic upgrade head`.
-4. **Verify schema state**: `alembic current` and `python -m app.database status`.
-
-The included `category_seeder` reads `SEED_CATEGORIES`; it is empty by default and never overwrites existing categories. No development users, passwords, role/permission catalog, or demo accounts are inserted.
-
-### Standalone seeder CLI
-
-```bash
-# List all registered seeders in topological dependency order
-python -m app.database.seeders list
-
-# Run all seeders
-python -m app.database.seeders run
-
-# Run a specific seeder (e.g. user_seeder, category_seeder)
-python -m app.database.seeders run user_seeder
-```
+    This confirms every model is a dataclass with an `id` field and a `created_at` field, and that every CRUD-exposed model has a matching hand-written `*Repository`.
+- **Seed/reference data**: insert it by hand (`psql`, a one-off script, or directly through a repository in a REPL) — there is no `category_seeder`/`user_seeder` or `python -m app.database seed` command anymore.
 
 ### Dedicated worker mode (worker-only deployment)
 
@@ -2901,8 +2969,6 @@ Run background consumers, inventory sweepers, and the outbox dispatcher outside 
 ```bash
 python -m app.workers.main
 ```
-
-If tables are absent, `python -m app.database check` and `status` print the missing table list and remediation commands. For Alembic-managed databases, always use `python -m app.database migrate`; `create-tables` intentionally refuses to alter migration history.
 
 ---
 
@@ -2933,13 +2999,6 @@ APP_NAME=HighPerfStatelessService
 DEBUG=false
 LOG_LEVEL=INFO
 ENVIRONMENT=development
-
-# ----------------------------------------------------------------------------
-# Database Auto-Initialization & Bootstrap Toggles
-# ----------------------------------------------------------------------------
-AUTO_CREATE_TABLES=false       # Create missing tables on boot (dev/test only)
-AUTO_MIGRATE=false             # Apply Alembic migrations on boot
-AUTO_SEED=false                # Run registered seeders on boot
 
 # ----------------------------------------------------------------------------
 # PostgreSQL / PgBouncer Credentials & Connection
@@ -3057,7 +3116,7 @@ In [`app/core/config.py`](app/core/config.py), the `Settings` class uses a Pydan
 
 ### Option 1: Docker Compose (Full Local Cluster, Fastest Start)
 
-Starts PostgreSQL 16, applies Alembic migrations, then starts PgBouncer (transaction mode), 3-node Redis 7 Cluster, Kafka, FastAPI (Gunicorn), Elasticsearch, and Nginx:
+Starts PostgreSQL 16, then PgBouncer (transaction mode), 3-node Redis 7 Cluster, Kafka, FastAPI (Gunicorn), Elasticsearch, and Nginx:
 
 ```bash
 cd deploy
@@ -3067,7 +3126,7 @@ docker-compose up --build -d
 docker-compose ps
 ```
 
-The one-shot `migrate` service creates or upgrades the PostgreSQL schema before the API starts. For manual migration workflows, run `alembic upgrade head` from the repository root with `MIGRATION_DATABASE_URL` configured.
+There is no migration step — this project has no migration tool. If the schema doesn't exist yet in the `postgres` container, create it directly (`psql`, or a one-off script) before starting the `app` service; see [§🗃️ Database Setup](#-database-setup-no-migration-tool-no-seeders).
 
 ### Option 2: Local Virtual Environment (Fast Dev Mode)
 
@@ -3122,12 +3181,10 @@ Configure `TRUSTED_PROXIES` with your load balancer or Nginx private IP addresse
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-**Step 4 — Verify database health & run migrations**:
+**Step 4 — Verify database connectivity & schema**: there is no migration/seed step to run here — confirm the schema already exists in the `postgres` container, creating it by hand first if this is a fresh database (see [§🗃️ Database Setup](#-database-setup-no-migration-tool-no-seeders)):
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec app python -m app.database status
-docker compose -f deploy/docker-compose.yml exec app python -m app.database migrate
-docker compose -f deploy/docker-compose.yml exec app python -m app.database.seeders run
+docker compose -f deploy/docker-compose.yml exec postgres psql -U "$DB_USER" -d "$DB_NAME" -c "\dt"
 ```
 
 **Step 5 — Scale web application workers**:
@@ -3313,14 +3370,10 @@ curl -i http://localhost:8000/readyz
 # HTTP 200: {"status": "ready", "components": {"database": "connected", "redis": "connected", "elasticsearch": "connected", "kafka": "connected"}}
 ```
 
-**2. Executing schema migrations in production**:
+**2. Checking model/repository consistency** (there is no migration tool — see [§🗃️ Database Setup](#-database-setup-no-migration-tool-no-seeders) for how schema changes are actually applied):
 
 ```bash
-# 1. Inspect current migration version
-python -m app.database status
-
-# 2. Run pending migrations safely (protected by PostgreSQL advisory lock)
-python -m app.database migrate
+python3 .agents/agents/developer-agent/skills/db_migration_helper.py
 ```
 
 **3. Log stream monitoring**:
@@ -3400,14 +3453,10 @@ curl -i http://localhost:8000/readyz
 # HTTP 200: {"status": "ready", "components": {"database": "connected", "redis": "connected", "elasticsearch": "connected", "kafka": "connected"}}
 ```
 
-**2. Executing schema migrations in production**:
+**2. Checking model/repository consistency** (there is no migration tool — see [§🗃️ Database Setup](#-database-setup-no-migration-tool-no-seeders) for how schema changes are actually applied):
 
 ```bash
-# 1. Inspect current migration version
-python -m app.database status
-
-# 2. Run pending migrations safely (protected by PostgreSQL advisory lock)
-python -m app.database migrate
+python3 .agents/agents/developer-agent/skills/db_migration_helper.py
 ```
 
 **3. Log stream monitoring**:
@@ -3447,7 +3496,7 @@ Every section above describes *how* a piece of this architecture works. This sec
 | **PgBouncer transaction pooling** | PostgreSQL forks an OS process per connection (~5-10MB RAM each); at 1,280 potential app-side sockets that's infeasible to hold open directly. PgBouncer multiplexes them onto ~80 pre-warmed backend connections, attaching a real Postgres connection to a client **only for the duration of one transaction**. | The alternative — each of 128 Uvicorn workers opening its own direct Postgres connections — would need `max_connections` in the thousands, which degrades Postgres's own scheduler and memory use long before 100k concurrency is reached. | [`deploy/pgbouncer.ini`](deploy/pgbouncer.ini) (`pool_mode = transaction`); `statement_cache_size=0`/`prepared_statement_cache_size=0` in [`app/db/session.py`](app/db/session.py) make `asyncpg` compatible with it (see §8). |
 | **Bounded `QueuePool` sized via `DB_POOL_SIZE`/`DB_MAX_OVERFLOW`** (not `NullPool`) | Reuses a small number of already-open asyncpg sockets to PgBouncer across requests. Opening a fresh TCP connection plus the Postgres/asyncpg startup handshake on *every single request* (what `NullPool` would do) adds real, avoidable latency to each one. | **This was a real gap this audit found and fixed** — [`app/db/session.py`](app/db/session.py) previously used `NullPool` whenever `PGBOUNCER_ENABLED=True` (the documented default), silently discarding the `DB_POOL_SIZE(5)`/`DB_MAX_OVERFLOW(5)` settings the "Connection Sizing Formula" in [`AGENTS.md`](AGENTS.md) §2 is computed against. Fixed to use a real bounded pool in both branches; PgBouncer still does its own backend-side multiplexing regardless. | [`app/db/session.py`](app/db/session.py) `create_db_engine()`. |
 | **Redis 7 Cluster cache-aside** (stampede lock, namespace versioning, negative cache, TTL jitter) | Every primitive here is $O(1)$: `GET`/`SET`/`INCR` are single-key RAM operations in the sub-millisecond range, versus a disk-backed PostgreSQL round-trip. The namespace-version trick turns "invalidate N cached list pages" into one atomic integer increment instead of an $O(N)$ `DEL` scan (which also fails outright on a real cluster via `CROSSSLOT`). | The obvious alternative — tracking cached query keys in a Set and `DEL`-ing them on write — doesn't survive contact with Redis Cluster's hash-slot sharding, and the naive "just cache it" approach without a stampede lock lets a single hot-key expiry turn into a thundering-herd database spike. | [`app/services/base.py`](app/services/base.py) `DynamicRedisCache`; distributed lock in [`app/core/redis.py`](app/core/redis.py) (see §5). |
-| **Keyset (cursor) pagination with a composite `(created_at, id)` index** | A B-Tree index seek is $O(\log N)$ regardless of how deep the page is. `OFFSET 50000` forces PostgreSQL to scan and discard 50,000 rows before returning anything — latency that grows linearly with page depth. | **This audit found and fixed a real gap**: `CategoryService.list_keyset()` was seeking on `(created_at, id)` without the model declaring that composite index — every category list page silently fell back to a full sort instead of an index seek. `User`/`Product`/`Employee` already had it correctly. | [`app/models/category.py`](app/models/category.py) now declares `ix_categories_created_at_id` (migration [`0006_category_keyset_and_reservation_fk_index.py`](alembic/versions/0006_category_keyset_and_reservation_fk_index.py)); pattern explained in §9.10.1. |
+| **Keyset (cursor) pagination with a composite `(created_at, id)` index** | A B-Tree index seek is $O(\log N)$ regardless of how deep the page is. `OFFSET 50000` forces PostgreSQL to scan and discard 50,000 rows before returning anything — latency that grows linearly with page depth. | **This audit found and fixed a real gap**: `CategoryService.list_keyset()` was seeking on `(created_at, id)` without the model declaring that composite index — every category list page silently fell back to a full sort instead of an index seek. `User`/`Product`/`Employee` already had it correctly. | the `categories` table has an `ix_categories_created_at_id` index created directly against Postgres (this project has no migration tool — see [§🗃️ Database Setup](#-database-setup-no-migration-tool-no-seeders)); pattern explained in §9.10.1. |
 | **Elasticsearch 8 CQRS search** | An inverted index + BM25 scoring answers "which documents contain these terms, ranked by relevance" in milliseconds across millions of documents. The equivalent in PostgreSQL — `ILIKE '%term%'` — can't use a B-Tree index at all and forces a sequential scan that gets slower as the table grows. | Bolting full-text search onto the transactional database couples search load to write-path latency and competes for the same connection pool. CQRS splits them: Postgres stays the fast, simple source of truth; Elasticsearch absorbs the expensive fuzzy/ranked queries on its own hardware. | [`app/core/elasticsearch.py`](app/core/elasticsearch.py); graceful `NullElasticsearch` degradation keeps primary CRUD unaffected if the search cluster is down (see §6). |
 | **Transactional outbox + Kafka** (vs. publishing directly in the request path) | Decouples the HTTP response from any downstream fan-out — the client gets its `201 Created` the instant the Postgres transaction commits, not after some other service has acknowledged an event. `SKIP LOCKED` lets multiple dispatcher workers poll the same outbox table concurrently without blocking each other. | Publishing to Kafka directly inside the request handler creates the dual-write problem: if the DB commits but the broker call fails (or vice versa), downstream consumers either never hear about it or react to an event that never actually happened. The outbox row commits atomically with the business row, so the event's existence is exactly as durable as the data it describes. | [`app/services/outbox.py`](app/services/outbox.py) `OutboxDispatcher` (see §7.1, §7.4). |
 | **Bounded retry + DLQ in the Kafka consumer** (not unbounded tight-loop retry) | A transient failure (a DB hiccup) gets a few spaced-out retries with exponential backoff instead of hammering the dependency in a zero-delay loop; a message that's genuinely unprocessable stops blocking the rest of the partition once it's dead-lettered, instead of wedging that partition forever. | **This audit found and fixed a real gap**: the live consumer path (`app/core/kafka.py`, actually wired into `app/main.py`/`app/workers/consumer_runner.py` — see the note in §7) previously caught any handler exception, seeked back to the same offset, and immediately retried with **zero backoff and no DLQ escape** — one bad message or one slow dependency call would spin that partition's CPU forever. A separate, more complete `BaseConsumer`/`DeadLetterQueueService` implementation already existed under `app/kafka/`, but it was never imported by the running code. | [`app/core/kafka.py`](app/core/kafka.py) `consume_events()` now retries up to `max_retries` with exponential backoff, then dead-letters to `dlq_topic` if one is configured (wired through in `app/main.py` and `app/workers/consumer_runner.py`; see §7.8). |

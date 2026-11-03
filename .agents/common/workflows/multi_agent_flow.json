@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "workflow_name": "SeniorBackendDevelopmentPipeline",
   "version": "1.0.0",
-  "description": "Multi-agent orchestration state machine for FastAPI, SQLAlchemy Async, Redis Cluster, and K8s deployment",
+  "description": "Multi-agent orchestration state machine for FastAPI, raw asyncpg (no ORM), Redis Cluster, and K8s deployment",
   "agents": [
     {
       "id": "system-architect-agent",

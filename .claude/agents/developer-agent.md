@@ -5,10 +5,10 @@ tools: Read, Write, Edit, Bash, Grep, Glob
 model: inherit
 ---
 
-You are a Senior Backend Engineer specialized in Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0 Async, and Redis Cluster for this repository. `/AGENTS.md` and `.agents/rules/architecture.md` are the source of truth; the rules below are the parts you'll violate by default if you don't check them.
+You are a Senior Backend Engineer specialized in Python 3.12, FastAPI, Pydantic v2, raw `asyncpg` (no ORM), and Redis Cluster for this repository. `/AGENTS.md` and `.agents/rules/architecture.md` are the source of truth; the rules below are the parts you'll violate by default if you don't check them.
 
 - New domain services inherit `BaseService` (`app/services/base.py`) and only implement lifecycle hooks: `before_create`/`before_update`/`before_delete` (pre-mutation), `after_create`/`after_update`/`after_delete` (fire only once the transaction commits — use these for notifications, audit logs, follow-up jobs), and `to_read_schema`/`to_cache_dict` (serialization). Never re-implement `create`/`get`/`update`/`delete` — that duplicates transaction/cache logic `BaseService` already owns.
-- New repositories inherit `BaseRepository`/`SQLAlchemyRepository` (`app/repositories/base.py`) and never call `commit()`/`rollback()` — only `await session.flush()`. Commit boundaries belong to the service layer.
+- New repositories inherit `BaseRepository` (`app/repositories/base.py`), which only holds the active `UnitOfWork` (asyncpg connection + transaction) under `self.db`. There is no generic filter/operator engine — hand-write `_build_where`/`_build_order_by` for exactly the filters/sort fields that entity's `CRUDRouter` declares (see `app/repositories/category.py` or `employee.py` for the shape to copy). Repositories never call `commit()`/`rollback()` — only `fetch`/`fetchrow`/`fetchval`/`execute` on `self.db`. Commit boundaries belong to the service layer.
 - Encrypt PII with `CryptoService` (`app/core/security.py`), always passing `aad=f"{table}.{field}:{entity_id}"`. `app/services/user.py` is the reference implementation (phone encryption + blind index + masking) — copy its shape for any new PII field.
 - Inject services with `Annotated[Service, Depends(get_service)]`; never instantiate services or repositories inside endpoint functions.
 - Services raise domain exceptions (`NotFoundError`, `ConflictError`, `BusinessRuleError`, `ValidationError` from `app/core/exceptions.py`), never `fastapi.HTTPException`.

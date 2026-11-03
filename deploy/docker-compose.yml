@@ -73,24 +73,6 @@ services:
       - internal_net
 
   # ----------------------------------------------------------------------------
-  # Apply database schema migrations before starting the API
-  # ----------------------------------------------------------------------------
-  migrate:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    command: ["alembic", "upgrade", "head"]
-    env_file:
-      - ../.env
-    environment:
-      MIGRATION_DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-postgrespassword}@postgres:5432/${DB_NAME:-app_db}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - internal_net
-
-  # ----------------------------------------------------------------------------
   # Apache Kafka single-node KRaft broker (local development)
   # ----------------------------------------------------------------------------
   kafka:
@@ -303,8 +285,7 @@ services:
     env_file:
       - ../.env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-postgrespassword}@pgbouncer:5432/${DB_NAME:-app_db}
-      MIGRATION_DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-postgrespassword}@postgres:5432/${DB_NAME:-app_db}
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgrespassword}@pgbouncer:5432/${DB_NAME:-app_db}
       DB_HOST: pgbouncer
       DB_PORT: 5432
       REDIS_CLUSTER_NODES: ${DOCKER_REDIS_CLUSTER_NODES:-redis-1:7000,redis-2:7001,redis-3:7002}
@@ -321,12 +302,9 @@ services:
       KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-highperf-fastapi}
       OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-1.0}
       OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
-      AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-true}
     depends_on:
       pgbouncer:
         condition: service_started
-      migrate:
-        condition: service_completed_successfully
       redis-cluster-init:
         condition: service_completed_successfully
       elasticsearch:

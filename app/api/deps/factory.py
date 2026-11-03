@@ -11,12 +11,11 @@ from typing import Annotated, Any, Optional, TypeVar, Union
 
 from fastapi import Depends, Request
 from redis.asyncio import Redis, RedisCluster
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.elasticsearch import IElasticsearchService, get_es
 from app.core.security import CryptoService
-from app.db.session import get_session
+from app.db.pool import UnitOfWork, get_session
 from app.services.base import BaseService
 from app.services.cache import DynamicRedisCache
 from app.services.interface import ICacheService, NullCache
@@ -24,7 +23,7 @@ from app.services.interface import ICacheService, NullCache
 ServiceT = TypeVar("ServiceT", bound=BaseService)  # type: ignore[type-arg]
 
 # Standard session dependency
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[UnitOfWork, Depends(get_session)]
 
 
 def get_crypto(request: Request) -> Optional[CryptoService]:

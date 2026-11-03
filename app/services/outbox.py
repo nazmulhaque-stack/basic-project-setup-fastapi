@@ -1,17 +1,37 @@
-"""Background dispatcher for transactional outbox events."""
+"""Background dispatcher for transactional outbox events (raw asyncpg, no ORM)."""
 
 import asyncio
 from datetime import datetime, timezone
 import logging
+from typing import Optional
 
-from sqlalchemy import and_, exists, or_, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
-from sqlalchemy.orm import aliased
+import asyncpg
 
 from app.core.kafka import KafkaEventProducer
-from app.models.outbox import OutboxEvent
 
 logger = logging.getLogger(__name__)
+
+# Guarantees strict FIFO delivery per aggregate: a later event for the same
+# (topic, event_key) is never dispatched while an earlier one is still
+# unpublished. `SKIP LOCKED` lets multiple dispatcher processes poll
+# concurrently without blocking on each other's in-flight batches.
+_SELECT_PENDING_SQL = """
+SELECT * FROM outbox_events AS o
+WHERE o.published_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM outbox_events AS older
+      WHERE older.topic = o.topic
+        AND older.event_key = o.event_key
+        AND older.published_at IS NULL
+        AND (
+            older.created_at < o.created_at
+            OR (older.created_at = o.created_at AND older.id < o.id)
+        )
+  )
+ORDER BY o.created_at, o.id
+LIMIT $1
+FOR UPDATE SKIP LOCKED
+"""
 
 
 class OutboxDispatcher:
@@ -19,17 +39,17 @@ class OutboxDispatcher:
 
     def __init__(
         self,
-        session_factory: async_sessionmaker[AsyncSession],
+        pool: asyncpg.Pool,
         producer: KafkaEventProducer,
         *,
         poll_interval: float = 1.0,
         batch_size: int = 100,
     ) -> None:
-        self._session_factory = session_factory
+        self._pool = pool
         self._producer = producer
         self._poll_interval = poll_interval
         self._batch_size = batch_size
-        self._task: asyncio.Task[None] | None = None
+        self._task: Optional[asyncio.Task[None]] = None
 
     def start(self) -> None:
         if self._task is not None:
@@ -50,50 +70,33 @@ class OutboxDispatcher:
     async def dispatch_once(self) -> int:
         """Publish one batch and mark successful rows in the same DB transaction."""
         published = 0
-        async with self._session_factory() as session:
-            async with session.begin():
-                earlier_event = aliased(OutboxEvent)
-                has_earlier_unpublished_event = exists(
-                    select(1).where(
-                        earlier_event.topic == OutboxEvent.topic,
-                        earlier_event.event_key == OutboxEvent.event_key,
-                        earlier_event.published_at.is_(None),
-                        or_(
-                            earlier_event.created_at < OutboxEvent.created_at,
-                            and_(
-                                earlier_event.created_at == OutboxEvent.created_at,
-                                earlier_event.id < OutboxEvent.id,
-                            ),
-                        ),
-                    )
-                )
-                result = await session.execute(
-                    select(OutboxEvent)
-                    .where(OutboxEvent.published_at.is_(None))
-                    .where(~has_earlier_unpublished_event)
-                    .order_by(OutboxEvent.created_at, OutboxEvent.id)
-                    .limit(self._batch_size)
-                    .with_for_update(skip_locked=True)
-                )
-                events = result.scalars().all()
-                for event in events:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(_SELECT_PENDING_SQL, self._batch_size)
+                for row in rows:
                     try:
                         await self._producer.publish(
-                            event.topic,
-                            event.event_key,
-                            event.payload,
+                            row["topic"],
+                            row["event_key"],
+                            row["payload"],
                         )
                     except Exception as exc:
-                        event.attempts += 1
-                        event.last_error = str(exc)[:4000]
+                        await connection.execute(
+                            "UPDATE outbox_events SET attempts = attempts + 1, last_error = $2 WHERE id = $1",
+                            row["id"],
+                            str(exc)[:4000],
+                        )
                         logger.exception(
                             "Could not publish outbox event %s; it will be retried.",
-                            event.id,
+                            row["id"],
                         )
                         continue
 
-                    event.published_at = datetime.now(timezone.utc)
-                    event.last_error = None
+                    await connection.execute(
+                        "UPDATE outbox_events SET published_at = $2, last_error = NULL WHERE id = $1",
+                        row["id"],
+                        datetime.now(timezone.utc),
+                    )
                     published += 1
         return published
 

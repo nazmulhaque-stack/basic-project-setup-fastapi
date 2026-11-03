@@ -11,9 +11,6 @@
       "Bash(python3 .agents/agents/developer-agent/skills/scaffold_crud.py* --dry-run*)",
       "Bash(python3 .agents/common/skills/git_helper.py status)",
       "Bash(python3 .agents/common/skills/git_helper.py check-secrets)",
-      "Bash(alembic current*)",
-      "Bash(alembic history*)",
-      "Bash(alembic heads*)",
       "Bash(git status*)",
       "Bash(git diff*)",
       "Bash(git log*)"

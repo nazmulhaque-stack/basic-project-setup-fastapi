@@ -17,8 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source code and deployment scripts
 COPY app/ ./app/
 COPY deploy/ ./deploy/
-COPY alembic/ ./alembic/
-COPY alembic.ini .
 COPY .env.example .env
 
 # Expose FastAPI port

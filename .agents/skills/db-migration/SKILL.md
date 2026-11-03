@@ -1,16 +1,16 @@
 ---
 name: db-migration
 description: >-
-  Inspects SQLAlchemy models, validates primary keys, table names, and verifies Alembic migration configuration and readiness.
+  Inspects dataclass models under app.models, validates id/created_at fields, and checks each CRUD-exposed model has a matching hand-written asyncpg repository.
 ---
 
-# Database Migration & Schema Verification Skill
+# Database Model & Repository Verification Skill
 
-Use this skill when modifying or creating database models, verifying Alembic configuration, or checking schema health before generating database migrations.
+Use this skill when modifying or creating database models, or checking model/repository consistency. This project has **no migration tool** (Alembic was removed along with SQLAlchemy; schema changes are applied directly against Postgres by hand, outside of this codebase).
 
 ## Quick Execution
 
-Run the migration helper script:
+Run the model health helper script:
 ```bash
 python3 .agents/agents/developer-agent/skills/db_migration_helper.py
 ```
@@ -18,17 +18,9 @@ python3 .agents/agents/developer-agent/skills/db_migration_helper.py
 ## Procedures
 
 1. **Verify Registered Models**:
-   - Confirm that all models inherit from `app.models.base.Base`.
-   - Ensure `__tablename__` is explicitly set.
-   - Verify that each model has an explicit primary key column.
-   - Ensure `created_at` timestamp is indexed for Keyset cursor pagination.
+   - Confirm that all models inherit from `app.models.base.Base` and are plain `@dataclass`es (no ORM).
+   - Verify that each model has an explicit `id` field.
+   - Ensure `created_at` is present for keyset cursor pagination.
+   - Confirm every CRUD-exposed model has a matching hand-written repository under `app/repositories/` (internal event/ledger models like `OutboxEvent` and `InventoryReservation` are exempt — they're accessed only via raw SQL inside their owning service, never through a repository or CRUDRouter).
 
-2. **Generate New Migration**:
-   ```bash
-   alembic revision --autogenerate -m "describe_changes"
-   ```
-
-3. **Apply Pending Migrations**:
-   ```bash
-   alembic upgrade head
-   ```
+2. **Applying a schema change**: write and run the `ALTER TABLE`/`CREATE TABLE` SQL directly against Postgres (e.g. via `psql` or the project's own docker-compose Postgres container), then update the matching dataclass model and hand-written repository SQL to match. There is no autogenerate/upgrade step to run.

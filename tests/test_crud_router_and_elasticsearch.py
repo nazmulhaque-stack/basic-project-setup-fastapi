@@ -8,7 +8,6 @@ import pytest
 from app.api.crud_router import CRUDRouter, build_list_query_model
 from app.core.config import Settings
 from app.core.elasticsearch import AsyncElasticsearchService, NullElasticsearch
-from app.db.session import create_db_engine
 from app.models.category import Category
 from app.repositories.category import CategoryRepository
 from app.schemas.category import CategoryCreate, CategoryRead, CategoryUpdate
@@ -18,7 +17,7 @@ from app.services.category import CategoryService
 def test_build_list_query_model() -> None:
     """Verifies dynamic Pydantic query model creation and parameter validation."""
     query_model = build_list_query_model(
-        Category,
+        CategoryRead,
         filter_fields={"name": ["eq", "icontains"], "is_active": ["eq"]},
         sort_fields=["id", "name", "created_at"],
     )
@@ -167,7 +166,8 @@ async def test_category_service_crud_lifecycle() -> None:
         created_at=datetime.now(timezone.utc),
     )
 
-    mock_repo.create = AsyncMock()
+    # repo.create() returns the entity it was given — no ORM identity map to mutate in place
+    mock_repo.create = AsyncMock(side_effect=lambda e: e)
     mock_repo.get = AsyncMock(return_value=entity)
     mock_repo.delete = AsyncMock()
     mock_repo.count = AsyncMock(return_value=1)
@@ -199,32 +199,45 @@ async def test_category_service_crud_lifecycle() -> None:
     mock_es.delete_document.assert_awaited_once()
 
 
-def test_pgbouncer_bounded_pool_and_statement_cache_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifies the engine disables asyncpg statement caching for PgBouncer transaction pooling
-    while still using a bounded QueuePool sized from DB_POOL_SIZE/DB_MAX_OVERFLOW — NOT NullPool,
-    which would otherwise open a brand-new connection to PgBouncer on every single checkout."""
+@pytest.mark.asyncio
+async def test_pgbouncer_bounded_pool_and_statement_cache_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies `create_db_pool` disables asyncpg's per-connection prepared-statement
+    cache (mandatory for PgBouncer transaction pooling) and sizes the pool from
+    DB_POOL_SIZE/DB_MAX_OVERFLOW, and that a SQLAlchemy-style `+asyncpg` DSN suffix
+    is normalized away before being handed to asyncpg."""
+    import asyncpg
+    from app.db.pool import create_db_pool
+
+    # Settings.resolve_service_urls() keeps DATABASE_URL's credentials in sync
+    # with any DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME from the environment
+    # (e.g. a real .env) — clear those so this test's explicit DATABASE_URL
+    # survives unmodified.
+    for var in ("DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT", "DB_NAME",
+                "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB"):
+        monkeypatch.delenv(var, raising=False)
+
     settings = Settings(
+        _env_file=None,
         PGBOUNCER_ENABLED=True,
         DATABASE_URL="postgresql+asyncpg://user:pass@127.0.0.1:6432/demo_db",
         DB_POOL_SIZE=5,
         DB_MAX_OVERFLOW=5,
     )
-    import app.db.session as db_session
 
-    engine_kwargs: Dict[str, Any] = {}
-    original_create_async_engine = db_session.create_async_engine
+    captured: Dict[str, Any] = {}
 
-    def capture_engine_kwargs(url: Any, **kwargs: Any) -> Any:
-        engine_kwargs.update(kwargs)
-        return original_create_async_engine(url, **kwargs)
+    async def fake_create_pool(dsn: str, **kwargs: Any) -> Any:
+        captured["dsn"] = dsn
+        captured.update(kwargs)
+        return MagicMock()
 
-    monkeypatch.setattr(db_session, "create_async_engine", capture_engine_kwargs)
-    engine = create_db_engine(settings)
-    assert engine.pool.size() == 5
-    connect_args = engine_kwargs["connect_args"]
-    assert connect_args["statement_cache_size"] == 0
-    assert connect_args["prepared_statement_cache_size"] == 0
-    assert callable(connect_args["prepared_statement_name_func"])
+    monkeypatch.setattr(asyncpg, "create_pool", fake_create_pool)
+    await create_db_pool(settings)
+
+    assert captured["dsn"] == "postgresql://user:pass@127.0.0.1:6432/demo_db"
+    assert captured["min_size"] == 5
+    assert captured["max_size"] == 10
+    assert captured["statement_cache_size"] == 0
 
 
 def test_partial_schema_generated_from_create_schema() -> None:
@@ -281,62 +294,6 @@ async def test_atomic_stock_adjustment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_repository_generic_crud_in_memory() -> None:
-    """Verifies repository generic CRUD operations, default sorting, operators, and safety guards."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-    from app.core.exceptions import InvalidQueryError
-    from app.db.base import Base
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with session_factory() as session:
-        repo = CategoryRepository(session)
-        assert repo.model.__name__ == "Category"  # Inferred from CategoryRepository[Category]
-
-        created = await repo.create_many([
-            {"name": "B"},
-            {"name": "A"},
-            {"name": "C", "is_active": False},
-        ])
-        await session.commit()
-        assert all(c.id for c in created)
-
-        # list() uses default_sort = ("name",)
-        categories = await repo.list()
-        assert [c.name for c in categories] == ["A", "B", "C"]
-        assert await repo.count(filters={"is_active": True}) == 2
-        assert await repo.exists(name="C")
-        found = await repo.get_by(name="A")
-        assert found is not None and found.name == "A"
-
-        # Protected fields ignored on update
-        obj = await repo.update(created[0], {"id": 999, "name": "B2"})
-        assert obj.id != 999 and obj.name == "B2"
-
-        # Unknown fields rejected
-        with pytest.raises(InvalidQueryError):
-            await repo.update(obj, {"non_existent_column": 1})
-
-        # Unknown filter operator rejected
-        with pytest.raises(InvalidQueryError):
-            await repo.list(filters={"name__unsupported_op": "x"})
-
-        # Refusal to bulk-delete without filters
-        with pytest.raises(InvalidQueryError):
-            await repo.delete_where()
-
-        # Delete with filter
-        deleted_count = await repo.delete_where(is_active=False)
-        assert deleted_count == 1
-        assert await repo.count() == 2
-
-    await engine.dispose()
-
-
-@pytest.mark.asyncio
 async def test_service_rule_with_mocked_repository() -> None:
     """Verifies that ProductService validates category existence and raises BusinessRuleError."""
     from app.core.exceptions import BusinessRuleError
@@ -360,10 +317,39 @@ async def test_service_rule_with_mocked_repository() -> None:
             category_id=999,
         )
         mock_categories = AsyncMock(spec=CategoryRepository)
-        mock_categories.exists.return_value = False
+        mock_categories.exists_active.return_value = False
         service._ensure_active_category = AsyncMock(
             side_effect=BusinessRuleError("Category id=999 does not exist or is inactive.")
         )
         await service.create(payload)
 
     service.repository.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_category_repository_crud_against_real_postgres(pg_pool: Any) -> None:
+    """Integration test for CategoryRepository's hand-written asyncpg SQL (create,
+    filtered list/count, update, delete) against a real Postgres connection.
+    Skipped automatically when no database is reachable (see the `pg_pool` fixture)."""
+    import uuid
+    from app.db.pool import UnitOfWork
+
+    unique = uuid.uuid4().hex[:8]
+    async with pg_pool.acquire() as connection:
+        async with UnitOfWork(connection) as uow:
+            repo = CategoryRepository(uow)
+            created = await repo.create(Category(name=f"Gadgets-{unique}", is_active=True))
+            other = await repo.create(Category(name=f"Widgets-{unique}", is_active=False))
+            assert created.id is not None and other.id is not None
+
+            found = await repo.list(filters={"name__icontains": unique})
+            assert {c.name for c in found} == {f"Gadgets-{unique}", f"Widgets-{unique}"}
+            assert await repo.count(filters={"name__icontains": unique, "is_active": True}) == 1
+
+            created.description = "updated description"
+            updated = await repo.update(created)
+            assert updated.description == "updated description"
+
+            await repo.delete(created)
+            await repo.delete(other)
+            assert await repo.get(created.id) is None

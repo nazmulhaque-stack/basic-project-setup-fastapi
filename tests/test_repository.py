@@ -5,11 +5,9 @@ from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 import uuid
 import pytest
-from sqlalchemy import select
 
 from app.core.security import CryptoService
 from app.models.user import User
-from app.repositories.base import BaseRepository
 from app.repositories.user import UserRepository
 from app.schemas.user import UserCreate, UserPage, UserRead
 from app.services.base import BaseService
@@ -47,7 +45,8 @@ async def test_user_service_create_user(
     cache: DynamicRedisCache = DynamicRedisCache(redis=mock_redis, prefix="users")
     service: UserService = UserService(repo=mock_user_repo, cache=cache, crypto=crypto_service)
 
-    mock_user_repo.create = AsyncMock()
+    # repo.create() returns the entity it was given — no ORM identity map to mutate in place
+    mock_user_repo.create = AsyncMock(side_effect=lambda entity: entity)
 
     payload: UserCreate = UserCreate(
         name="Alice Architect",
@@ -188,35 +187,6 @@ async def test_user_service_list_users_invalidation(
     assert mock_user_repo.list_keyset.call_count == 2  # Call count incremented
 
 
-def test_base_repository_dynamic_filter_engine() -> None:
-    """Verifies that BaseRepository dynamic filter engine translates operators into valid clauses."""
-    repo: BaseRepository[User, uuid.UUID] = BaseRepository(User, session=MagicMock())
-    query: Any = select(User)
-
-    filtered_query: Any = repo._apply_filters(
-        query,
-        email="test@example.com",
-        role__in=["admin", "user"],
-        name__ilike="%architect%",
-    )
-
-    compiled: str = str(filtered_query.compile(compile_kwargs={"literal_binds": False}))
-    assert "users.email =" in compiled
-    assert "users.role IN" in compiled
-    assert "lower(users.name) LIKE lower(" in compiled or "users.name ILIKE" in compiled
-
-
-def test_base_repository_dynamic_ordering() -> None:
-    """Verifies that BaseRepository correctly parses descending '-' prefix and multi-column order."""
-    repo: BaseRepository[User, uuid.UUID] = BaseRepository(User, session=MagicMock())
-    query: Any = select(User)
-
-    ordered_query: Any = repo._apply_ordering(query, order_by=["-created_at", "email"])
-    compiled: str = str(ordered_query.compile(compile_kwargs={"literal_binds": False}))
-    assert "users.created_at DESC" in compiled
-    assert "users.email ASC" in compiled
-
-
 @pytest.mark.asyncio
 async def test_base_service_null_cache_polymorphism(mock_user_repo: UserRepository) -> None:
     """Verifies that BaseService operates cleanly with NullCache when no distributed cache is provided."""
@@ -296,8 +266,8 @@ async def test_user_service_crud_pattern_methods(
     assert found_user is not None
     assert found_user.name == "Diana Prince"
 
-    # 2. get_all
-    mock_user_repo.get_all = AsyncMock(return_value=[dummy_user])
+    # 2. get_all (BaseService.get_all() -> list_offset() -> self.repo.list(...))
+    mock_user_repo.list = AsyncMock(return_value=[dummy_user])
     all_users: list[UserRead] = await service.get_all(limit=10, offset=0)
     assert len(all_users) == 1
     assert all_users[0].email == "diana@example.com"
@@ -329,10 +299,14 @@ async def test_base_service_after_hooks_fire_after_commit() -> None:
     mock_session: AsyncMock = AsyncMock()
     mock_session.commit = AsyncMock(side_effect=lambda: events.append("commit"))
 
+    def _mock_create(entity: Product) -> Product:
+        events.append("repo.create")
+        return entity  # repo.create() returns the (freshly constructed) entity; no ORM identity map to mutate in place
+
     mock_product_repo: MagicMock = MagicMock(spec=ProductRepository)
     mock_product_repo.model = Product
     mock_product_repo.session = mock_session
-    mock_product_repo.create = AsyncMock(side_effect=lambda entity: events.append("repo.create"))
+    mock_product_repo.create = AsyncMock(side_effect=_mock_create)
 
     class TrackedProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductRead, uuid.UUID]):
         def __init__(self) -> None:
@@ -369,8 +343,12 @@ async def test_base_service_after_hooks_fire_after_commit() -> None:
         category="general", is_active=True, created_at=datetime.now(timezone.utc),
     )
     events.clear()
+    def _mock_update(entity: Product) -> Product:
+        events.append("repo.update")
+        return entity
+
     mock_product_repo.get = AsyncMock(return_value=existing)
-    mock_product_repo.update = AsyncMock(side_effect=lambda entity: events.append("repo.update"))
+    mock_product_repo.update = AsyncMock(side_effect=_mock_update)
     update_payload = ProductUpdate(price_cents=999)
     await service.update(existing.id, update_payload)
     assert len(service.after_update_calls) == 1

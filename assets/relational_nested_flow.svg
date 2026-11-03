@@ -18,7 +18,7 @@
   <!-- Header -->
   <g transform="translate(50, 45)">
     <text x="0" y="0" fill="#2dd4bf" font-size="22" font-weight="800" letter-spacing="1">📦 RELATIONAL EAGER LOADING PIPELINE (CATEGORY IN PRODUCT)</text>
-    <text x="0" y="24" fill="#94a3b8" font-size="12" font-weight="500">How selectinload prevents N+1 query floods and lazy="raise" eliminates async MissingGreenlet crashes</text>
+    <text x="0" y="24" fill="#94a3b8" font-size="12" font-weight="500">How a dedicated repository method prevents N+1 query floods when loading a relationship</text>
   </g>
 
   <!-- Top Flow: Step 1 to 4 -->
@@ -40,9 +40,9 @@
     <rect width="280" height="140" rx="8" fill="#1e293b" stroke="#2dd4bf" stroke-width="1.5" />
     <text x="20" y="28" fill="#2dd4bf" font-size="13" font-weight="700">2. Repository Eager Load</text>
     <text x="20" y="55" fill="#ccfbf1" font-size="11">• ProductRepository.get_with_category()</text>
-    <text x="20" y="75" fill="#ffffff" font-size="11" font-family="monospace">options=[selectinload(</text>
-    <text x="40" y="93" fill="#ffffff" font-size="11" font-family="monospace">Product.category_rel)]</text>
-    <text x="20" y="115" fill="#a7f3d0" font-size="10" font-weight="600">• Overrides lazy="raise" safely</text>
+    <text x="20" y="75" fill="#ffffff" font-size="11" font-family="monospace">row = await db.fetchrow(...)</text>
+    <text x="40" y="93" fill="#ffffff" font-size="11" font-family="monospace">cat = await db.fetchrow(...)</text>
+    <text x="20" y="115" fill="#a7f3d0" font-size="10" font-weight="600">• Always 2 queries, never N+1</text>
   </g>
 
   <!-- Arrow -->
@@ -76,19 +76,19 @@
   <!-- Bottom Comparison Container: lazy="raise" vs lazy="select" -->
   <g transform="translate(50, 270)">
     <rect width="1200" height="430" rx="10" fill="#0f172a" stroke="#334155" stroke-width="1.5" />
-    <text x="25" y="32" fill="#ffffff" font-size="14" font-weight="800">⚡ ARCHITECTURAL COMPARISON: WHY lazy="raise" IS MANDATORY AT 100k CONCURRENCY</text>
+    <text x="25" y="32" fill="#ffffff" font-size="14" font-weight="800">⚡ ARCHITECTURAL COMPARISON: WHY A DEDICATED EAGER-LOAD METHOD IS MANDATORY AT 100k CONCURRENCY</text>
 
     <!-- Left Box: Bad Approach -->
     <g transform="translate(25, 50)">
       <rect width="555" height="350" rx="8" fill="#450a0a" stroke="#ef4444" stroke-width="1.5" />
-      <text x="20" y="30" fill="#fca5a5" font-size="14" font-weight="700">❌ Default / Naive Approach (lazy="select" or sync access)</text>
-      
+      <text x="20" y="30" fill="#fca5a5" font-size="14" font-weight="700">❌ Naive Approach (per-row relationship fetch in a loop)</text>
+
       <text x="20" y="65" fill="#fee2e2" font-size="12" font-weight="600">The Failure Chain:</text>
-      <text x="20" y="90" fill="#fecaca" font-size="11">1. Developer accesses `product.category_rel.name` inside route or template</text>
-      <text x="20" y="115" fill="#fecaca" font-size="11">2. In AsyncIO: Triggers `MissingGreenlet: greenlet_spawn has not been called`</text>
-      <text x="20" y="135" fill="#fecaca" font-size="11">   ──► Entire request worker crashes with HTTP 500 Internal Server Error</text>
-      <text x="20" y="165" fill="#fecaca" font-size="11">3. In Synchronous Loop: Issues 1 query per item on a list of 100 products</text>
-      <text x="20" y="185" fill="#fecaca" font-size="11">   ──► 1 + 100 = 101 synchronous roundtrips to database!</text>
+      <text x="20" y="90" fill="#fecaca" font-size="11">1. Developer loops: `for p in products: cat = await repo.get(p.category_id)`</text>
+      <text x="20" y="115" fill="#fecaca" font-size="11">2. Each iteration awaits its own round-trip — nothing is batched</text>
+      <text x="20" y="135" fill="#fecaca" font-size="11">   ──► No crash, but no batching either: pure N+1 query growth</text>
+      <text x="20" y="165" fill="#fecaca" font-size="11">3. On a list of 100 products: issues 1 query per item</text>
+      <text x="20" y="185" fill="#fecaca" font-size="11">   ──► 1 + 100 = 101 sequential roundtrips to database!</text>
       <text x="20" y="215" fill="#fecaca" font-size="11">4. PgBouncer 80-connection pool exhausted in 20 milliseconds</text>
       <text x="20" y="240" fill="#fecaca" font-size="11">5. Application latency spikes from 2ms to &gt; 5,000ms</text>
       <text x="20" y="270" fill="#fecaca" font-size="11">6. Reverse proxy times out (504 Gateway Timeout)</text>
@@ -100,15 +100,15 @@
     <!-- Right Box: Production Pattern -->
     <g transform="translate(620, 50)">
       <rect width="555" height="350" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="1.5" />
-      <text x="20" y="30" fill="#6ee7b7" font-size="14" font-weight="700">✅ Production Pattern (lazy="raise" + selectinload)</text>
-      
+      <text x="20" y="30" fill="#6ee7b7" font-size="14" font-weight="700">✅ Production Pattern (dedicated eager-load repository method)</text>
+
       <text x="20" y="65" fill="#d1fae5" font-size="12" font-weight="600">The Robust Architecture:</text>
-      <text x="20" y="90" fill="#a7f3d0" font-size="11">1. Model declares `relationship(..., lazy="raise")` explicitly</text>
-      <text x="20" y="115" fill="#a7f3d0" font-size="11">2. Accidental lazy loads are caught IMMEDIATELY at development / test time</text>
-      <text x="20" y="135" fill="#a7f3d0" font-size="11">   ──► Zero hidden queries can ever slip into production</text>
-      <text x="20" y="165" fill="#a7f3d0" font-size="11">3. Repository uses `selectinload(Product.category_rel)`:</text>
-      <text x="20" y="185" fill="#a7f3d0" font-size="11">   ──► Executes exactly 2 batch queries regardless of list size (1 or 1,000)</text>
-      <text x="20" y="215" fill="#a7f3d0" font-size="11">4. Foreign key `category_id` has B-Tree index: `index=True` for fast seek</text>
+      <text x="20" y="90" fill="#a7f3d0" font-size="11">1. Repository exposes `get_with_category(id)` — never a generic accessor</text>
+      <text x="20" y="115" fill="#a7f3d0" font-size="11">2. There is no lazy-loading machinery to accidentally trigger</text>
+      <text x="20" y="135" fill="#a7f3d0" font-size="11">   ──► A relationship is only ever populated by an explicit, named method</text>
+      <text x="20" y="165" fill="#a7f3d0" font-size="11">3. `get_with_category()` issues one extra `fetchrow` keyed on `category_id`:</text>
+      <text x="20" y="185" fill="#a7f3d0" font-size="11">   ──► Exactly 2 queries total for this single detail-view lookup</text>
+      <text x="20" y="215" fill="#a7f3d0" font-size="11">4. Foreign key `category_id` is indexed for a fast seek</text>
       <text x="20" y="240" fill="#a7f3d0" font-size="11">5. PgBouncer sockets held for &lt; 1.2ms and released back to pool</text>
       <text x="20" y="270" fill="#a7f3d0" font-size="11">6. Pydantic serializes `ProductDetail` with nested `CategoryRead` cleanly</text>
       

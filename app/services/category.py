@@ -4,9 +4,9 @@ Inherits full CRUD, Redis caching, and Elasticsearch search from BaseService wit
 """
 
 from typing import Optional
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.elasticsearch import IElasticsearchService
+from app.db.pool import UnitOfWork
 from app.models.category import Category
 from app.repositories.category import CategoryRepository
 from app.schemas.category import CategoryCreate, CategoryRead, CategoryUpdate
@@ -22,7 +22,7 @@ class CategoryService(BaseService[Category, CategoryCreate, CategoryUpdate, Cate
 
     def __init__(
         self,
-        db: Optional[AsyncSession] = None,
+        db: Optional[UnitOfWork] = None,
         repo: Optional[CategoryRepository] = None,
         cache: Optional[ICacheService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,

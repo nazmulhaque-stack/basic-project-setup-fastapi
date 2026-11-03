@@ -11,9 +11,68 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _sync_db_url(
+    url_str: str,
+    user: Optional[str],
+    password: Optional[str],
+    host: Optional[str],
+    port: Optional[int],
+    db_name: Optional[str],
+    *,
+    override_host_port: bool,
+) -> str:
+    """Overlay individual DB_* credential overrides onto a DATABASE_URL-shaped
+    connection string, without any SQLAlchemy URL object. Preserves a real
+    configured host/port over an explicit localhost/127.0.0.1 override (so a
+    `.env` default of `DB_HOST=localhost` never clobbers a deployment's real
+    `DATABASE_URL`).
+    """
+    parts = urlsplit(url_str)
+    new_user = user if user is not None else parts.username
+    new_password = password if password is not None else parts.password
+
+    if override_host_port:
+        existing_host = parts.hostname
+        if host is not None:
+            if existing_host and existing_host not in ("127.0.0.1", "localhost") and host in ("127.0.0.1", "localhost"):
+                new_host = existing_host
+            else:
+                new_host = host
+        else:
+            new_host = existing_host
+
+        if port is not None:
+            if existing_host and existing_host not in ("127.0.0.1", "localhost") and host in ("127.0.0.1", "localhost"):
+                new_port = parts.port
+            else:
+                new_port = port
+        else:
+            new_port = parts.port
+    else:
+        new_host = parts.hostname
+        new_port = parts.port
+
+    new_db = db_name if db_name is not None else (parts.path.lstrip("/") or None)
+
+    netloc = ""
+    if new_user:
+        netloc += quote(str(new_user), safe="")
+        if new_password:
+            netloc += f":{quote(str(new_password), safe='')}"
+        netloc += "@"
+    if new_host:
+        netloc += str(new_host)
+    if new_port:
+        netloc += f":{new_port}"
+
+    new_path = f"/{new_db}" if new_db else parts.path
+    return urlunsplit((parts.scheme, netloc, new_path, parts.query, parts.fragment))
 
 
 class CacheOperationFlags(BaseSettings):
@@ -56,32 +115,16 @@ class Settings(BaseSettings):
     POSTGRES_DB: Optional[str] = Field(default=None, description="PostgreSQL database name alias")
 
     DATABASE_URL: str = Field(
-        default="postgresql+asyncpg://postgres:postgres@127.0.0.1:6432/app_db",
-        description="Async database URL using asyncpg, asyncmy, or aiosqlite",
+        default="postgresql://postgres:postgres@127.0.0.1:6432/app_db",
+        description="Postgres connection string for asyncpg (a 'postgresql+asyncpg://' SQLAlchemy-style prefix is also accepted and normalized)",
     )
     MIGRATION_DATABASE_URL: Optional[str] = Field(
         default=None,
-        description="Optional direct database URL for Alembic migrations, bypassing PgBouncer",
+        description="Optional direct database URL bypassing PgBouncer, kept in sync with DATABASE_URL's credentials",
     )
     ENVIRONMENT: str = Field(
         default="development",
         description="Deployment environment name, e.g. development, testing, or production",
-    )
-    AUTO_MIGRATE: bool = Field(
-        default=False,
-        description="Apply existing Alembic migrations during application startup",
-    )
-    AUTO_CREATE_TABLES: bool = Field(
-        default=False,
-        description="Create missing metadata tables for explicit development/testing bootstrap",
-    )
-    AUTO_SEED: bool = Field(
-        default=False,
-        description="Run registered idempotent database seeders during startup",
-    )
-    SEED_CATEGORIES: str = Field(
-        default="[]",
-        description="Optional JSON array of category names for the safe reference seeder",
     )
     PGBOUNCER_ENABLED: bool = Field(
         default=True,
@@ -309,43 +352,13 @@ class Settings(BaseSettings):
 
         if user or password or host or port or db_name:
             try:
-                from sqlalchemy.engine import make_url
-                url = make_url(self.DATABASE_URL)
-                new_user = user if user is not None else url.username
-                new_password = password if password is not None else url.password
-                if host is not None:
-                    if url.host and url.host not in ("127.0.0.1", "localhost") and host in ("127.0.0.1", "localhost"):
-                        new_host = url.host
-                    else:
-                        new_host = host
-                else:
-                    new_host = url.host
-
-                if port is not None:
-                    if url.host and url.host not in ("127.0.0.1", "localhost") and host in ("127.0.0.1", "localhost"):
-                        new_port = url.port
-                    else:
-                        new_port = port
-                else:
-                    new_port = url.port
-                new_database = db_name if db_name is not None else url.database
-
-                updated_url = url.set(
-                    username=new_user,
-                    password=new_password,
-                    host=new_host,
-                    port=new_port,
-                    database=new_database,
+                self.DATABASE_URL = _sync_db_url(
+                    self.DATABASE_URL, user, password, host, port, db_name, override_host_port=True
                 )
-                self.DATABASE_URL = updated_url.render_as_string(hide_password=False)
-
                 if self.MIGRATION_DATABASE_URL:
-                    mig_url = make_url(self.MIGRATION_DATABASE_URL)
-                    mig_updated = mig_url.set(
-                        username=user if user is not None else mig_url.username,
-                        password=password if password is not None else mig_url.password,
+                    self.MIGRATION_DATABASE_URL = _sync_db_url(
+                        self.MIGRATION_DATABASE_URL, user, password, None, None, None, override_host_port=False
                     )
-                    self.MIGRATION_DATABASE_URL = mig_updated.render_as_string(hide_password=False)
             except Exception:
                 pass
         return self

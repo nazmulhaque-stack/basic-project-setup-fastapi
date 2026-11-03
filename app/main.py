@@ -2,10 +2,10 @@
 
 Architecture & Principles:
 --------------------------
-1. Reusable Generic Repository Pattern + Service Layer + SQLAlchemy 2.0 Async architecture.
-2. Zero module-level connection globals: Engine, Redis client, and Crypto keys
-   are strictly instantiated in the async `lifespan` context manager, attached to
-   `app.state`, and gracefully closed during shutdown.
+1. Reusable Generic Repository Pattern + Service Layer over raw `asyncpg` (no ORM).
+2. Zero module-level connection globals: the asyncpg pool, Redis client, and
+   Crypto keys are strictly instantiated in the async `lifespan` context
+   manager, attached to `app.state`, and gracefully closed during shutdown.
 3. Default response class is ORJSONResponse for ultra-fast C/Rust JSON serialization.
 4. Kept completely stateless across N worker processes and M physical servers.
 5. Production exception handlers sanitize all internal errors, preventing stack
@@ -20,12 +20,12 @@ import sys
 import time
 import uuid
 
+import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
 from fastapi.routing import APIRoute
 from redis.asyncio import Redis, RedisCluster
-from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.v1.health import router as health_router
 from app.api.v1.router import api_v1_router
@@ -48,8 +48,7 @@ from app.core.logging import (
 )
 from app.core.redis import close_redis_client, create_redis_client
 from app.core.security import CryptoService
-from app.database.initialization import initialize_database
-from app.db.session import create_db_engine, create_session_factory
+from app.db.pool import close_db_pool, create_db_pool
 from app.schemas.base import ErrorDetail, ErrorResponse
 from app.services.outbox import OutboxDispatcher
 from app.services.inventory_reservations import (
@@ -76,16 +75,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     logger.info("Initializing application resources for worker in %s mode...", settings.APP_NAME)
 
-    # 1. Initialize PostgreSQL Async Engine & Sessionmaker
-    engine = create_db_engine(settings)
-    session_factory = create_session_factory(engine)
-    app.state.engine = engine
-    app.state.session_factory = session_factory
-    try:
-        await initialize_database(engine, session_factory, settings)
-    except Exception:
-        await engine.dispose()
-        raise
+    # 1. Initialize the raw asyncpg connection pool (PgBouncer transaction-pooling compatible)
+    db_pool = await create_db_pool(settings)
+    app.state.db_pool = db_pool
 
     kafka_producer: Optional[KafkaEventProducer] = None
     outbox_dispatcher: Optional[OutboxDispatcher] = None
@@ -96,7 +88,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         kafka_producer = KafkaEventProducer(settings.KAFKA_BOOTSTRAP_SERVERS)
         await kafka_producer.start()
         outbox_dispatcher = OutboxDispatcher(
-            session_factory,
+            db_pool,
             kafka_producer,
             poll_interval=settings.OUTBOX_POLL_INTERVAL,
             batch_size=settings.OUTBOX_BATCH_SIZE,
@@ -107,7 +99,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         async def handle_inventory_event(event: dict[str, Any]) -> None:
             await handle_inventory_reserved(
                 event,
-                session_factory,
+                db_pool,
                 kafka_producer,
                 output_topic=settings.KAFKA_EVENTS_TOPIC,
                 dead_letter_topic=settings.KAFKA_INVENTORY_DLQ_TOPIC,
@@ -127,7 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         reservation_sweeper_task = asyncio.create_task(
             run_expiration_sweeper(
-                session_factory,
+                db_pool,
                 settings.KAFKA_EVENTS_TOPIC,
                 interval=settings.INVENTORY_RESERVATION_SWEEP_INTERVAL,
                 stop_event=inventory_consumer_stop,
@@ -230,9 +222,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.warning("Error closing Redis client: %s", exc)
 
     try:
-        await app.state.engine.dispose()
+        await close_db_pool(app.state.db_pool)
     except Exception as exc:
-        logger.warning("Error disposing DB engine: %s", exc)
+        logger.warning("Error closing DB pool: %s", exc)
 
     logger.info("Worker shutdown complete.")
 
@@ -366,8 +358,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-@app.exception_handler(SQLAlchemyError)
-async def database_exception_handler(request: Request, exc: SQLAlchemyError) -> ORJSONResponse:
+@app.exception_handler(asyncpg.PostgresError)
+async def database_exception_handler(request: Request, exc: asyncpg.PostgresError) -> ORJSONResponse:
     """Sanitizes database errors so SQL statements and internal state never leak to client."""
     logger.error("Unhandled database error: %s", exc)
     envelope: ErrorResponse = ErrorResponse(

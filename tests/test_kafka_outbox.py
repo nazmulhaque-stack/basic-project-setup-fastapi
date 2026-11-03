@@ -1,14 +1,20 @@
-"""Tests for transactional domain events and Kafka outbox delivery."""
+"""Tests for transactional domain events and Kafka outbox delivery.
+
+Integration tests here run against a real Postgres connection via the `pg_pool`
+fixture (see `tests/conftest.py`) and self-clean their rows, since there is no
+in-memory substitute that faithfully reproduces asyncpg/Postgres behavior now
+that the project talks to the database only via raw asyncpg (no SQLAlchemy,
+no SQLite fallback).
+"""
 
 from datetime import datetime, timezone
+from typing import Any
+import uuid
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.db.base import Base
-from app.models.outbox import OutboxEvent
+from app.db.pool import UnitOfWork
 from app.schemas.category import CategoryCreate
 from app.services.category import CategoryService
 from app.services.outbox import OutboxDispatcher
@@ -23,138 +29,154 @@ class FakeProducer:
 
 
 @pytest.mark.asyncio
-async def test_domain_mutation_and_event_share_transaction() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_domain_mutation_and_event_share_transaction(pg_pool: Any) -> None:
+    unique = uuid.uuid4().hex[:8]
+    category_ids: list[int] = []
 
-    async with session_factory() as session:
-        # 1. Default: auto_outbox_events is False -> generic create does NOT trigger outbox event
-        service = CategoryService(
-            db=session,
-            outbox_enabled=True,
-            outbox_topic="domain.events",
-        )
-        cat_default = await service.create(CategoryCreate(name="Clothing"))
-        res = await session.execute(select(OutboxEvent))
-        assert res.scalar_one_or_none() is None
+    try:
+        async with pg_pool.acquire() as connection:
+            # 1. Default: auto_outbox_events is False -> generic create does NOT trigger outbox event
+            async with UnitOfWork(connection) as uow:
+                service = CategoryService(db=uow, outbox_enabled=True, outbox_topic="domain.events")
+                cat_default = await service.create(CategoryCreate(name=f"Clothing-{unique}"))
+                category_ids.append(cat_default.id)
+                no_event = await connection.fetchval(
+                    "SELECT count(*) FROM outbox_events WHERE event_key = $1", str(cat_default.id)
+                )
+                assert no_event == 0
 
-        # 2. Developer explicitly requests event triggering on create via emit_outbox_event=True
-        category = await service.create(
-            CategoryCreate(name="Electronics"),
-            emit_outbox_event=True,
-        )
-        result = await session.execute(select(OutboxEvent))
-        event = result.scalar_one()
+                # 2. Developer explicitly requests event triggering on create via emit_outbox_event=True
+                category = await service.create(
+                    CategoryCreate(name=f"Electronics-{unique}"),
+                    emit_outbox_event=True,
+                )
+                category_ids.append(category.id)
+                event_row = await connection.fetchrow(
+                    "SELECT * FROM outbox_events WHERE event_key = $1", str(category.id)
+                )
+                assert event_row is not None
+                assert event_row["topic"] == "domain.events"
+                assert event_row["event_key"] == str(category.id)
+                assert event_row["event_type"] == "HighPerfStatelessService.category.created"
+                assert event_row["payload"]["event_type"] == "HighPerfStatelessService.category.created"
+                assert event_row["payload"]["aggregate_id"] == str(category.id)
+                assert event_row["payload"]["data"] == {"id": str(category.id)}
+                assert event_row["published_at"] is None
 
-        assert event.topic == "domain.events"
-        assert event.event_key == str(category.id)
-        assert event.event_type == "HighPerfStatelessService.category.created"
-        assert event.payload["event_type"] == "HighPerfStatelessService.category.created"
-        assert event.payload["aggregate_id"] == str(category.id)
-        assert event.payload["data"] == {"id": str(category.id)}
-        assert event.published_at is None
+                # 3. Developer explicitly enqueues manual event via enqueue_outbox_event
+                manual_event = await service.enqueue_outbox_event(
+                    "created",
+                    cat_default,
+                    version="v1",
+                )
+                assert manual_event is not None
+                assert manual_event.event_type == "HighPerfStatelessService.category.created.v1"
 
-        # 3. Developer explicitly enqueues manual event via enqueue_outbox_event
-        manual_event = service.enqueue_outbox_event(
-            "created",
-            cat_default,
-            version="v1",
-        )
-        assert manual_event is not None
-        assert manual_event.event_type == "HighPerfStatelessService.category.created.v1"
-
-    # 4. Outbox disabled flag prevents all outbox events
-    async with session_factory() as session:
-        disabled_service = CategoryService(
-            db=session,
-            outbox_enabled=False,
-        )
-        await disabled_service.create(CategoryCreate(name="Books"), emit_outbox_event=True)
-        manual = disabled_service.enqueue_outbox_event("created", cat_default)
-        assert manual is None
-
-    await engine.dispose()
+            # 4. Outbox disabled flag prevents all outbox events
+            async with UnitOfWork(connection) as uow:
+                disabled_service = CategoryService(db=uow, outbox_enabled=False)
+                book = await disabled_service.create(
+                    CategoryCreate(name=f"Books-{unique}"), emit_outbox_event=True
+                )
+                category_ids.append(book.id)
+                manual = await disabled_service.enqueue_outbox_event("created", cat_default)
+                assert manual is None
+                count = await connection.fetchval(
+                    "SELECT count(*) FROM outbox_events WHERE event_key = $1", str(book.id)
+                )
+                assert count == 0
+    finally:
+        if category_ids:
+            async with pg_pool.acquire() as connection:
+                await connection.execute(
+                    "DELETE FROM outbox_events WHERE event_key = ANY($1::text[])",
+                    [str(c) for c in category_ids],
+                )
+                await connection.execute(
+                    "DELETE FROM categories WHERE id = ANY($1::int[])", category_ids
+                )
 
 
 @pytest.mark.asyncio
-async def test_outbox_dispatcher_publishes_and_marks_event() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(OutboxEvent.__table__.create)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_outbox_dispatcher_publishes_and_marks_event(pg_pool: Any) -> None:
     event_id = uuid4()
-    async with session_factory() as session:
-        session.add(
-            OutboxEvent(
-                id=event_id,
-                topic="domain.events",
-                event_key="category-1",
-                event_type="Category.created.v1",
-                payload={"event_id": str(event_id), "aggregate_id": "category-1"},
-                created_at=datetime.now(timezone.utc),
+    try:
+        async with pg_pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO outbox_events (id, topic, event_key, event_type, payload, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                event_id,
+                "domain.events",
+                "category-1",
+                "Category.created.v1",
+                {"event_id": str(event_id), "aggregate_id": "category-1"},
+                datetime.now(timezone.utc),
             )
-        )
-        await session.commit()
 
-    producer = FakeProducer()
-    dispatcher = OutboxDispatcher(session_factory, producer, batch_size=10)
-    assert await dispatcher.dispatch_once() == 1
-    assert producer.events[0][0:2] == ("domain.events", "category-1")
+        producer = FakeProducer()
+        dispatcher = OutboxDispatcher(pg_pool, producer, batch_size=10)
+        assert await dispatcher.dispatch_once() == 1
+        assert producer.events[0][0:2] == ("domain.events", "category-1")
 
-    async with session_factory() as session:
-        event = await session.get(OutboxEvent, event_id)
-        assert event is not None
-        assert event.published_at is not None
-        assert event.last_error is None
-
-    await engine.dispose()
+        async with pg_pool.acquire() as connection:
+            row = await connection.fetchrow("SELECT * FROM outbox_events WHERE id = $1", event_id)
+            assert row is not None
+            assert row["published_at"] is not None
+            assert row["last_error"] is None
+    finally:
+        async with pg_pool.acquire() as connection:
+            await connection.execute("DELETE FROM outbox_events WHERE id = $1", event_id)
 
 
 @pytest.mark.asyncio
-async def test_outbox_dispatcher_preserves_order_for_each_aggregate() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(OutboxEvent.__table__.create)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_outbox_dispatcher_preserves_order_for_each_aggregate(pg_pool: Any) -> None:
     first_id = uuid4()
     second_id = uuid4()
-    async with session_factory() as session:
-        session.add_all(
-            [
-                OutboxEvent(
-                    id=first_id,
-                    topic="domain.events",
-                    event_key="category-1",
-                    event_type="category.updated.v1",
-                    payload={"event_id": str(first_id)},
-                    created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-                ),
-                OutboxEvent(
-                    id=second_id,
-                    topic="domain.events",
-                    event_key="category-1",
-                    event_type="category.deleted.v1",
-                    payload={"event_id": str(second_id)},
-                    created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
-                ),
-            ]
-        )
-        await session.commit()
+    try:
+        async with pg_pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO outbox_events (id, topic, event_key, event_type, payload, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                first_id,
+                "domain.events",
+                "category-1",
+                "category.updated.v1",
+                {"event_id": str(first_id)},
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            await connection.execute(
+                """
+                INSERT INTO outbox_events (id, topic, event_key, event_type, payload, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                second_id,
+                "domain.events",
+                "category-1",
+                "category.deleted.v1",
+                {"event_id": str(second_id)},
+                datetime(2026, 1, 2, tzinfo=timezone.utc),
+            )
 
-    producer = FakeProducer()
-    dispatcher = OutboxDispatcher(session_factory, producer, batch_size=10)
-    assert await dispatcher.dispatch_once() == 1
-    assert [event[2]["event_id"] for event in producer.events] == [str(first_id)]
+        producer = FakeProducer()
+        dispatcher = OutboxDispatcher(pg_pool, producer, batch_size=10)
+        assert await dispatcher.dispatch_once() == 1
+        assert [event[2]["event_id"] for event in producer.events] == [str(first_id)]
 
-    assert await dispatcher.dispatch_once() == 1
-    assert [event[2]["event_id"] for event in producer.events] == [
-        str(first_id),
-        str(second_id),
-    ]
+        assert await dispatcher.dispatch_once() == 1
+        assert [event[2]["event_id"] for event in producer.events] == [
+            str(first_id),
+            str(second_id),
+        ]
+    finally:
+        async with pg_pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM outbox_events WHERE id = ANY($1::uuid[])", [first_id, second_id]
+            )
 
-    await engine.dispose()
 
 def test_format_event_type_convention() -> None:
     from app.services.base import format_event_type

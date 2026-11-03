@@ -1,22 +1,31 @@
 """Dynamic filter/sort query-model builder for CRUDRouter.
 
 Turns a `filter_fields`/`sort_fields` config into a validated Pydantic model
-(`<Model>ListQuery`) at router-construction time, so every filter shows up in
+(`<Entity>ListQuery`) at router-construction time, so every filter shows up in
 `/docs` with its correct type and invalid query params are rejected with 422
 instead of silently ignored.
+
+Type information comes from the entity's own Pydantic **read schema**
+(`model.model_fields`) rather than any database/ORM introspection — repositories
+are raw hand-written asyncpg SQL now, so there is no column metadata to inspect.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, Type
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, create_model, field_validator
-from sqlalchemy import inspect as sa_inspect
-
-from app.repositories.base import FILTER_OPERATORS, LOOKUP_SEP
 
 RESERVED_QUERY_NAMES = {"page", "size", "sort"}
+LOOKUP_SEP = "__"
 LIST_OPERATORS = {"in", "not_in"}
 TEXT_OPERATORS = {"contains", "icontains", "startswith", "endswith"}
+# The full operator vocabulary CRUDRouter's query-model builder understands.
+# Repositories are free to support a subset of these per filter_fields entry —
+# each hand-writes only the WHERE branches it actually declares.
+FILTER_OPERATORS = {
+    "eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in",
+    "like", "ilike", "contains", "icontains", "startswith", "endswith", "isnull",
+}
 
 OP_DESCRIPTIONS = {
     "eq": "equals",
@@ -68,27 +77,24 @@ class ListQueryBase(BaseModel):
 
 
 def build_list_query_model(
-    model: type,
+    read_schema: Type[BaseModel],
     filter_fields: Mapping[str, Sequence[str]],
     sort_fields: Sequence[str],
 ) -> type:
-    """Create `<Model>ListQuery` from the model's column types. Validates config at startup."""
-    columns = sa_inspect(model).columns
+    """Create `<Entity>ListQuery` from the read schema's field types. Validates config at startup."""
+    schema_fields = read_schema.model_fields
     fields: Dict[str, Any] = {}
 
     for field_name, ops in filter_fields.items():
-        if field_name not in columns:
-            raise ValueError(f"{model.__name__}.{field_name} is not a column (filter_fields).")
+        if field_name not in schema_fields:
+            raise ValueError(f"{read_schema.__name__}.{field_name} is not a field (filter_fields).")
         if field_name in RESERVED_QUERY_NAMES:
             raise ValueError(f"'{field_name}' clashes with a reserved query param.")
-        try:
-            py_type: Any = columns[field_name].type.python_type
-        except NotImplementedError:
-            py_type = str
+        py_type: Any = schema_fields[field_name].annotation or str
 
         for op in ops:
             if op not in FILTER_OPERATORS:
-                raise ValueError(f"Unknown operator '{op}' for {model.__name__}.{field_name}.")
+                raise ValueError(f"Unknown operator '{op}' for {read_schema.__name__}.{field_name}.")
             param = field_name if op == "eq" else f"{field_name}{LOOKUP_SEP}{op}"
             if op in LIST_OPERATORS:
                 annotation: Any = Annotated[Optional[List[py_type]], BeforeValidator(_split_csv)]
@@ -104,9 +110,9 @@ def build_list_query_model(
             )
 
     allowed_sort = set(sort_fields)
-    unknown_sort = allowed_sort - set(columns.keys())
+    unknown_sort = allowed_sort - set(schema_fields.keys())
     if unknown_sort:
-        raise ValueError(f"sort_fields not columns of {model.__name__}: {sorted(unknown_sort)}")
+        raise ValueError(f"sort_fields not fields of {read_schema.__name__}: {sorted(unknown_sort)}")
 
     def check_sort(cls: type, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -117,7 +123,7 @@ def build_list_query_model(
         return value
 
     return create_model(
-        f"{model.__name__}ListQuery",
+        f"{read_schema.__name__}ListQuery",
         __base__=ListQueryBase,
         __validators__={"check_sort": field_validator("sort")(check_sort)},
         **fields,
@@ -126,8 +132,10 @@ def build_list_query_model(
 
 __all__ = [
     "RESERVED_QUERY_NAMES",
+    "LOOKUP_SEP",
     "LIST_OPERATORS",
     "TEXT_OPERATORS",
+    "FILTER_OPERATORS",
     "OP_DESCRIPTIONS",
     "ListQueryBase",
     "build_list_query_model",

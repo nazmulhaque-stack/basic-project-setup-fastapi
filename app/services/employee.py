@@ -6,13 +6,12 @@ Inherits full CRUD, Redis caching, and Elasticsearch search from BaseService.
 from typing import Optional
 import uuid
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.elasticsearch import IElasticsearchService
 from app.core.exceptions import ConflictError, NotFoundError
+from app.db.pool import UnitOfWork
 from app.models.employee import Employee
-from app.models.user import User
 from app.repositories.employee import EmployeeRepository
+from app.repositories.user import UserRepository
 from app.schemas.employee import EmployeeCreate, EmployeeRead, EmployeeUpdate
 from app.services.base import BaseService
 from app.services.interface import ICacheService
@@ -25,7 +24,7 @@ class EmployeeService(BaseService[Employee, EmployeeCreate, EmployeeUpdate, Empl
 
     def __init__(
         self,
-        db: Optional[AsyncSession] = None,
+        db: Optional[UnitOfWork] = None,
         repo: Optional[EmployeeRepository] = None,
         cache: Optional[ICacheService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
@@ -61,7 +60,7 @@ class EmployeeService(BaseService[Employee, EmployeeCreate, EmployeeUpdate, Empl
         """Validate 1-to-1 constraint and user existence before creating employee."""
         # 1. Check if user exists
         if self.db is not None:
-            user = await self.db.get(User, payload.user_id)
+            user = await UserRepository(self.db).get(payload.user_id)
             if user is None:
                 raise NotFoundError(f"User with ID '{payload.user_id}' not found.")
 
@@ -78,7 +77,7 @@ class EmployeeService(BaseService[Employee, EmployeeCreate, EmployeeUpdate, Empl
         new_user_id = update_data.get("user_id")
         if new_user_id is not None and new_user_id != entity.user_id:
             if self.db is not None:
-                user = await self.db.get(User, new_user_id)
+                user = await UserRepository(self.db).get(new_user_id)
                 if user is None:
                     raise NotFoundError(f"User with ID '{new_user_id}' not found.")
             existing = await self.repository.get_by_user_id(new_user_id)

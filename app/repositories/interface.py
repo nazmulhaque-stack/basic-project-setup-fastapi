@@ -1,142 +1,66 @@
-"""Abstract interface for Generic Asynchronous Repositories following OOP SOLID principles.
+"""Abstract interface for hand-written asyncpg repositories.
 
-Defines the contract (Interface Segregation & Dependency Inversion) for all repository implementations.
-Concrete repositories implement this interface to ensure polymorphic behavior and testability.
+Each concrete repository (UserRepository, ProductRepository, ...) implements
+its own SQL for every method below — there is no generic, dynamically
+dispatched filter engine. The interface exists only so `BaseService` depends
+on a stable shape rather than any one repository's concrete class.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import (
-    Any,
-    Dict,
-    Generic,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
-    TypeVar,
-    Union,
-)
+from typing import Any, Generic, List, Optional, Tuple, Type, TypeVar
 
-from pydantic import BaseModel
-
-from app.db.base import Base
+from app.models.base import Base
 
 ModelType = TypeVar("ModelType", bound=Base)
 IdType = TypeVar("IdType")
 
 
 class IBaseRepository(ABC, Generic[ModelType, IdType]):
-    """Abstract Base Repository interface defining full dynamic data access operations."""
+    """Abstract repository contract implemented by hand-written asyncpg repositories."""
 
     @property
     @abstractmethod
     def model(self) -> Type[ModelType]:
-        """Returns the SQLAlchemy model class managed by this repository."""
+        """Returns the dataclass this repository constructs rows into."""
         pass
 
     @abstractmethod
-    async def get_by_id(
-        self,
-        obj_id: Any,
-        options: Optional[Sequence[Any]] = None,
-    ) -> Optional[ModelType]:
-        """Retrieves an entity by its primary key with optional eager/lazy load options."""
+    async def get(self, entity_id: IdType) -> Optional[ModelType]:
+        """Retrieves an entity by its primary key."""
         pass
 
     @abstractmethod
-    async def get(
-        self,
-        entity_id: IdType,
-        options: Optional[Sequence[Any]] = None,
-    ) -> Optional[ModelType]:
-        """Retrieves an entity by its primary key (alias for get_by_id)."""
+    async def create(self, entity: ModelType) -> ModelType:
+        """Inserts a new row and returns the fully-populated entity (via RETURNING *)."""
         pass
 
     @abstractmethod
-    async def get_all(
-        self,
-        limit: int = 100,
-        offset: int = 0,
-        options: Optional[Sequence[Any]] = None,
-        **filters: Any,
-    ) -> List[ModelType]:
-        """Retrieves all entities matching filters with limit and offset."""
-        pass
-
-    @abstractmethod
-    async def get_by(
-        self,
-        options: Optional[Sequence[Any]] = None,
-        **kwargs: Any,
-    ) -> Optional[ModelType]:
-        """Dynamically finds the first entity matching arbitrary column expressions."""
-        pass
-
-    @abstractmethod
-    async def exists_by(self, **kwargs: Any) -> bool:
-        """Checks if any entity exists matching dynamic filter criteria."""
-        pass
-
-    @abstractmethod
-    async def count(self, **filters: Any) -> int:
-        """Counts records matching dynamic filter criteria."""
-        pass
-
-    @abstractmethod
-    async def create(
-        self,
-        data: Union[BaseModel, Dict[str, Any], ModelType],
-        refresh: bool = False,
-    ) -> ModelType:
-        """Adds and flushes a new entity to the active transaction."""
-        pass
-
-    @abstractmethod
-    async def bulk_create(
-        self,
-        items: Sequence[Union[BaseModel, Dict[str, Any], ModelType]],
-    ) -> Sequence[ModelType]:
-        """Adds and flushes multiple entities to the active transaction in a single round-trip."""
-        pass
-
-    @abstractmethod
-    async def update(
-        self,
-        entity: ModelType,
-        data: Optional[Union[BaseModel, Dict[str, Any]]] = None,
-        **kwargs: Any,
-    ) -> ModelType:
-        """Dynamically updates attributes on an existing entity and flushes."""
+    async def update(self, entity: ModelType) -> ModelType:
+        """Updates an existing row from the entity's current field values."""
         pass
 
     @abstractmethod
     async def delete(self, entity: ModelType) -> None:
-        """Removes an entity from the active transaction and flushes."""
-        pass
-
-    @abstractmethod
-    async def delete_by_id(self, entity_id: IdType) -> bool:
-        """Looks up an entity by primary key and deletes it if found."""
-        pass
-
-    @abstractmethod
-    async def delete_where(self, **filters: Any) -> int:
-        """Deletes all entities matching dynamic criteria and returns count of deleted rows."""
+        """Deletes a row."""
         pass
 
     @abstractmethod
     async def list(
         self,
+        *,
+        filters: Optional[Mapping[str, Any]] = None,
+        sort: Optional[Sequence[str]] = None,
         offset: int = 0,
         limit: int = 100,
-        order_by: Union[str, Sequence[str], None] = None,
-        descending: bool = False,
-        options: Optional[Sequence[Any]] = None,
-        **filters: Any,
     ) -> Sequence[ModelType]:
-        """Dynamic offset-based pagination with rich operator filtering and multi-column ordering."""
+        """Offset-paginated listing using this entity's own supported filter/sort keys."""
+        pass
+
+    @abstractmethod
+    async def count(self, filters: Optional[Mapping[str, Any]] = None) -> int:
+        """Counts rows matching this entity's own supported filters."""
         pass
 
     @abstractmethod
@@ -147,23 +71,10 @@ class IBaseRepository(ABC, Generic[ModelType, IdType]):
         cursor_id: Optional[Any] = None,
         order_col: str = "created_at",
         id_col: str = "id",
-        options: Optional[Sequence[Any]] = None,
         **filters: Any,
     ) -> Tuple[List[ModelType], bool]:
-        """Dynamic keyset (cursor) pagination across arbitrary model ordering columns."""
+        """Keyset (cursor) pagination: composite (order_col, id_col) seek."""
         pass
 
-    @abstractmethod
-    async def aggregate(
-        self,
-        func_name: str,
-        column_name: str,
-        **filters: Any,
-    ) -> Any:
-        """Executes an aggregate function (sum, avg, min, max, count) dynamically."""
-        pass
 
-    @abstractmethod
-    async def flush(self) -> None:
-        """Flushes pending state changes to the database without committing."""
-        pass
+__all__ = ["IBaseRepository"]

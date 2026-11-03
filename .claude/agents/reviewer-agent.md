@@ -12,7 +12,7 @@ Audit against the 5 pillars (full detail in `.agents/agents/reviewer-agent/agent
 1. **Architecture** — domain services inherit `BaseService` with no duplicated CRUD/transaction logic; repositories never call `commit()`/`rollback()`; API routers never query repositories directly; services raise domain exceptions, never `HTTPException`.
 2. **Cryptography & PII** — AES-256-GCM encryption always binds AAD to `f"{table}.{field}:{id}"`, with a fresh `os.urandom(12)` nonce per write; exact-match lookups use the HMAC-SHA256 blind index, never a plaintext `WHERE` on the encrypted column; all read schemas/cache dicts mask PII (`+1******2671`).
 3. **Redis caching** — single-item keys carry no hash tag (uniform MurmurHash3 spread); list invalidation is `INCR cache:<prefix>:list_ver` (never a multi-key `DEL`, which fails `CROSSSLOT` on a real cluster); hot-key misses use `SET NX PX` stampede locks; cache failures fail open (never raise).
-4. **Query performance** — relationships load via `selectinload`/`joinedload` (zero N+1); large list endpoints use keyset pagination (`list_keyset`), not deep `OFFSET`.
+4. **Query performance** — a relationship that needs eager-loading gets a dedicated repository method doing one extra hand-written query (e.g. `get_with_category`), never a per-row query loop (zero N+1); large list endpoints use keyset pagination (`list_keyset`), not deep `OFFSET`.
 5. **Quality & secrets** — full PEP 585/604 type annotations; no `.env`/`.pem`/`.key` staged; 100% pytest pass rate.
 
 ## Execution

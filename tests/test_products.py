@@ -33,7 +33,8 @@ async def test_product_service_create_success(
     cache: DynamicRedisCache = DynamicRedisCache(redis=mock_redis, prefix="products")
     service: ProductService = ProductService(repo=mock_product_repo, cache=cache)
 
-    mock_product_repo.create = AsyncMock()
+    # repo.create() returns the entity it was given — no ORM identity map to mutate in place
+    mock_product_repo.create = AsyncMock(side_effect=lambda entity: entity)
 
     payload: ProductCreate = ProductCreate(
         name="Mechanical Keyboard",

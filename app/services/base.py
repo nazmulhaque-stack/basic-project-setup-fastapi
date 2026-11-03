@@ -12,9 +12,14 @@ in `app/services/cache.py` — neither module needs to change when the other doe
   `to_read_schema`, `to_cache_dict` (serialization).
 - Keyset (cursor) B-Tree pagination and offset pagination with safety limits.
 - Polymorphic Caching: Uses NullCache transparently when no cache instance is provided.
+- Persistence is raw asyncpg (see `app/db/pool.py`) — no ORM. Repositories hand-write
+  SQL and return fully-populated entities via `INSERT/UPDATE ... RETURNING *`; this
+  class never touches SQL directly, only `self.db` (a `UnitOfWork`) for the
+  transaction boundary (`commit()`/`rollback()`) and staging outbox event rows.
 """
 
 from collections.abc import Mapping
+from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
 import logging
 import os
@@ -28,17 +33,17 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    get_args,
 )
 import uuid
 
+import asyncpg
 from pydantic import BaseModel
-from sqlalchemy import Uuid
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.elasticsearch import IElasticsearchService, NullElasticsearch
 from app.core.exceptions import ConflictError, NotFoundError
+from app.db.pool import UnitOfWork
 from app.models.base import Base
 from app.models.outbox import OutboxEvent
 from app.repositories.interface import IBaseRepository
@@ -131,6 +136,31 @@ def format_event_type(
     return ".".join(parts)
 
 
+def _id_field_is_uuid(model_cls: type, id_col: str) -> bool:
+    """Checks whether `model_cls`'s `id_col` field is typed `uuid.UUID` (or
+    `Optional[uuid.UUID]`), without any SQLAlchemy column/table introspection.
+    Used only to decide whether `before_create`'s default implementation should
+    client-side-generate the primary key (required for UUID PKs — e.g. `User`
+    needs its id *before* insert, to bind it into encryption AAD; see
+    `UserService.before_create`). Integer PKs are left `None` and assigned by
+    the database's own SERIAL/IDENTITY default instead.
+
+    Reads only `id_col`'s raw annotation from `dataclasses.fields()` —
+    deliberately not `typing.get_type_hints(model_cls)`, which resolves every
+    field, including other fields' `TYPE_CHECKING`-only forward references
+    (e.g. `Product.category_rel: "Optional[Category]"`, `Employee.user:
+    "Optional[User]"`) that aren't importable at module level. Those would
+    raise `NameError` for a lookup that only cares about `id_col` anyway, and
+    silently returning `False` on that error would wrongly skip UUID
+    generation for those models.
+    """
+    field = next((f for f in dataclass_fields(model_cls) if f.name == id_col), None)
+    if field is None or isinstance(field.type, str):
+        return False
+    tp = field.type
+    return tp is uuid.UUID or uuid.UUID in get_args(tp)
+
+
 class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, ReadSchemaType, IdType]):
     """Generic domain service orchestrator implementing IBaseService with polymorphic caching and Elasticsearch search offloading."""
 
@@ -142,8 +172,8 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         elasticsearch: Optional[IElasticsearchService] = None,
         order_col: str = "created_at",
         id_col: str = "id",
-        db: Optional[AsyncSession] = None,
-        session: Optional[AsyncSession] = None,
+        db: Optional[UnitOfWork] = None,
+        session: Optional[UnitOfWork] = None,
         outbox_enabled: bool = False,
         auto_outbox_events: bool = False,
         outbox_topic: str = "domain.events",
@@ -151,9 +181,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
     ) -> None:
         self.repo: IBaseRepository[ModelType, IdType] = repo
         self.repository: IBaseRepository[ModelType, IdType] = repo
-        active_db = db or session or getattr(repo, "_session", None) or getattr(repo, "session", None) or getattr(repo, "db", None)
-        self.db: Optional[AsyncSession] = active_db
-        self.session: Optional[AsyncSession] = active_db
+        active_db = db or session or getattr(repo, "db", None) or getattr(repo, "session", None)
+        self.db: Optional[UnitOfWork] = active_db
+        self.session: Optional[UnitOfWork] = active_db
         self.read_schema_cls: Type[ReadSchemaType] = read_schema_cls
         # Polymorphic caching: uses NullCache when no distributed cache is supplied
         self.cache: ICacheService = cache if cache is not None else NullCache()
@@ -181,20 +211,22 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
     async def before_create(self, payload: CreateSchemaType) -> ModelType:
         """Hook called before inserting entity into repository.
 
-        Default implementation instantiates model directly from payload dictionary.
+        Default implementation instantiates model directly from payload dictionary,
+        client-side-generating the primary key only when it's UUID-typed (integer
+        PKs are left for the database's own SERIAL/IDENTITY default).
         Override to implement custom ID generation, encryption, or blind indexing.
+
+        The UUID must be generated *before* constructing `self.repo.model(**data)`,
+        not after: unlike an ORM model (where every column has an implicit
+        default of `None`), these dataclass models declare `id` as a required
+        positional field with no default — omitting it from `data` raises
+        `TypeError`, it does not construct a half-initialized instance to patch
+        via `setattr` afterward.
         """
         data: Dict[str, Any] = payload.model_dump()
+        if data.get(self.id_col) is None and _id_field_is_uuid(self.repo.model, self.id_col):
+            data[self.id_col] = uuid.uuid4()
         entity: ModelType = self.repo.model(**data)
-        id_column = self.repo.model.__table__.c.get(self.id_col)
-        if (
-            id_column is not None
-            and isinstance(id_column.type, Uuid)
-            and getattr(entity, self.id_col, None) is None
-        ):
-            setattr(entity, self.id_col, uuid.uuid4())
-        if hasattr(entity, "created_at") and getattr(entity, "created_at", None) is None:
-            setattr(entity, "created_at", datetime.now(timezone.utc))
         return entity
 
     async def before_update(self, entity: ModelType, payload: UpdateSchemaType) -> None:
@@ -273,7 +305,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         srv = service or getattr(self, "service_name", None)
         return format_event_type(model=mod, action=action, service=srv, version=version)
 
-    def enqueue_outbox_event(
+    async def enqueue_outbox_event(
         self,
         action: str,
         entity: ModelType,
@@ -290,13 +322,16 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
 
         Allows developers to emit domain events on demand when needed,
         without relying on automatic dynamic triggers from generic CRUD operations.
+        Must be awaited: it inserts the event row immediately (within the current,
+        not-yet-committed transaction) since asyncpg has no sync "stage for later
+        flush" primitive the way a SQLAlchemy session's `add()` did.
 
         Convention: '<service_name>.<model_name>.<action_name>[.<version>]'
         (e.g., 'HighPerfStatelessService.user.created').
         """
         if not self.outbox_enabled and not force:
             return None
-        return self._enqueue_outbox_event(
+        return await self._enqueue_outbox_event(
             action=action,
             entity=entity,
             event_type=event_type,
@@ -306,7 +341,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
             extra_data=extra_data,
         )
 
-    def _enqueue_outbox_event(
+    async def _enqueue_outbox_event(
         self,
         action: str,
         entity: ModelType,
@@ -317,7 +352,9 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         service: Optional[str] = None,
         version: Optional[str] = None,
     ) -> Optional[OutboxEvent]:
-        """Adds a non-sensitive event envelope to the current DB transaction.
+        """Inserts a non-sensitive event envelope row within the current (not yet
+        committed) transaction — it becomes durable exactly when `self.db.commit()`
+        for this same request does, which is the whole point of the outbox pattern.
 
         Uses `build_event_type` to guarantee the standardized event_type convention:
         '<service_name>.<model_name>.<action_name>[.<version>]' (e.g., 'HighPerfStatelessService.user.created').
@@ -349,7 +386,17 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 "data": {"id": entity_id, **(extra_data or {})},
             },
         )
-        self.db.add(outbox_event)
+        await self.db.execute(
+            """
+            INSERT INTO outbox_events (id, topic, event_key, event_type, payload)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            outbox_event.id,
+            outbox_event.topic,
+            outbox_event.event_key,
+            outbox_event.event_type,
+            outbox_event.payload,
+        )
         return outbox_event
 
     # --------------------------------------------------------------------------
@@ -365,12 +412,12 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         """Creates entity, invalidates list cache, commits transaction, syncs to ES, and returns read schema."""
         entity: ModelType = await self.before_create(payload)
         try:
-            await self.repo.create(entity)
+            entity = await self.repo.create(entity)
             if self.outbox_enabled and (
                 emit_outbox_event is True
                 or (emit_outbox_event is None and self.auto_outbox_events is True)
             ):
-                self._enqueue_outbox_event("created", entity)
+                await self._enqueue_outbox_event("created", entity)
             await self.cache.invalidate_lists(enabled=cache_enabled)
             if self.db is not None:
                 await self.db.commit()
@@ -390,7 +437,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 logger.warning("Elasticsearch index failed on create (%s): %s", self.resource_name, es_err)
 
             return await self.to_read_schema(entity)
-        except IntegrityError as exc:
+        except asyncpg.exceptions.IntegrityConstraintViolationError as exc:
             if self.db is not None:
                 await self.db.rollback()
             raise ConflictError("Conflict: duplicate unique constraint violation.") from exc
@@ -439,9 +486,6 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
         **filters: Any,
     ) -> List[ReadSchemaType]:
         """Retrieves all entities matching filters with limit and offset."""
-        if hasattr(self.repo, "get_all"):
-            entities = await self.repo.get_all(limit=limit, offset=offset, **filters)
-            return [await self.to_read_schema(e) for e in entities]
         return await self.list_offset(offset=offset, limit=limit, **filters)
 
     async def update(
@@ -458,15 +502,12 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
 
         try:
             await self.before_update(entity, payload)
-            if hasattr(self.repo, "update"):
-                await self.repo.update(entity)
-            else:
-                await self.repo.flush()
+            entity = await self.repo.update(entity)
             if self.outbox_enabled and (
                 emit_outbox_event is True
                 or (emit_outbox_event is None and self.auto_outbox_events is True)
             ):
-                self._enqueue_outbox_event("updated", entity)
+                await self._enqueue_outbox_event("updated", entity)
 
             # Invalidate item and list caches polymorphically
             await self.cache.delete_item(entity_id, enabled=cache_enabled)
@@ -489,7 +530,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
                 logger.warning("Elasticsearch index failed on update (%s): %s", self.resource_name, es_err)
 
             return await self.to_read_schema(entity)
-        except IntegrityError as exc:
+        except asyncpg.exceptions.IntegrityConstraintViolationError as exc:
             if self.db is not None:
                 await self.db.rollback()
             raise ConflictError("Conflict: update violates unique database constraint.") from exc
@@ -529,7 +570,7 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
             emit_outbox_event is True
             or (emit_outbox_event is None and self.auto_outbox_events is True)
         ):
-            self._enqueue_outbox_event("deleted", entity)
+            await self._enqueue_outbox_event("deleted", entity)
 
         # Invalidate item and list caches polymorphically
         await self.cache.delete_item(entity_id, enabled=cache_enabled)
@@ -632,12 +673,14 @@ class BaseService(IBaseService[ModelType, CreateSchemaType, UpdateSchemaType, Re
     ) -> List[ReadSchemaType]:
         """Standard offset-based listing for smaller datasets or admin screens."""
         safe_limit: int = min(100, max(1, limit))
+        sort: Optional[List[str]] = None
+        if order_by:
+            sort = [f"-{order_by}" if descending else order_by]
         entities: Sequence[ModelType] = await self.repo.list(
+            filters=filters,
+            sort=sort,
             offset=offset,
             limit=safe_limit,
-            order_by=order_by,
-            descending=descending,
-            **filters,
         )
         return [await self.to_read_schema(e) for e in entities]
 

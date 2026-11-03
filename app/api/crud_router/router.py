@@ -31,10 +31,10 @@ file, subclass and extend the registry:
 """
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, ClassVar, Dict, List, Optional
+from dataclasses import fields as dataclass_fields
+from typing import Any, ClassVar, Dict, List, Optional, Union, get_args
 
 from fastapi import APIRouter, params
-from sqlalchemy import inspect as sa_inspect
 
 from app.api.crud_router.query_model import ListQueryBase, build_list_query_model
 from app.api.crud_router.routes import (
@@ -49,8 +49,35 @@ from app.api.crud_router.search import add_search_route
 from app.schemas.base import Page, make_partial
 
 
+def _resolve_id_type(model: type) -> type:
+    """Determines the Python type of `model`'s `id` field (for the `{item_id}`
+    path parameter), without any ORM/column introspection.
+
+    Reads only that one field's raw annotation from `dataclasses.fields()` —
+    deliberately not `typing.get_type_hints(model)`, which resolves *every*
+    field, including other fields' `TYPE_CHECKING`-only forward references
+    (e.g. `Category.products: "List[Product]"`) that aren't importable at
+    module level and would raise `NameError` for a lookup that only cares
+    about `id` anyway.
+
+    `Optional[int]` (e.g. `Category`, whose `id` is DB-assigned and `None`
+    before insert) unwraps to plain `int`, since a path parameter is never
+    actually `None`.
+    """
+    id_field = next((f for f in dataclass_fields(model) if f.name == "id"), None)
+    if id_field is None or isinstance(id_field.type, str):
+        return str
+    hint = id_field.type
+    if hint is type(None):
+        return str
+    args = [a for a in get_args(hint) if a is not type(None)]
+    if args:
+        return args[0] if len(args) == 1 else Union[tuple(args)]  # type: ignore[valid-type]
+    return hint
+
+
 class CRUDRouter(APIRouter):
-    """Dynamic generic CRUD router generating typed OpenAPI endpoints for any SQLAlchemy entity."""
+    """Dynamic generic CRUD router generating typed OpenAPI endpoints for any entity."""
 
     ROUTE_BUILDERS: ClassVar[Dict[str, Callable[["CRUDRouter"], None]]] = {
         "list": add_list_route,
@@ -89,17 +116,13 @@ class CRUDRouter(APIRouter):
         self.read_schema = read_schema
         self.page_schema = Page[read_schema]  # type: ignore[valid-type]
 
-        # Determine Primary Key Python type (UUID, int, or str)
-        pk_cols = sa_inspect(model).primary_key
-        pk_col = pk_cols[0] if pk_cols else None
-        try:
-            self.id_type: type = pk_col.type.python_type if pk_col is not None else str
-        except (NotImplementedError, AttributeError):
-            self.id_type = str
+        # Determine Primary Key Python type (UUID, int, or str) from the dataclass's own hints.
+        self.id_type: type = _resolve_id_type(model)
 
-        default_sort = ("created_at", "id") if "created_at" in sa_inspect(model).columns else ("id",)
+        model_field_names = {f.name for f in dataclass_fields(model)}
+        default_sort = ("created_at", "id") if "created_at" in model_field_names else ("id",)
         self.query_model = build_list_query_model(
-            model, filter_fields or {}, sort_fields or default_sort
+            read_schema, filter_fields or {}, sort_fields or default_sort
         )
 
         enabled = set(routes) if routes is not None else set(self.ROUTE_BUILDERS)

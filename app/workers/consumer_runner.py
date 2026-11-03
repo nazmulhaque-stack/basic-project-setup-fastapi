@@ -4,9 +4,11 @@ import asyncio
 import logging
 from typing import Any
 
+import asyncpg
+
 from app.core.config import Settings, get_settings
 from app.core.kafka import KafkaEventProducer, consume_events_forever
-from app.db.session import create_db_engine, create_session_factory
+from app.db.pool import close_db_pool, create_db_pool
 from app.services.inventory_reservations import (
     handle_inventory_reserved,
     run_expiration_sweeper,
@@ -25,8 +27,7 @@ class WorkerSupervisor:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self.engine = create_db_engine(self.settings)
-        self.session_factory = create_session_factory(self.engine)
+        self.pool: asyncpg.Pool | None = None
         self._stop_event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._producer: KafkaEventProducer | None = None
@@ -40,30 +41,33 @@ class WorkerSupervisor:
             await self._stop_event.wait()
             return
 
-        # 1. Start Kafka Producer
+        # 1. Initialize the raw asyncpg connection pool (PgBouncer transaction-pooling compatible)
+        self.pool = await create_db_pool(self.settings)
+
+        # 2. Start Kafka Producer
         self._producer = KafkaEventProducer(self.settings.KAFKA_BOOTSTRAP_SERVERS)
         await self._producer.start()
 
-        # 2. Start Outbox Dispatcher
+        # 3. Start Outbox Dispatcher
         self._outbox_dispatcher = OutboxDispatcher(
-            self.session_factory,
+            self.pool,
             self._producer,
             poll_interval=self.settings.OUTBOX_POLL_INTERVAL,
             batch_size=self.settings.OUTBOX_BATCH_SIZE,
         )
         self._outbox_dispatcher.start()
 
-        # 3. Inventory Consumer handler
+        # 4. Inventory Consumer handler
         async def handle_inventory_event(event: dict[str, Any]) -> None:
             await handle_inventory_reserved(
                 event,
-                self.session_factory,
+                self.pool,
                 self._producer,
                 output_topic=self.settings.KAFKA_EVENTS_TOPIC,
                 dead_letter_topic=self.settings.KAFKA_INVENTORY_DLQ_TOPIC,
             )
 
-        # 4. Spawn consumer and sweeper tasks
+        # 5. Spawn consumer and sweeper tasks
         consumer_task = asyncio.create_task(
             consume_events_forever(
                 bootstrap_servers=self.settings.KAFKA_BOOTSTRAP_SERVERS,
@@ -80,7 +84,7 @@ class WorkerSupervisor:
 
         sweeper_task = asyncio.create_task(
             run_expiration_sweeper(
-                self.session_factory,
+                self.pool,
                 self.settings.KAFKA_EVENTS_TOPIC,
                 interval=self.settings.INVENTORY_RESERVATION_SWEEP_INTERVAL,
                 stop_event=self._stop_event,
@@ -104,7 +108,7 @@ class WorkerSupervisor:
         if self._producer:
             await self._producer.stop()
 
-        await self.engine.dispose()
+        await close_db_pool(self.pool)
         logger.info("WorkerSupervisor shutdown complete.")
 
     def stop(self) -> None:

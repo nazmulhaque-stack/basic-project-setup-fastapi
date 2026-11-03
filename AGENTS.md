@@ -1,7 +1,7 @@
 # Antigravity Workspace Guidelines: Senior Backend & System Architecture
 
 Welcome to the **FastAPI High-Performance Backend Architecture** project.
-This repository implements an enterprise-grade, clean architecture backend designed to serve **100,000 (1 lakh) concurrent requests** with asynchronous PostgreSQL/MySQL, PgBouncer transaction pooling, Redis 7 Cluster caching, Elasticsearch 8 CQRS search, AES-256-GCM AEAD cryptography, and Kubernetes deployment.
+This repository implements an enterprise-grade, clean architecture backend designed to serve **100,000 (1 lakh) concurrent requests** with asynchronous PostgreSQL via raw `asyncpg` (no ORM), PgBouncer transaction pooling, Redis 7 Cluster caching, Elasticsearch 8 CQRS search, AES-256-GCM AEAD cryptography, and Kubernetes deployment.
 
 ---
 
@@ -13,17 +13,17 @@ This repository implements an enterprise-grade, clean architecture backend desig
   - Domain services (`UserService`, `ProductService`, `CategoryService`) **must inherit from `BaseService`** and implement pluggable lifecycle hooks (`before_create`, `before_update`, `before_delete`, `after_create`, `after_update`, `after_delete`, `to_read_schema`, `to_cache_dict`). The `after_*` hooks run only once their corresponding mutation has committed.
   - Polymorphic cache handling via `NullCache` eliminates defensive `if self.cache is not None:` branches.
   - Never duplicate generic CRUD queries or transaction commits in domain services.
-- **Repository Persistence (`app/repositories/`)**: Encapsulates all SQLAlchemy 2.0 Async queries, dynamic filtering (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `like`, `ilike`), ordering, and Keyset cursor pagination.
-  - **Repositories must NEVER call `commit()` or `rollback()`**. They only flush state changes (`await session.flush()`).
-  - Shared `AsyncSession` dependency enables atomic multi-repository business transactions.
-- **Database Models (`app/models/`)**: Declarative SQLAlchemy models inheriting from `Base` (`app/models/base.py` / `app/db/base.py`).
+- **Repository Persistence (`app/repositories/`)**: Hand-written `asyncpg` SQL per entity — there is no ORM and no generic filter/operator dispatch engine. Each repository (`UserRepository`, `ProductRepository`, `CategoryRepository`, `EmployeeRepository`) writes its own `_build_where`/`_build_order_by` branches for exactly the filters/sort fields its `CRUDRouter` declares, plus hand-written Keyset cursor pagination (`list_keyset`, `app/repositories/sql_helpers.py:keyset_seek_clause`).
+  - **Repositories must NEVER call `commit()` or `rollback()`**. They only `fetch`/`fetchrow`/`fetchval`/`execute` via the active `UnitOfWork` — there is no separate flush step; statements apply immediately inside the still-open transaction.
+  - Shared `UnitOfWork` (one acquired `asyncpg` connection + one open transaction, `app/db/pool.py`) enables atomic multi-repository business transactions.
+- **Database Models (`app/models/`)**: Plain `@dataclass` models inheriting from `Base` (`app/models/base.py`) — no ORM, no declarative mapping.
 - **Schemas (`app/schemas/`)**: Pydantic v2 DTOs (`model_config = ConfigDict(from_attributes=True)`).
 
 ---
 
 ## 2. Database Connection Multiplexing & PgBouncer
 - **Transaction Pooling Mode**: PgBouncer multiplexes client sockets across pre-warmed backend connections to PostgreSQL.
-- **`statement_cache_size = 0` (Mandatory)**: In `app/core/database.py`, `connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0}` is strictly required to prevent `prepared statement "_asyncpg_stmt_*" does not exist` crashes across pooled connections.
+- **`statement_cache_size=0` (Mandatory)**: In `app/db/pool.py`, `asyncpg.create_pool(..., statement_cache_size=0, ...)` is strictly required to prevent `prepared statement "_asyncpg_stmt_*" does not exist` crashes across pooled connections.
 - **Connection Sizing Formula for 100k Concurrency**:
   $$\text{Total App Sockets} = \text{Nodes (16)} \times \text{Workers/Node (8)} \times (\text{pool\_size} (5) + \text{max\_overflow} (5)) = 1,280 \le \text{PgBouncer MAX\_CLIENT\_CONN} (2,000)$$
   $$\text{PgBouncer DEFAULT\_POOL\_SIZE} (80) \le \text{PostgreSQL max\_connections} (150) - 30 \text{ Reserved} = 120$$
@@ -70,9 +70,9 @@ This repository implements an enterprise-grade, clean architecture backend desig
 ---
 
 ## 7. Query Performance & Keyset Pagination
-- Large list endpoints must use **Keyset (cursor) pagination** (`order_by(created_at, id)` composite seek) instead of deep offset scans.
+- Large list endpoints must use **Keyset (cursor) pagination** (`ORDER BY created_at, id` with a composite seek `WHERE` clause) instead of deep offset scans.
 - Cursor token format: URL-safe Base64 of `timestamp|uuid`.
-- Prevent N+1 queries by using `selectinload` or `joinedload` on relationships.
+- Prevent N+1 queries: a relationship that needs eager-loading gets a dedicated repository method doing one extra hand-written query (e.g. `ProductRepository.get_with_category`), never a per-row query loop.
 
 ---
 

@@ -1,9 +1,38 @@
 """Pytest configuration and shared test fixtures."""
 
+from collections.abc import AsyncGenerator
 from typing import Any, Dict, List, Optional
+
+import asyncpg
 import pytest
 
+from app.core.config import get_settings
 from app.core.security import CryptoService
+from app.db.pool import close_db_pool, create_db_pool
+
+
+@pytest.fixture
+async def pg_pool() -> AsyncGenerator[asyncpg.Pool, None]:
+    """Real asyncpg pool against `DATABASE_URL`, for integration tests that need
+    actual Postgres behavior (constraints, `RETURNING`, `FOR UPDATE SKIP LOCKED`)
+    that no in-memory substitute can faithfully reproduce now that the project
+    talks to Postgres only via raw asyncpg (no SQLAlchemy, no SQLite fallback).
+
+    Skips (not fails) the test when no Postgres is reachable, so this suite
+    stays green in sandboxes without a database while still exercising real
+    integration behavior wherever one is configured (e.g. the project's own
+    docker-compose Postgres).
+    """
+    settings = get_settings()
+    try:
+        pool = await create_db_pool(settings)
+    except Exception as exc:
+        pytest.skip(f"No reachable Postgres database for integration tests: {exc}")
+        return
+    try:
+        yield pool
+    finally:
+        await close_db_pool(pool)
 
 # Stable 32-byte test keys (64 hex characters)
 TEST_KEY_V1: bytes = bytes.fromhex("1111111111111111111111111111111111111111111111111111111111111111")

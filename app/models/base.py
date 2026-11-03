@@ -1,19 +1,20 @@
-"""Declarative base class and reusable mixins for all SQLAlchemy 2.0 models."""
+"""Marker base for domain row dataclasses (no ORM, no declarative metaclass).
 
-from app.db.base import (
-    Base,
-    IdIntMixin,
-    IdMixin,
-    IdUuidMixin,
-    NAMING_CONVENTION,
-    TimestampMixin,
-)
+Models are plain `@dataclass`es representing exactly the columns a query
+returns. They are constructed by their repository from an `asyncpg.Record`
+(or, before insert, from a Create-schema's `.model_dump()`); there is no
+session, no lazy loading, and no identity map. Optional relationship fields
+(e.g. `Product.category_rel`) default to `None` and are populated only by
+repository methods that explicitly fetch them (the hand-written equivalent of
+`selectinload`).
+"""
 
-__all__ = [
-    "Base",
-    "NAMING_CONVENTION",
-    "IdMixin",
-    "IdIntMixin",
-    "IdUuidMixin",
-    "TimestampMixin",
-]
+from dataclasses import dataclass
+
+
+@dataclass
+class Base:
+    """Marker base class for domain row dataclasses."""
+
+
+__all__ = ["Base"]

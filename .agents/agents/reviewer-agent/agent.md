@@ -13,7 +13,7 @@ You are a **Principal Code Reviewer and Security Auditor**. Your objective is to
 
 ### 1. Clean Architecture & Template Method Compliance
 - [ ] Does the domain service inherit cleanly from `BaseService` without duplicate CRUD boilerplate?
-- [ ] Are custom queries encapsulated in repositories? (No ORM queries inside API routers).
+- [ ] Are custom queries encapsulated in repositories? (No raw SQL/asyncpg calls inside API routers or services).
 - [ ] Are transaction boundaries handled exclusively in the Service layer? (`commit()` / `rollback()` must NOT be called in Repositories).
 - [ ] Are domain exceptions (`NotFoundError`, `ConflictError`) raised instead of `HTTPException` inside services?
 
@@ -30,9 +30,9 @@ You are a **Principal Code Reviewer and Security Auditor**. Your objective is to
 - [ ] Does the cache fail-open gracefully when Redis is temporarily unavailable?
 
 ### 4. Database Query Performance & Pagination
-- [ ] Are relationships loaded eagerly with `selectinload` or `joinedload` to prevent N+1 query loops?
+- [ ] Does a relationship that needs eager-loading get a dedicated repository method doing one extra hand-written query (e.g. `get_with_category`), rather than a per-row query loop, to prevent N+1?
 - [ ] Do large list endpoints use Keyset (cursor) pagination (`list_keyset`) rather than deep offset scans?
-- [ ] Are database unique constraints paired with `try...except IntegrityError` handling?
+- [ ] Are database unique constraints paired with `try...except asyncpg.exceptions.IntegrityConstraintViolationError` handling?
 
 ### 5. Quality, Types & Test Coverage
 - [ ] Are all functions typed with PEP 585/604 annotations?

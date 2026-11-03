@@ -7,10 +7,9 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 import uuid
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.elasticsearch import IElasticsearchService
 from app.core.exceptions import BusinessRuleError, ConflictError, NotFoundError
+from app.db.pool import UnitOfWork
 from app.models.product import Product
 from app.repositories.product import ProductRepository
 from app.schemas.product import ProductCreate, ProductPage, ProductRead, ProductUpdate
@@ -25,7 +24,7 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
 
     def __init__(
         self,
-        db: Optional[AsyncSession] = None,
+        db: Optional[UnitOfWork] = None,
         repo: Optional[ProductRepository] = None,
         cache: Optional[ICacheService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
@@ -67,7 +66,7 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         if self.db is not None:
             from app.repositories.category import CategoryRepository
             categories = CategoryRepository(self.db)
-            if not await categories.exists(id=category_id, is_active=True):
+            if not await categories.exists_active(category_id):
                 raise BusinessRuleError(f"Category id={category_id} does not exist or is inactive.")
 
     async def before_create(self, payload: ProductCreate) -> Product:
@@ -118,10 +117,13 @@ class ProductService(BaseService[Product, ProductCreate, ProductUpdate, ProductR
         if not success:
             raise BusinessRuleError(f"Not enough stock to remove {-delta} unit(s).")
 
-        self._enqueue_outbox_event("stock_adjusted", product)
+        await self._enqueue_outbox_event("stock_adjusted", product)
+        # change_stock_atomic() ran a separate UPDATE from the earlier SELECT above,
+        # so re-fetch to reflect the new stock/updated_at (no ORM session identity
+        # map to "refresh" in place the way the SQLAlchemy version did).
+        product = await self.repo.get(product_id)
         if self.db is not None:
             await self.db.commit()
-            await self.db.refresh(product)
 
         # Invalidate item and list caches polymorphically
         await self.cache.delete_item(product_id)

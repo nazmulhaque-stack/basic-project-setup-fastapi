@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Database Migration & Schema Health Helper.
+"""Database Model & Repository Health Helper.
 
-Validates Alembic configuration, ensures all SQLAlchemy models inherit from Base,
-verifies that primary keys and index definitions exist, and checks model exports.
+Validates that every dataclass model under `app.models` inherits from `Base`,
+has an `id` field and a `created_at` field (needed for keyset cursor
+pagination), and has a matching hand-written repository module under
+`app.repositories`. There is no migration tool in this project (schema
+changes are applied directly against Postgres), so this script checks model
+*shape*, not migration state.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields as dataclass_fields, is_dataclass
 import importlib
 import inspect
 from pathlib import Path
@@ -21,9 +26,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.models.base import Base
 
+# Internal event/ledger models with no CRUDRouter exposure, accessed only via
+# hand-written SQL directly inside their owning service (app/services/outbox.py,
+# app/services/inventory_reservations.py) — they never had a dedicated repository.
+_NO_REPOSITORY_EXPECTED = {"OutboxEvent", "InventoryReservation"}
+
 
 def inspect_models() -> List[Type[Base]]:
-    """Discovers all SQLAlchemy models registered under app.models."""
+    """Discovers all dataclass models registered under app.models."""
     import app.models as models_pkg
 
     discovered: List[Type[Base]] = []
@@ -35,57 +45,61 @@ def inspect_models() -> List[Type[Base]]:
 
 
 def validate_schema_health() -> int:
-    """Verifies that all models have proper primary keys, table names, and timestamps."""
+    """Verifies that all models are proper dataclasses with an id/created_at field
+    and a matching hand-written repository module."""
     print("======================================================")
-    print("  Database Schema & Model Health Inspection          ")
+    print("  Database Model & Repository Health Inspection      ")
     print("======================================================")
 
     models = inspect_models()
-    print(f"Found {len(models)} registered SQLAlchemy models:")
+    print(f"Found {len(models)} registered dataclass models:")
     errors: List[str] = []
 
     for model in models:
-        table_name = getattr(model, "__tablename__", None)
-        print(f"\n  • Model: {model.__name__} (Table: '{table_name}')")
+        print(f"\n  • Model: {model.__name__}")
 
-        if not table_name:
-            errors.append(f"{model.__name__} is missing '__tablename__'.")
+        if not is_dataclass(model):
+            errors.append(f"{model.__name__} is not a dataclass.")
+            continue
 
-        # Inspect columns
-        cols = model.__table__.columns
-        col_names = [c.name for c in cols]
-        print(f"    Columns ({len(cols)}): {', '.join(col_names)}")
+        field_names = [f.name for f in dataclass_fields(model)]
+        print(f"    Fields ({len(field_names)}): {', '.join(field_names)}")
 
-        # Check primary key
-        pks = [c.name for c in cols if c.primary_key]
-        if not pks:
-            errors.append(f"{model.__name__} has NO primary key defined!")
-        else:
-            print(f"    Primary Key(s): {', '.join(pks)}")
+        if "id" not in field_names:
+            errors.append(f"{model.__name__} has NO 'id' field defined!")
 
-        # Check created_at for cursor pagination compatibility
-        if "created_at" not in col_names:
+        if "created_at" not in field_names:
             print(f"    [WARN] 'created_at' missing on {model.__name__} (needed for keyset cursor pagination)")
 
-    # Verify alembic.ini existence
-    alembic_ini = PROJECT_ROOT / "alembic.ini"
-    if not alembic_ini.exists():
-        errors.append("alembic.ini not found at project root!")
-    else:
-        print(f"\n✓ alembic.ini confirmed present at {alembic_ini.relative_to(PROJECT_ROOT)}")
+        # Every CRUD-exposed model should have a matching hand-written repository,
+        # since this project dropped the generic SQLAlchemy-based repository engine.
+        if model.__name__ in _NO_REPOSITORY_EXPECTED:
+            print(f"    Repository: none expected (internal event/ledger model)")
+            continue
+
+        repo_module_name = f"app.repositories.{model.__name__.lower()}"
+        try:
+            repo_module = importlib.import_module(repo_module_name)
+            repo_class_name = f"{model.__name__}Repository"
+            if not hasattr(repo_module, repo_class_name):
+                errors.append(f"{repo_module_name} does not define {repo_class_name}.")
+            else:
+                print(f"    Repository: {repo_module_name}.{repo_class_name}")
+        except ModuleNotFoundError:
+            errors.append(f"No repository module found at {repo_module_name} for {model.__name__}.")
 
     if errors:
-        print("\n[FAILED] Database schema validation errors:")
+        print("\n[FAILED] Database model validation errors:")
         for err in errors:
             print(f"  ✗ {err}")
         return 1
 
-    print("\n✓ All SQLAlchemy models are structurally healthy and ready for migrations.")
+    print("\n✓ All models are structurally healthy and have a matching repository.")
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Alembic & Schema Health Helper")
+    parser = argparse.ArgumentParser(description="Database Model & Repository Health Helper")
     parser.add_argument("--check", action="store_true", default=True, help="Run schema health checks")
     args = parser.parse_args()
     return validate_schema_health()

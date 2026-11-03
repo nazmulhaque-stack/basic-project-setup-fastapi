@@ -8,11 +8,10 @@ import logging
 from typing import Any, Dict, Optional
 import uuid
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.elasticsearch import IElasticsearchService
 from app.core.exceptions import ConflictError
 from app.core.security import CryptoService, DecryptionError
+from app.db.pool import UnitOfWork
 from app.models.user import User
 from app.repositories.user import UserRepository
 from app.schemas.user import UserCreate, UserPage, UserRead, UserUpdate
@@ -27,7 +26,7 @@ class UserService(BaseService[User, UserCreate, UserUpdate, UserRead, uuid.UUID]
 
     def __init__(
         self,
-        db: Optional[AsyncSession] = None,
+        db: Optional[UnitOfWork] = None,
         repo: Optional[UserRepository] = None,
         cache: Optional[ICacheService] = None,
         crypto: Optional[CryptoService] = None,

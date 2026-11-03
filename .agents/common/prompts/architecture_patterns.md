@@ -25,8 +25,9 @@ Comprehensive technical guidelines for developing and reviewing components withi
 ┌────────────────────────────────────────────────────────┐
 │                  Repository Persistence Layer          │
 │                 app/repositories/*.py                  │
-│    (SQLAlchemy 2.0 Async, dynamic filtering,           │
-│     keyset cursor pagination, flushes)                 │
+│    (raw asyncpg, hand-written SQL per entity —         │
+│     no ORM, no generic filter engine — keyset          │
+│     cursor pagination)                                 │
 └───────────────────────────┬────────────────────────────┘
                             │ Interacts with DB
                             ▼
@@ -38,7 +39,7 @@ Comprehensive technical guidelines for developing and reviewing components withi
 ### Layer Dependency Rules:
 1. **Controllers (API endpoints)** only depend on **Services** via `Annotated[Service, Depends(get_service)]`.
 2. **Services** depend on **Repositories**, **Cache**, **CryptoService**, and **ElasticsearchService**.
-3. **Repositories** depend on **AsyncSession** and **SQLAlchemy Models**.
+3. **Repositories** depend on **`UnitOfWork`** (a thin asyncpg connection + transaction wrapper, `app/db/pool.py`) and plain dataclass **models**. There is no ORM session and no generic query engine — each repository hand-writes its own SQL.
 4. **Never invert dependencies**: Controllers must never query repositories directly. Repositories must never access HTTP requests.
 
 ---
@@ -126,7 +127,7 @@ Our architecture enforces **Keyset (cursor) B-Tree seeks**:
 1. **Transaction Pooling Mode**:
    - PgBouncer holds idle client connections, binding a PostgreSQL server socket ONLY for the duration of a transaction (`BEGIN ... COMMIT`).
 2. **Mandatory Statement Cache Sizing**:
-   - `statement_cache_size = 0` and `prepared_statement_cache_size = 0` in asyncpg `connect_args`.
+   - `statement_cache_size=0` passed directly to `asyncpg.create_pool()` (see `app/db/pool.py`).
    - Prepared statements in asyncpg are per-connection and fail when PgBouncer switches physical connections between transactions.
 3. **Connection Budget Math for 100k Concurrency**:
    - 16 Hosts × 8 Workers = 128 ASGI Worker Processes.

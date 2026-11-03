@@ -1,6 +1,5 @@
-"""Database package re-exporting Base, engine, and session management."""
+"""Database package re-exporting asyncpg pool management."""
 
-from app.db.base import Base
-from app.db.session import create_db_engine, create_session_factory, get_db
+from app.db.pool import close_db_pool, create_db_pool, get_db, get_pool, get_session
 
-__all__ = ["Base", "get_db", "create_db_engine", "create_session_factory"]
+__all__ = ["create_db_pool", "close_db_pool", "get_pool", "get_db", "get_session"]

@@ -4,7 +4,6 @@ import logging
 from typing import Any, Dict, Union
 from fastapi import APIRouter, Request, status
 from fastapi.responses import ORJSONResponse
-from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +38,10 @@ async def readyz(request: Request) -> Union[Dict[str, Any], ORJSONResponse]:
 
     # 1. Check Database connection (Critical)
     try:
-        session_factory = getattr(request.app.state, "session_factory", None)
-        if session_factory is not None:
-            async with session_factory() as session:
-                await session.execute(text("SELECT 1"))
+        db_pool = getattr(request.app.state, "db_pool", None)
+        if db_pool is not None:
+            async with db_pool.acquire() as connection:
+                await connection.fetchval("SELECT 1")
             db_ok = True
     except Exception as exc:
         logger.error("Readiness check DB error: %s", exc)

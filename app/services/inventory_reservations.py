@@ -1,19 +1,15 @@
-"""Idempotent handling and expiration of inventory reservation events."""
+"""Idempotent handling and expiration of inventory reservation events (raw asyncpg)."""
 
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import uuid
-from typing import Any
+from typing import Any, Optional
 
+import asyncpg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import or_, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.kafka import KafkaEventProducer
-from app.models.inventory_reservation import InventoryReservation
-from app.models.outbox import OutboxEvent
-from app.models.product import Product
 from app.services.base import format_event_type
 
 logger = logging.getLogger(__name__)
@@ -71,9 +67,30 @@ async def _dead_letter(
     )
 
 
+async def _insert_outbox_event(
+    connection: asyncpg.Connection,
+    *,
+    topic: str,
+    event_key: str,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    await connection.execute(
+        """
+        INSERT INTO outbox_events (id, topic, event_key, event_type, payload)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        uuid.uuid4(),
+        topic,
+        event_key,
+        event_type,
+        payload,
+    )
+
+
 async def handle_inventory_reserved(
     event: dict[str, Any],
-    session_factory: async_sessionmaker[AsyncSession],
+    pool: asyncpg.Pool,
     producer: KafkaEventProducer,
     *,
     output_topic: str,
@@ -99,37 +116,40 @@ async def handle_inventory_reserved(
         return
 
     payload = envelope.payload
-    product_uuid: uuid.UUID | None
+    product_uuid: Optional[uuid.UUID]
     try:
         product_uuid = uuid.UUID(payload.product_id)
     except ValueError:
         product_uuid = None
 
-    dead_letter_reason: str | None = None
-    async with session_factory() as session:
-        async with session.begin():
-            existing = await session.scalar(
-                select(InventoryReservation).where(
-                    or_(
-                        InventoryReservation.reservation_id == payload.reservation_id,
-                        InventoryReservation.event_id == envelope.event_id,
-                    )
-                )
+    dead_letter_reason: Optional[str] = None
+    sku = payload.product_id.strip().upper()
+
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            existing = await connection.fetchrow(
+                """
+                SELECT * FROM inventory_reservations
+                WHERE reservation_id = $1 OR event_id = $2
+                """,
+                payload.reservation_id,
+                envelope.event_id,
             )
             if existing is not None:
-                existing_product = await session.get(Product, existing.product_id)
+                existing_product = await connection.fetchrow(
+                    "SELECT * FROM products WHERE id = $1", existing["product_id"]
+                )
                 same_request = (
-                    existing.reservation_id == payload.reservation_id
-                    and existing.order_id == payload.order_id
-                    and existing.quantity == payload.quantity
-                    and existing.location_id == payload.location_id
+                    existing["reservation_id"] == payload.reservation_id
+                    and existing["order_id"] == payload.order_id
+                    and existing["quantity"] == payload.quantity
+                    and existing["location_id"] == payload.location_id
                     and (
-                        existing.product_id == product_uuid
+                        existing["product_id"] == product_uuid
                         or (
                             product_uuid is None
                             and existing_product is not None
-                            and existing_product.sku
-                            == payload.product_id.strip().upper()
+                            and existing_product["sku"] == sku
                         )
                     )
                 )
@@ -139,87 +159,83 @@ async def handle_inventory_reserved(
                     "event_id or reservation_id was reused with a different payload"
                 )
             else:
-                product_query = select(Product).where(
-                    Product.sku == payload.product_id.strip().upper()
-                )
                 if product_uuid is not None:
-                    product_query = select(Product).where(
-                        or_(
-                            Product.id == product_uuid,
-                            Product.sku == payload.product_id.strip().upper(),
-                        )
+                    product = await connection.fetchrow(
+                        "SELECT * FROM products WHERE id = $1 OR sku = $2",
+                        product_uuid,
+                        sku,
                     )
-                product = await session.scalar(product_query)
+                else:
+                    product = await connection.fetchrow(
+                        "SELECT * FROM products WHERE sku = $1", sku
+                    )
+
                 if product is None:
-                    dead_letter_reason = (
-                        f"Unknown product identifier: {payload.product_id}"
-                    )
+                    dead_letter_reason = f"Unknown product identifier: {payload.product_id}"
                 else:
                     now = datetime.now(timezone.utc)
                     expires_at = now + timedelta(minutes=payload.ttl_minutes)
-                    result = await session.execute(
-                        update(Product)
-                        .where(
-                            Product.id == product.id,
-                            Product.stock - Product.reserved_quantity
-                            >= payload.quantity,
-                        )
-                        .values(
-                            reserved_quantity=Product.reserved_quantity
-                            + payload.quantity
-                        )
+                    result = await connection.execute(
+                        """
+                        UPDATE products
+                        SET reserved_quantity = reserved_quantity + $2, updated_at = now()
+                        WHERE id = $1 AND stock - reserved_quantity >= $2
+                        """,
+                        product["id"],
+                        payload.quantity,
                     )
-                    is_reserved = result.rowcount == 1
-                    session.add(
-                        InventoryReservation(
-                            event_id=envelope.event_id,
-                            reservation_id=payload.reservation_id,
-                            order_id=payload.order_id,
-                            product_id=product.id,
-                            quantity=payload.quantity,
-                            location_id=payload.location_id,
-                            status="reserved" if is_reserved else "rejected",
-                            expires_at=expires_at if is_reserved else None,
-                        )
+                    is_reserved = result.endswith(" 1")
+
+                    await connection.execute(
+                        """
+                        INSERT INTO inventory_reservations
+                            (id, event_id, reservation_id, order_id, product_id,
+                             quantity, location_id, status, expires_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        """,
+                        uuid.uuid4(),
+                        envelope.event_id,
+                        payload.reservation_id,
+                        payload.order_id,
+                        product["id"],
+                        payload.quantity,
+                        payload.location_id,
+                        "reserved" if is_reserved else "rejected",
+                        expires_at if is_reserved else None,
                     )
+
                     if not is_reserved:
-                        failure_id = uuid.uuid4()
                         failure_type = format_event_type("inventory", "reservation_failed", "v1")
-                        session.add(
-                            OutboxEvent(
-                                id=failure_id,
-                                topic=output_topic,
-                                event_key=str(product.id),
-                                event_type=failure_type,
-                                payload={
-                                    "event_id": str(failure_id),
-                                    "event_type": failure_type,
-                                    "timestamp": now.isoformat(),
-                                    "payload": {
-                                        "reservation_id": payload.reservation_id,
-                                        "order_id": payload.order_id,
-                                        "product_id": payload.product_id,
-                                        "quantity": payload.quantity,
-                                        "location_id": payload.location_id,
-                                        "reason": "insufficient_stock",
-                                    },
+                        failure_id = uuid.uuid4()
+                        available = product["stock"] - product["reserved_quantity"]
+                        await _insert_outbox_event(
+                            connection,
+                            topic=output_topic,
+                            event_key=str(product["id"]),
+                            event_type=failure_type,
+                            payload={
+                                "event_id": str(failure_id),
+                                "event_type": failure_type,
+                                "timestamp": now.isoformat(),
+                                "payload": {
+                                    "reservation_id": payload.reservation_id,
+                                    "order_id": payload.order_id,
+                                    "product_id": payload.product_id,
+                                    "quantity": payload.quantity,
+                                    "location_id": payload.location_id,
+                                    "reason": "insufficient_stock",
                                 },
-                            )
+                            },
                         )
                         logger.warning(
                             "Rejected reservation %s: requested %d, available %d.",
                             payload.reservation_id,
                             payload.quantity,
-                            product.available_quantity,
+                            available,
                         )
 
     if dead_letter_reason is not None:
-        await _dead_letter(
-            event,
-            dead_letter_reason,
-            producer,
-            dead_letter_topic,
-        )
+        await _dead_letter(event, dead_letter_reason, producer, dead_letter_topic)
         logger.critical(
             "Dead-lettered inventory reservation %s: %s",
             payload.reservation_id,
@@ -228,7 +244,7 @@ async def handle_inventory_reserved(
 
 
 async def release_expired_reservations_once(
-    session_factory: async_sessionmaker[AsyncSession],
+    pool: asyncpg.Pool,
     output_topic: str,
     *,
     batch_size: int = 100,
@@ -236,67 +252,67 @@ async def release_expired_reservations_once(
     """Release one batch of expired reservations without changing on-hand stock."""
     released = 0
     now = datetime.now(timezone.utc)
-    async with session_factory() as session:
-        async with session.begin():
-            result = await session.execute(
-                select(InventoryReservation)
-                .where(
-                    InventoryReservation.status == "reserved",
-                    InventoryReservation.expires_at <= now,
-                )
-                .order_by(InventoryReservation.expires_at)
-                .limit(batch_size)
-                .with_for_update(skip_locked=True)
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            reservations = await connection.fetch(
+                """
+                SELECT * FROM inventory_reservations
+                WHERE status = 'reserved' AND expires_at <= $1
+                ORDER BY expires_at
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                now,
+                batch_size,
             )
-            reservations = result.scalars().all()
             for reservation in reservations:
-                result = await session.execute(
-                    update(Product)
-                    .where(
-                        Product.id == reservation.product_id,
-                        Product.reserved_quantity >= reservation.quantity,
-                    )
-                    .values(
-                        reserved_quantity=Product.reserved_quantity
-                        - reservation.quantity
-                    )
+                result = await connection.execute(
+                    """
+                    UPDATE products
+                    SET reserved_quantity = reserved_quantity - $2
+                    WHERE id = $1 AND reserved_quantity >= $2
+                    """,
+                    reservation["product_id"],
+                    reservation["quantity"],
                 )
-                if result.rowcount != 1:
+                if not result.endswith(" 1"):
                     raise RuntimeError(
                         "Could not release expired reservation "
-                        f"{reservation.reservation_id}; inventory state is inconsistent."
+                        f"{reservation['reservation_id']}; inventory state is inconsistent."
                     )
 
-                reservation.status = "expired"
-                event_id = uuid.uuid4()
+                await connection.execute(
+                    "UPDATE inventory_reservations SET status = 'expired' WHERE id = $1",
+                    reservation["id"],
+                )
+
                 event_type = format_event_type("inventory", "reservation_expired", "v1")
-                session.add(
-                    OutboxEvent(
-                        id=event_id,
-                        topic=output_topic,
-                        event_key=str(reservation.product_id),
-                        event_type=event_type,
-                        payload={
-                            "event_id": str(event_id),
-                            "event_type": event_type,
-                            "timestamp": now.isoformat(),
-                            "payload": {
-                                "reservation_id": reservation.reservation_id,
-                                "order_id": reservation.order_id,
-                                "product_id": str(reservation.product_id),
-                                "quantity": reservation.quantity,
-                                "location_id": reservation.location_id,
-                                "reason": "ttl_expired",
-                            },
+                event_id = uuid.uuid4()
+                await _insert_outbox_event(
+                    connection,
+                    topic=output_topic,
+                    event_key=str(reservation["product_id"]),
+                    event_type=event_type,
+                    payload={
+                        "event_id": str(event_id),
+                        "event_type": event_type,
+                        "timestamp": now.isoformat(),
+                        "payload": {
+                            "reservation_id": reservation["reservation_id"],
+                            "order_id": reservation["order_id"],
+                            "product_id": str(reservation["product_id"]),
+                            "quantity": reservation["quantity"],
+                            "location_id": reservation["location_id"],
+                            "reason": "ttl_expired",
                         },
-                    )
+                    },
                 )
                 released += 1
     return released
 
 
 async def run_expiration_sweeper(
-    session_factory: async_sessionmaker[AsyncSession],
+    pool: asyncpg.Pool,
     output_topic: str,
     *,
     interval: float,
@@ -305,10 +321,7 @@ async def run_expiration_sweeper(
     """Periodically release expired reservations until application shutdown."""
     while not stop_event.is_set():
         try:
-            released = await release_expired_reservations_once(
-                session_factory,
-                output_topic,
-            )
+            released = await release_expired_reservations_once(pool, output_topic)
             if released:
                 logger.info("Released %d expired inventory reservation(s).", released)
         except asyncio.CancelledError:
