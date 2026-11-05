@@ -17,8 +17,8 @@ from app.models.user import User
 from app.repositories.user import UserRepository
 from app.schemas.base import decode_cursor, encode_cursor
 from app.schemas.user import UserCreate, UserPage, UserRead, UserUpdate
+from app.core.cache_interface import ICacheService, NullCache
 from app.services.cache import DynamicRedisCache
-from app.services.interface import ICacheService, NullCache
 
 logger = logging.getLogger(__name__)
 

@@ -25,7 +25,7 @@ from redis.asyncio import Redis, RedisCluster
 from redis.exceptions import RedisError
 
 from app.core.config import CacheOperationFlags, Settings, get_settings
-from app.services.interface import ICacheService
+from app.core.cache_interface import ICacheService
 
 logger = logging.getLogger(__name__)
 

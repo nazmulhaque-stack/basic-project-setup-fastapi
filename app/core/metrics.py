@@ -12,8 +12,6 @@ Metrics exposed:
   redis_operation_duration_seconds{operation}              Histogram
   elasticsearch_operations_total{operation, index, status} Counter
   elasticsearch_operation_duration_seconds{operation}      Histogram
-  outbox_events_pending                                     Gauge
-  outbox_events_processed_total                            Counter
   cache_hits_total{prefix}                                 Counter
   cache_misses_total{prefix}                               Counter
 """
@@ -182,18 +180,6 @@ class MetricsRegistry:
         buckets=_ES_LATENCY_BUCKETS,
     )
 
-    # ------------------------------------------------------------------
-    # Transactional Outbox
-    # ------------------------------------------------------------------
-    outbox_events_pending: Gauge = Gauge(  # type: ignore[valid-type]
-        "outbox_events_pending",
-        "Number of domain events currently waiting in the outbox table.",
-    )
-
-    outbox_events_processed_total: Counter = Counter(  # type: ignore[valid-type]
-        "outbox_events_processed_total",
-        "Cumulative domain events successfully dispatched from the outbox.",
-    )
 
     # ------------------------------------------------------------------
     # Cache
@@ -291,17 +277,6 @@ class MetricsRegistry:
             operation=operation,
         ).observe(duration_seconds)
 
-    def record_outbox_pending(self, count: int) -> None:
-        """Update the outbox pending events gauge.
-
-        Args:
-            count: Current number of unprocessed outbox rows.
-        """
-        self.outbox_events_pending.set(count)
-
-    def record_outbox_processed(self) -> None:
-        """Increment the processed outbox events counter by one."""
-        self.outbox_events_processed_total.inc()
 
     def record_cache_hit(self, prefix: str) -> None:
         """Increment the cache-hit counter for *prefix*.

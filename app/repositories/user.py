@@ -6,7 +6,6 @@ import uuid
 
 from app.db.pool import UnitOfWork
 from app.models.user import User
-from app.repositories.sql_helpers import keyset_seek_clause
 
 
 def _row_to_user(row: Any) -> User:
@@ -93,10 +92,10 @@ class UserRepository:
             params.append(role)
             clauses.append(f"role = ${len(params)}")
 
-        seek, seek_params = keyset_seek_clause("created_at", "id", cursor_dt, cursor_id, len(params) + 1)
-        if seek:
-            clauses.append(seek)
-            params.extend(seek_params)
+        if cursor_dt is not None and cursor_id is not None:
+            p1, p2 = len(params) + 1, len(params) + 2
+            clauses.append(f"(created_at > ${p1} OR (created_at = ${p1} AND id > ${p2}))")
+            params.extend([cursor_dt, cursor_id])
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         safe_limit = min(100, max(1, limit))

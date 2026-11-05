@@ -1,13 +1,13 @@
 """Elasticsearch 8 Asynchronous CQRS Search Engine Client.
 
-Provides high-throughput search offloading to serve 100k+ concurrent search and faceted queries,
-freeing PostgreSQL and PgBouncer for transactional writes.
-Includes Null Object Pattern (NullElasticsearch) to fail-open gracefully when ES is disabled or offline.
+Provides high-throughput search offloading for full-text and fuzzy queries.
+Includes Null Object Pattern (NullElasticsearch) to fail-open gracefully when ES is offline.
 """
 
 from abc import ABC, abstractmethod
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
+
 from fastapi import Request
 
 try:
@@ -40,17 +40,6 @@ class IElasticsearchService(ABC):
         pass
 
     @abstractmethod
-    async def search_documents(
-        self,
-        index: str,
-        query: Union[str, Dict[str, Any]],
-        limit: int = 20,
-        offset: int = 0,
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """Executes full-text or structured query against Elasticsearch index."""
-        pass
-
-    @abstractmethod
     async def search(
         self,
         index: str,
@@ -58,24 +47,21 @@ class IElasticsearchService(ABC):
         limit: int = 20,
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """Short-name alias for `search_documents` — the name actually called
-        by `BaseService.search()` and `BaseRepository.search()`. Declared as
-        its own abstract method (not left as a bare post-hoc class attribute
-        alias) so `unittest.mock.Mock(spec=IElasticsearchService)` and any
-        other interface-shaped substitute actually exposes it.
-        """
+        """Executes full-text or structured fuzzy search against Elasticsearch index."""
         pass
 
-    @abstractmethod
-    async def ping(self) -> bool:
-        """Checks cluster connectivity."""
     @abstractmethod
     async def search_raw(
         self,
         index: str,
         body: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Executes arbitrary validated search/aggregation query returning raw Elasticsearch response."""
+        """Executes raw search/aggregation query returning Elasticsearch response."""
+        pass
+
+    @abstractmethod
+    async def ping(self) -> bool:
+        """Checks cluster connectivity."""
         pass
 
     @abstractmethod
@@ -96,7 +82,7 @@ class NullElasticsearch(IElasticsearchService):
     async def delete_document(self, index: str, id_: str) -> bool:
         return True
 
-    async def search_documents(
+    async def search(
         self,
         index: str,
         query: Union[str, Dict[str, Any]],
@@ -104,8 +90,6 @@ class NullElasticsearch(IElasticsearchService):
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
         return [], 0
-
-    search = search_documents
 
     async def search_raw(
         self,
@@ -162,7 +146,7 @@ class AsyncElasticsearchService(IElasticsearchService):
             logger.warning("Elasticsearch delete error on %s/%s: %s", full_index, id_, exc)
             return False
 
-    async def search_documents(
+    async def search(
         self,
         index: str,
         query: Union[str, Dict[str, Any]],
@@ -195,14 +179,12 @@ class AsyncElasticsearchService(IElasticsearchService):
             logger.warning("Elasticsearch search failed on %s: %s", full_index, exc)
             return [], 0
 
-    search = search_documents
-
     async def search_raw(
         self,
         index: str,
         body: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Executes query with body (including aggs, post_filters) directly against Elasticsearch."""
+        """Executes query with body directly against Elasticsearch."""
         full_index = self._full_index_name(index)
         try:
             return await self.client.search(index=full_index, **body)
@@ -252,24 +234,6 @@ def create_elasticsearch_client(settings: Optional[Settings] = None) -> Optional
         return None
 
 
-def get_elasticsearch_service(
-    settings: Settings = get_settings(),
-    client: Optional[Any] = None,
-) -> IElasticsearchService:
-    """Factory creating an Elasticsearch service or NullElasticsearch fallback."""
-    if not settings.ELASTICSEARCH_ENABLED or AsyncElasticsearch is None:
-        return NullElasticsearch()
-
-    if client is not None:
-        return AsyncElasticsearchService(client, index_prefix=settings.ELASTICSEARCH_INDEX_PREFIX)
-
-    es_client = create_elasticsearch_client(settings)
-    if es_client is None:
-        return NullElasticsearch()
-
-    return AsyncElasticsearchService(es_client, index_prefix=settings.ELASTICSEARCH_INDEX_PREFIX)
-
-
 def get_es(request: Request) -> IElasticsearchService:
     """Dependency injecting Elasticsearch service from application state."""
     es = getattr(request.app.state, "elasticsearch", None)
@@ -283,6 +247,5 @@ __all__ = [
     "NullElasticsearch",
     "AsyncElasticsearchService",
     "create_elasticsearch_client",
-    "get_elasticsearch_service",
     "get_es",
 ]

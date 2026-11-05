@@ -2,12 +2,9 @@
 
 Provides explicit, structured exception types that decouple business logic
 from HTTP status codes and prevent leaking internal implementation details.
-Conforms to both Clean Architecture and fastapi-repo-pattern error handling.
 """
 
 from typing import Any, Optional
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 
 
 class AppException(Exception):
@@ -32,10 +29,6 @@ class AppException(Exception):
         self.details = details
 
 
-# Alias for fastapi-repo-pattern compatibility
-AppError = AppException
-
-
 class NotFoundError(AppException):
     """Raised when a requested resource is not found."""
 
@@ -56,26 +49,6 @@ class ConflictError(AppException):
         super().__init__(message=message, code=code, status_code=409)
 
 
-class BusinessRuleError(AppException):
-    """Raised when request breaks a business rule (e.g. references missing parent)."""
-
-    status_code = 422
-    code = "business_rule_violation"
-
-    def __init__(self, message: str = "Business rule violation", code: str = "business_rule_violation") -> None:
-        super().__init__(message=message, code=code, status_code=422)
-
-
-class InvalidQueryError(AppException):
-    """Raised when an unknown filter or sort field reaches the repository."""
-
-    status_code = 400
-    code = "invalid_query"
-
-    def __init__(self, message: str = "Invalid query parameter", code: str = "invalid_query") -> None:
-        super().__init__(message=message, code=code, status_code=400)
-
-
 class DecryptionError(AppException):
     """Raised when ciphertext cannot be decrypted or authentication tag fails."""
 
@@ -90,27 +63,9 @@ class DecryptionError(AppException):
         super().__init__(message=message, code=code, status_code=400)
 
 
-async def app_error_handler(_: Request, exc: AppException) -> JSONResponse:
-    """Standard error response handler."""
-    body: dict[str, Any] = {"detail": exc.message, "code": exc.code}
-    if exc.details is not None:
-        body["details"] = exc.details
-    return JSONResponse(status_code=exc.status_code, content=body)
-
-
-def register_exception_handlers(app: FastAPI) -> None:
-    """Registers exception handlers on the FastAPI application."""
-    app.add_exception_handler(AppException, app_error_handler)  # type: ignore[arg-type]
-
-
 __all__ = [
     "AppException",
-    "AppError",
     "NotFoundError",
     "ConflictError",
-    "BusinessRuleError",
-    "InvalidQueryError",
     "DecryptionError",
-    "app_error_handler",
-    "register_exception_handlers",
 ]

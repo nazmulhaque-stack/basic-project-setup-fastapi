@@ -5,9 +5,9 @@ from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
+from app.core.cache_interface import NullCache
 from app.core.redis import RedisTemporaryState, cached
 from app.services.cache import DynamicRedisCache
-from app.services.interface import NullCache
 
 
 class InMemoryMockRedis:

@@ -254,9 +254,6 @@ class Settings(BaseSettings):
 
     # Category-Specific TTLs (in seconds)
     CACHE_TTL_USER: int = Field(default=300, description="TTL for user profile cache items")
-    CACHE_TTL_PRODUCT: int = Field(default=600, description="TTL for catalog product cache items")
-    CACHE_TTL_REFERENCE: int = Field(default=3600, description="TTL for static reference/lookup tables")
-    CACHE_TTL_CONFIG: int = Field(default=1800, description="TTL for dynamic application configuration")
 
     # Temporary State TTLs (in seconds)
     IDEMPOTENCY_KEY_TTL: int = Field(default=86400, description="TTL for idempotency tokens (24 hours)")
