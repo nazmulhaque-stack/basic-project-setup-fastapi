@@ -40,6 +40,11 @@ class IElasticsearchService(ABC):
         pass
 
     @abstractmethod
+    async def get_document(self, index: str, id_: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single document by ID from Elasticsearch."""
+        pass
+
+    @abstractmethod
     async def search(
         self,
         index: str,
@@ -81,6 +86,9 @@ class NullElasticsearch(IElasticsearchService):
 
     async def delete_document(self, index: str, id_: str) -> bool:
         return True
+
+    async def get_document(self, index: str, id_: str) -> Optional[Dict[str, Any]]:
+        return None
 
     async def search(
         self,
@@ -145,6 +153,19 @@ class AsyncElasticsearchService(IElasticsearchService):
         except Exception as exc:
             logger.warning("Elasticsearch delete error on %s/%s: %s", full_index, id_, exc)
             return False
+
+    async def get_document(self, index: str, id_: str) -> Optional[Dict[str, Any]]:
+        full_index = self._full_index_name(index)
+        try:
+            resp = await self.client.get(index=full_index, id=str(id_))
+            if resp and "_source" in resp:
+                return resp["_source"]
+            return None
+        except ESNotFoundError:
+            return None
+        except Exception as exc:
+            logger.warning("Elasticsearch get error on %s/%s: %s", full_index, id_, exc)
+            return None
 
     async def search(
         self,

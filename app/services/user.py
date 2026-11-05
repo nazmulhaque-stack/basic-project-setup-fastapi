@@ -8,16 +8,26 @@ import uuid
 from fastapi import Depends
 
 from app.api.deps import CryptoDep, ElasticsearchDep, RedisDep, SessionDep
+from app.core.cache_interface import ICacheService, NullCache
 from app.core.config import Settings, get_settings
 from app.core.elasticsearch import IElasticsearchService, NullElasticsearch
 from app.core.exceptions import ConflictError, DecryptionError, NotFoundError
 from app.core.security import CryptoService
 from app.db.pool import UnitOfWork
-from app.models.user import User
+from app.models.user import Department, Role, User, UserAccount, UserProfile
 from app.repositories.user import UserRepository
 from app.schemas.base import decode_cursor, encode_cursor
-from app.schemas.user import UserCreate, UserPage, UserRead, UserUpdate
-from app.core.cache_interface import ICacheService, NullCache
+from app.schemas.user import (
+    AccountCreate,
+    AccountRead,
+    DepartmentRead,
+    RoleRead,
+    UserCreate,
+    UserPage,
+    UserProfileRead,
+    UserRead,
+    UserUpdate,
+)
 from app.services.cache import DynamicRedisCache
 
 logger = logging.getLogger(__name__)
@@ -56,10 +66,117 @@ class UserService:
             name=user.name,
             email=user.email,
             role=user.role,
+            department_id=user.department_id,
+            role_id=user.role_id,
             phone_masked=masked_phone,
             created_at=user.created_at or datetime.now(timezone.utc),
         )
 
+    def _to_profile_read(self, profile: UserProfile) -> UserProfileRead:
+        """Transforms rich aggregated UserProfile domain dataclass into UserProfileRead schema."""
+        user = profile.user
+        masked_phone = user.phone_encrypted
+        if self.crypto is not None and user.phone_encrypted:
+            aad = f"users.phone:{user.id}".encode("utf-8")
+            try:
+                plain_phone = self.crypto.decrypt(user.phone_encrypted, aad=aad)
+                masked_phone = self.crypto.mask_phone(plain_phone)
+            except DecryptionError:
+                masked_phone = "***"
+
+        dept_read: Optional[DepartmentRead] = None
+        if profile.department:
+            dept_read = DepartmentRead(
+                id=profile.department.id,
+                name=profile.department.name,
+                code=profile.department.code,
+                description=profile.department.description,
+            )
+
+        role_read: Optional[RoleRead] = None
+        if profile.role_info:
+            role_read = RoleRead(
+                id=profile.role_info.id,
+                name=profile.role_info.name,
+                description=profile.role_info.description,
+                permissions=profile.role_info.permissions,
+            )
+
+        accounts_read: List[AccountRead] = [
+            AccountRead(
+                id=acc.id,
+                account_number=acc.account_number,
+                account_type=acc.account_type,
+                balance_cents=acc.balance_cents,
+                currency=acc.currency,
+                status=acc.status,
+                created_at=acc.created_at,
+            )
+            for acc in profile.accounts
+        ]
+
+        return UserProfileRead(
+            id=user.id,
+            name=user.name,
+            email=user.email,
+            role=user.role,
+            phone_masked=masked_phone,
+            department=dept_read,
+            role_info=role_read,
+            accounts=accounts_read,
+            total_balance_cents=profile.total_balance_cents,
+            account_count=len(profile.accounts),
+            created_at=user.created_at or datetime.now(timezone.utc),
+        )
+
+    # --------------------------------------------------------------------------
+    # Elasticsearch Synchronization (Write Path)
+    # --------------------------------------------------------------------------
+    async def _sync_user_to_es(self, user_id: uuid.UUID) -> None:
+        """Synchronizes user entity and aggregated profile document to Elasticsearch."""
+        profile = await self.repo.get_profile(user_id)
+        if profile is None:
+            return
+
+        user = profile.user
+        # 1. Sync 'user' index
+        await self.es.index_document(
+            index="user",
+            id_=str(user.id),
+            document={
+                "id": str(user.id),
+                "name": user.name,
+                "email": user.email,
+                "role": user.role,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+            },
+        )
+
+        # 2. Sync 'user_profile' index (Full denormalized CQRS document)
+        profile_read = self._to_profile_read(profile)
+        doc = profile_read.model_dump(mode="json")
+        doc["department_name"] = profile_read.department.name if profile_read.department else None
+        doc["department_code"] = profile_read.department.code if profile_read.department else None
+        doc["role_name"] = profile_read.role_info.name if profile_read.role_info else None
+        doc["account_numbers"] = [a.account_number for a in profile_read.accounts]
+        await self.es.index_document(
+            index="user_profile",
+            id_=str(user.id),
+            document=doc,
+        )
+
+    async def sync_all_to_es(self) -> Dict[str, Any]:
+        """Bulk synchronizes all users and profiles from PostgreSQL into Elasticsearch."""
+        profiles = await self.repo.list_all_profiles()
+        count = 0
+        for profile in profiles:
+            await self._sync_user_to_es(profile.user.id)
+            count += 1
+        return {"status": "success", "synced_count": count}
+
+    # --------------------------------------------------------------------------
+    # User CRUD
+    # --------------------------------------------------------------------------
     async def create_user(self, payload: UserCreate) -> UserRead:
         """Create a user with PII encryption, blind index, direct ES indexing, and Redis invalidation."""
         # 1. Uniqueness check for email
@@ -87,6 +204,8 @@ class UserService:
             name=payload.name,
             email=str(payload.email),
             role=payload.role,
+            department_id=payload.department_id,
+            role_id=payload.role_id,
             phone_encrypted=phone_encrypted,
             phone_blind_index=phone_blind_index,
             created_at=datetime.now(timezone.utc),
@@ -94,20 +213,24 @@ class UserService:
 
         # 3. Insert into PostgreSQL
         created = await self.repo.create(user)
-        read_model = self._to_read_schema(created)
 
-        # 4. Direct indexing into Elasticsearch (CQRS)
-        await self.es.index_document(
-            index="user",
-            id_=str(created.id),
-            document={
-                "id": str(created.id),
-                "name": created.name,
-                "email": created.email,
-                "role": created.role,
-                "created_at": created.created_at.isoformat() if created.created_at else None,
-            },
-        )
+        # 4. Insert optional initial accounts
+        if payload.accounts:
+            for acc_payload in payload.accounts:
+                account_model = UserAccount(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    account_number=acc_payload.account_number,
+                    account_type=acc_payload.account_type,
+                    balance_cents=acc_payload.balance_cents,
+                    currency=acc_payload.currency,
+                    status=acc_payload.status,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                )
+                await self.repo.create_account(account_model)
+
+        read_model = self._to_read_schema(created)
 
         # 5. Invalidate Redis list cache and store item
         await self.cache.invalidate_lists()
@@ -115,6 +238,9 @@ class UserService:
 
         # 6. Commit Database Transaction
         await self.db.commit()
+
+        # 7. Sync Elasticsearch (both user and user_profile documents)
+        await self._sync_user_to_es(created.id)
 
         return read_model
 
@@ -132,6 +258,122 @@ class UserService:
         read_model = self._to_read_schema(user)
         await self.cache.set_item(str(user.id), read_model.model_dump(mode="json"))
         return read_model
+
+    # --------------------------------------------------------------------------
+    # Aggregated Profile with Redis Cache-Aside & Elasticsearch CQRS
+    # --------------------------------------------------------------------------
+    async def get_user_profile(self, user_id: uuid.UUID) -> UserProfileRead:
+        """CQRS Profile Read: Queries Redis Cache-Aside first, then directly retrieves from Elasticsearch (NOT PostgreSQL)."""
+        cache_key = f"profile:{user_id}"
+
+        # 1. Level 1: Redis Cache-Aside check
+        cached = await self.cache.get_item(cache_key)
+        if cached is not None:
+            return UserProfileRead(**cached)
+
+        # 2. Level 2: CQRS Read directly from Elasticsearch (Zero PostgreSQL queries)
+        es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
+        if es_doc is not None:
+            profile_read = UserProfileRead(**es_doc)
+            # Populate L1 Redis Cache
+            await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
+            return profile_read
+
+        # 3. Fallback only if ES document is absent:
+        profile = await self.repo.get_profile(user_id)
+        if profile is None:
+            await self.cache.set_negative_cache(cache_key)
+            raise NotFoundError(f"User with ID '{user_id}' not found.")
+
+        profile_read = self._to_profile_read(profile)
+        await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
+        await self._sync_user_to_es(user_id)
+        return profile_read
+
+    async def search_user_profiles(
+        self,
+        q: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[UserProfileRead]:
+        """Full-text fuzzy search across aggregated profiles directly in Elasticsearch."""
+        hits, total = await self.es.search(
+            index="user_profile",
+            query=q,
+            limit=limit,
+            offset=offset,
+        )
+        results: List[UserProfileRead] = []
+        for hit in hits:
+            try:
+                results.append(UserProfileRead(**hit))
+            except Exception:
+                pass
+        return results
+
+    async def add_user_account(self, user_id: uuid.UUID, payload: AccountCreate) -> AccountRead:
+        """Adds account info to user, invalidates profile cache, updates ES, and commits transaction."""
+        user = await self.repo.get(user_id)
+        if user is None:
+            raise NotFoundError(f"User with ID '{user_id}' not found.")
+
+        account = UserAccount(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            account_number=payload.account_number,
+            account_type=payload.account_type,
+            balance_cents=payload.balance_cents,
+            currency=payload.currency,
+            status=payload.status,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        created = await self.repo.create_account(account)
+
+        # Invalidate profile cache so next read fetches updated accounts
+        await self.cache.delete_item(f"profile:{user_id}")
+
+        # Commit DB transaction
+        await self.db.commit()
+
+        # Sync Elasticsearch profile document immediately on write
+        await self._sync_user_to_es(user_id)
+
+        return AccountRead(
+            id=created.id,
+            account_number=created.account_number,
+            account_type=created.account_type,
+            balance_cents=created.balance_cents,
+            currency=created.currency,
+            status=created.status,
+            created_at=created.created_at,
+        )
+
+    async def list_departments(self) -> List[DepartmentRead]:
+        """List all departments."""
+        depts = await self.repo.list_departments()
+        return [
+            DepartmentRead(
+                id=d.id,
+                name=d.name,
+                code=d.code,
+                description=d.description,
+            )
+            for d in depts
+        ]
+
+    async def list_roles(self) -> List[RoleRead]:
+        """List all roles and permission sets."""
+        roles = await self.repo.list_roles()
+        return [
+            RoleRead(
+                id=r.id,
+                name=r.name,
+                description=r.description,
+                permissions=r.permissions,
+            )
+            for r in roles
+        ]
 
     async def list_users(
         self,
@@ -221,6 +463,10 @@ class UserService:
             user.name = payload.name
         if payload.role is not None:
             user.role = payload.role
+        if payload.department_id is not None:
+            user.department_id = payload.department_id
+        if payload.role_id is not None:
+            user.role_id = payload.role_id
 
         if payload.phone is not None:
             if self.crypto is not None:
@@ -234,25 +480,16 @@ class UserService:
         updated = await self.repo.update(user)
         read_model = self._to_read_schema(updated)
 
-        # Direct ES document update
-        await self.es.index_document(
-            index="user",
-            id_=str(updated.id),
-            document={
-                "id": str(updated.id),
-                "name": updated.name,
-                "email": updated.email,
-                "role": updated.role,
-                "created_at": updated.created_at.isoformat() if updated.created_at else None,
-            },
-        )
-
-        # Invalidate Redis item & list cache
+        # Invalidate Redis item, profile, & list cache
         await self.cache.delete_item(str(user_id))
+        await self.cache.delete_item(f"profile:{user_id}")
         await self.cache.invalidate_lists()
 
         # Commit DB transaction
         await self.db.commit()
+
+        # Sync Elasticsearch (both user and user_profile documents) immediately on write
+        await self._sync_user_to_es(updated.id)
 
         return read_model
 
@@ -262,15 +499,17 @@ class UserService:
         if not deleted:
             raise NotFoundError(f"User with ID '{user_id}' not found.")
 
-        # Delete from Elasticsearch
-        await self.es.delete_document(index="user", id_=str(user_id))
-
         # Invalidate Redis
         await self.cache.delete_item(str(user_id))
+        await self.cache.delete_item(f"profile:{user_id}")
         await self.cache.invalidate_lists()
 
         # Commit DB transaction
         await self.db.commit()
+
+        # Delete from Elasticsearch immediately on write
+        await self.es.delete_document(index="user", id_=str(user_id))
+        await self.es.delete_document(index="user_profile", id_=str(user_id))
 
 
 # ------------------------------------------------------------------------------

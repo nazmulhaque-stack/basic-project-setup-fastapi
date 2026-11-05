@@ -1,4 +1,4 @@
-"""Unit and integration tests for User API endpoints, cursor pagination, and E.164 validation."""
+"""Unit and integration tests for User API endpoints, cursor pagination, profile schemas, and E.164 validation."""
 
 from datetime import datetime, timezone
 import uuid
@@ -6,7 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.base import decode_cursor, encode_cursor
-from app.schemas.user import UserCreate
+from app.schemas.user import (
+    AccountCreate,
+    AccountRead,
+    DepartmentRead,
+    RoleRead,
+    UserCreate,
+    UserProfileRead,
+)
 
 
 def test_cursor_encoding_and_decoding() -> None:
@@ -56,3 +63,38 @@ def test_user_create_phone_e164_validation() -> None:
     with pytest.raises(ValidationError):
         UserCreate(name="Bad", email="bad@example.com", phone="+12345678901234567")
 
+
+def test_user_profile_schemas() -> None:
+    """Verifies rich UserProfileRead and Account schemas."""
+    uid = uuid.uuid4()
+    acc_id = uuid.uuid4()
+
+    account = AccountRead(
+        id=acc_id,
+        account_number="ACC-123456",
+        account_type="savings",
+        balance_cents=250000,
+        currency="USD",
+        status="active",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    profile = UserProfileRead(
+        id=uid,
+        name="Alice Admin",
+        email="alice@company.com",
+        role="admin",
+        phone_masked="+1******0199",
+        department=DepartmentRead(id=1, name="Engineering", code="ENG", description="Software dev"),
+        role_info=RoleRead(id=1, name="Admin", description="Superuser", permissions=["admin:all"]),
+        accounts=[account],
+        total_balance_cents=250000,
+        account_count=1,
+    )
+
+    assert profile.id == uid
+    assert profile.department.code == "ENG"
+    assert profile.role_info.permissions == ["admin:all"]
+    assert profile.accounts[0].account_number == "ACC-123456"
+    assert profile.total_balance_cents == 250000
+    assert profile.account_count == 1

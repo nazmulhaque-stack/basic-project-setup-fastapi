@@ -1,6 +1,7 @@
 """User API Router (FastAPI Official Documentation Style).
 
-Endpoints for User CRUD, keyset pagination, and full-text Elasticsearch fuzzy search.
+Endpoints for User CRUD, keyset pagination, aggregated profile queries with Redis caching,
+and full-text Elasticsearch fuzzy search.
 """
 
 from typing import Annotated, List, Optional
@@ -8,12 +9,96 @@ import uuid
 
 from fastapi import APIRouter, Query, status
 
-from app.schemas.user import UserCreate, UserPage, UserRead, UserUpdate
+from app.schemas.user import (
+    AccountCreate,
+    AccountRead,
+    DepartmentRead,
+    RoleRead,
+    UserCreate,
+    UserPage,
+    UserProfileRead,
+    UserRead,
+    UserUpdate,
+)
 from app.services.user import UserServiceDep
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
 
+# ------------------------------------------------------------------------------
+# 1. Departments & Roles Lookups (Static paths before parameterized {user_id})
+# ------------------------------------------------------------------------------
+@router.get(
+    "/departments",
+    response_model=List[DepartmentRead],
+    summary="List departments",
+    description="Returns all active departments for user organization.",
+)
+async def list_departments(
+    service: UserServiceDep,
+) -> List[DepartmentRead]:
+    return await service.list_departments()
+
+
+@router.get(
+    "/roles",
+    response_model=List[RoleRead],
+    summary="List roles",
+    description="Returns all available authorization roles and permission sets.",
+)
+async def list_roles(
+    service: UserServiceDep,
+) -> List[RoleRead]:
+    return await service.list_roles()
+
+
+# ------------------------------------------------------------------------------
+# 2. Elasticsearch Fuzzy Searches
+# ------------------------------------------------------------------------------
+@router.get(
+    "/profiles/search",
+    response_model=List[UserProfileRead],
+    summary="Search user profiles",
+    description="Full-text fuzzy search across aggregated profiles (names, departments, accounts) via Elasticsearch.",
+)
+async def search_profiles(
+    service: UserServiceDep,
+    q: Annotated[str, Query(min_length=1, description="Search term for name, department, role, or account")] = "",
+    limit: Annotated[int, Query(ge=1, le=100, description="Max results")] = 20,
+    offset: Annotated[int, Query(ge=0, description="Offset")] = 0,
+) -> List[UserProfileRead]:
+    return await service.search_user_profiles(q=q, limit=limit, offset=offset)
+
+
+@router.get(
+    "/search",
+    response_model=List[UserRead],
+    summary="Search users",
+    description="Full-text fuzzy search across users powered directly by Elasticsearch.",
+)
+async def search_users(
+    service: UserServiceDep,
+    q: Annotated[str, Query(min_length=1, description="Search query string")] = "",
+    limit: Annotated[int, Query(ge=1, le=100, description="Max search results")] = 20,
+    offset: Annotated[int, Query(ge=0, description="Search result offset")] = 0,
+) -> List[UserRead]:
+    return await service.search_users(q=q, limit=limit, offset=offset)
+
+
+@router.post(
+    "/sync-es",
+    summary="Sync all users to Elasticsearch",
+    description="Synchronizes all users and aggregated profiles from PostgreSQL into Elasticsearch.",
+)
+async def sync_users_to_es(
+    service: UserServiceDep,
+) -> dict:
+    return await service.sync_all_to_es()
+
+
+# ------------------------------------------------------------------------------
+# 3. User CRUD Operations
+# ------------------------------------------------------------------------------
 @router.post(
     "",
     response_model=UserRead,
@@ -44,18 +129,31 @@ async def list_users(
 
 
 @router.get(
-    "/search",
-    response_model=List[UserRead],
-    summary="Search users",
-    description="Full-text fuzzy search across users powered directly by Elasticsearch.",
+    "/{user_id}/profile",
+    response_model=UserProfileRead,
+    summary="Get user profile",
+    description="Complex multi-table query joining User, Department, Role, and UserAccounts with Redis Cache-Aside and Elasticsearch CQRS indexing.",
 )
-async def search_users(
+async def get_user_profile(
+    user_id: uuid.UUID,
     service: UserServiceDep,
-    q: Annotated[str, Query(min_length=1, description="Search query string")] = "",
-    limit: Annotated[int, Query(ge=1, le=100, description="Max search results")] = 20,
-    offset: Annotated[int, Query(ge=0, description="Search result offset")] = 0,
-) -> List[UserRead]:
-    return await service.search_users(q=q, limit=limit, offset=offset)
+) -> UserProfileRead:
+    return await service.get_user_profile(user_id)
+
+
+@router.post(
+    "/{user_id}/accounts",
+    response_model=AccountRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add account to user",
+    description="Attaches a new account to the user, invalidates profile cache, and updates Elasticsearch.",
+)
+async def add_user_account(
+    user_id: uuid.UUID,
+    payload: AccountCreate,
+    service: UserServiceDep,
+) -> AccountRead:
+    return await service.add_user_account(user_id, payload)
 
 
 @router.get(
