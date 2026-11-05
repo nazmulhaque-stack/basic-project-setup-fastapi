@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -75,12 +75,12 @@ def _sync_db_url(
     return urlunsplit((parts.scheme, netloc, new_path, parts.query, parts.fragment))
 
 
-class CacheOperationFlags(BaseSettings):
+class CacheOperationFlags(BaseModel):
     """Granular per-operation feature flags for dynamic caching behavior.
 
     Allows enabling or disabling cache at each individual CRUD juncture without redeployment.
     """
-    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     enable_get_item: bool = Field(default=True, alias="CACHE_ENABLE_GET_ITEM")
     enable_set_item: bool = Field(default=True, alias="CACHE_ENABLE_SET_ITEM")
@@ -151,48 +151,6 @@ class Settings(BaseSettings):
     MAX_PAGE_SIZE: int = Field(
         default=100,
         description="Maximum allowed items per paginated page",
-    )
-
-    # Kafka event integration
-    KAFKA_ENABLED: bool = Field(
-        default=False,
-        description="Enables the Kafka producer and transactional outbox dispatcher",
-    )
-    KAFKA_BOOTSTRAP_SERVERS: str = Field(
-        default="127.0.0.1:9092",
-        description="Comma-separated Kafka bootstrap broker addresses",
-    )
-    KAFKA_EVENTS_TOPIC: str = Field(
-        default="domain.events",
-        description="Topic for versioned domain event envelopes",
-    )
-    KAFKA_CONSUMER_GROUP: str = Field(
-        default="highperf-fastapi",
-        description="Default Kafka consumer group for service consumers",
-    )
-    KAFKA_INVENTORY_TOPIC: str = Field(
-        default="inventory.events",
-        description="Inbound topic containing inventory reservation requests",
-    )
-    KAFKA_INVENTORY_CONSUMER_GROUP: str = Field(
-        default="highperf-inventory",
-        description="Consumer group that owns inventory reservation processing",
-    )
-    KAFKA_INVENTORY_DLQ_TOPIC: str = Field(
-        default="inventory.events.dlq",
-        description="Dead-letter topic for invalid inventory reservation events",
-    )
-    INVENTORY_RESERVATION_SWEEP_INTERVAL: float = Field(default=30.0, gt=0)
-    OUTBOX_POLL_INTERVAL: float = Field(default=1.0, gt=0)
-    OUTBOX_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
-    ES_SYNC_POLL_INTERVAL: float = Field(
-        default=1.0, gt=0,
-        description="Poll interval for ElasticsearchSyncDispatcher (outbox-driven auto-sync)",
-    )
-    ES_SYNC_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
-    ES_SYNC_MAX_ATTEMPTS: int = Field(
-        default=10, ge=1,
-        description="Dead-letters an Elasticsearch sync event after this many failed attempts",
     )
 
     # Elasticsearch 8 Log & Search Engine

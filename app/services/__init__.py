@@ -1,24 +1,18 @@
-"""Services package re-exporting domain interfaces and implementations."""
+"""Services package."""
 
-from app.services.base import BaseService, format_event_type
 from app.services.cache import DynamicRedisCache, NEGATIVE_CACHE_SENTINEL, get_cache
-from app.services.category import CategoryService
-from app.services.employee import EmployeeService
-from app.services.interface import IBaseService, ICacheService, NullCache
-from app.services.product import ProductService
-from app.services.user import UserService
+from app.services.interface import ICacheService, NullCache
+from app.services.user import UserCacheDep, UserService, UserServiceDep, get_user_cache, get_user_service
 
 __all__ = [
-    "IBaseService",
     "ICacheService",
     "NullCache",
-    "BaseService",
     "DynamicRedisCache",
     "NEGATIVE_CACHE_SENTINEL",
     "get_cache",
-    "format_event_type",
     "UserService",
-    "ProductService",
-    "CategoryService",
-    "EmployeeService",
+    "get_user_cache",
+    "UserCacheDep",
+    "get_user_service",
+    "UserServiceDep",
 ]

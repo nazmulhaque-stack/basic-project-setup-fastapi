@@ -18,8 +18,6 @@ from app.core.logging import (
     set_log_context,
 )
 from app.main import app
-from app.schemas.log import LogQueryFilter
-from app.services.log_search import LogSearchService
 
 
 # ==============================================================================
@@ -168,146 +166,8 @@ async def test_async_log_buffer_backpressure_drops_when_full() -> None:
 
 
 # ==============================================================================
-# LogSearchService & Elasticsearch Aggregations Tests
+# Health Probe Integration Tests
 # ==============================================================================
-
-
-@pytest.mark.asyncio
-async def test_log_search_service_queries_and_filters() -> None:
-    """Verifies LogSearchService query building, filtering, and result mapping."""
-    mock_es_service = AsyncMock()
-    sample_hit = {
-        "_source": {
-            "@timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": "ERROR",
-            "service": "order-service",
-            "environment": "production",
-            "logger": "app.orders",
-            "message": "Payment gateway timeout",
-            "request_id": "req-999",
-            "trace_id": "tr-888",
-            "status_code": 504,
-            "duration_ms": 5001.2,
-        }
-    }
-    mock_es_service.search_raw.return_value = {
-        "hits": {"total": {"value": 1}, "hits": [sample_hit]}
-    }
-
-    service = LogSearchService(es=mock_es_service, log_index="test-logs")
-    filters = LogQueryFilter(
-        level="ERROR",
-        service="order-service",
-        request_id="req-999",
-        search="timeout",
-        limit=20,
-        offset=0,
-    )
-
-    items, total = await service.search_logs(filters)
-    assert total == 1
-    assert len(items) == 1
-    assert items[0].level == "ERROR"
-    assert items[0].service == "order-service"
-    assert items[0].message == "Payment gateway timeout"
-
-    # Verify query DSL arguments passed to search_raw
-    call_args = mock_es_service.search_raw.call_args[0]
-    index_arg, body_arg = call_args[0], call_args[1]
-    assert index_arg == "test-logs"
-    assert "bool" in body_arg["query"]
-    assert any("order-service" in str(f) for f in body_arg["query"]["bool"]["filter"])
-
-
-@pytest.mark.asyncio
-async def test_log_search_service_aggregations() -> None:
-    """Verifies faceted aggregation response calculation."""
-    mock_es_service = AsyncMock()
-    mock_es_service.search_raw.return_value = {
-        "hits": {"total": {"value": 150}},
-        "aggregations": {
-            "by_level": {"buckets": [{"key": "INFO", "doc_count": 120}, {"key": "ERROR", "doc_count": 30}]},
-            "by_service": {"buckets": [{"key": "api-gateway", "doc_count": 150}]},
-            "by_route": {"buckets": [{"key": "/api/v1/products", "doc_count": 90}]},
-            "by_status_code": {"buckets": [{"key": "200", "doc_count": 120}, {"key": "500", "doc_count": 30}]},
-            "timeline": {"buckets": [{"key_as_string": "2026-10-29T12:00:00Z", "doc_count": 150}]},
-        },
-    }
-
-    service = LogSearchService(es=mock_es_service, log_index="test-logs")
-    filters = LogQueryFilter()
-    aggs = await service.aggregate_logs(filters, interval="1h")
-
-    assert aggs.total_logs == 150
-    assert aggs.by_level["INFO"] == 120
-    assert aggs.by_level["ERROR"] == 30
-    assert aggs.by_service["api-gateway"] == 150
-    assert aggs.by_route["/api/v1/products"] == 90
-    assert len(aggs.timeline) == 1
-    assert aggs.timeline[0].count == 150
-
-
-@pytest.mark.asyncio
-async def test_log_search_service_get_services() -> None:
-    """Verifies unique services aggregation retrieval."""
-    mock_es_service = AsyncMock()
-    mock_es_service.search_raw.return_value = {
-        "aggregations": {
-            "unique_services": {
-                "buckets": [{"key": "service-a"}, {"key": "service-b"}]
-            }
-        }
-    }
-    service = LogSearchService(es=mock_es_service)
-    res = await service.get_services()
-    assert res.services == ["service-a", "service-b"]
-
-
-# ==============================================================================
-# API Endpoints & Health Probe Integration Tests
-# ==============================================================================
-
-
-@pytest.mark.asyncio
-async def test_log_api_endpoints() -> None:
-    """Verifies /api/v1/logs endpoints with mock LogSearchService dependency override."""
-    mock_log_service = AsyncMock()
-    mock_log_service.search_logs.return_value = ([], 0)
-    mock_log_service.get_errors.return_value = ([], 0)
-    mock_log_service.get_services.return_value = MagicMock(services=["app-api", "worker"])
-    mock_log_service.aggregate_logs.return_value = {
-        "total_logs": 0,
-        "by_level": {},
-        "by_service": {},
-        "by_route": {},
-        "by_status_code": {},
-        "timeline": [],
-    }
-
-    from app.api.deps import get_log_search_service
-    app.dependency_overrides[get_log_search_service] = lambda: mock_log_service
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. Search logs
-        r1 = await client.get("/api/v1/logs?level=INFO&limit=10")
-        assert r1.status_code == 200
-        assert r1.json()["total"] == 0
-
-        # 2. Errors endpoint
-        r2 = await client.get("/api/v1/logs/errors")
-        assert r2.status_code == 200
-
-        # 3. Aggregations endpoint
-        r3 = await client.get("/api/v1/logs/aggregations")
-        assert r3.status_code == 200
-
-        # 4. Services endpoint
-        r4 = await client.get("/api/v1/logs/services")
-        assert r4.status_code == 200
-        assert "app-api" in r4.json()["services"]
-
-    app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio

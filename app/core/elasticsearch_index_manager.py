@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 
 from app.core.config import get_settings
-from app.core.elasticsearch_registry import ELASTICSEARCH_INDEXES
+
+ELASTICSEARCH_INDEXES: Dict[str, str] = {"user": "users"}
 
 logger = logging.getLogger(__name__)
 

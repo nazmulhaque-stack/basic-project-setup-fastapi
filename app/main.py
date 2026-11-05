@@ -1,23 +1,18 @@
 """Stateless High-Performance FastAPI Application.
 
-Architecture & Principles:
---------------------------
-1. Reusable Generic Repository Pattern + Service Layer over raw `asyncpg` (no ORM).
-2. Zero module-level connection globals: the asyncpg pool, Redis client, and
-   Crypto keys are strictly instantiated in the async `lifespan` context
-   manager, attached to `app.state`, and gracefully closed during shutdown.
-3. Default response class is ORJSONResponse for ultra-fast C/Rust JSON serialization.
-4. Kept completely stateless across N worker processes and M physical servers.
-5. Production exception handlers sanitize all internal errors, preventing stack
-   trace leakage to clients while emitting structured error envelopes.
+Architecture:
+1. Raw asyncpg connection pool (PgBouncer transaction-pooling compatible).
+2. Redis 7 caching and atomic Lua rate limiter.
+3. AES-256-GCM AEAD encryption and HMAC-SHA256 blind indexing for PII.
+4. Elasticsearch for full-text search.
+5. FastAPI official documentation style, stateless architecture.
 """
 
 from contextlib import asynccontextmanager
-import asyncio
 import logging
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 import sys
 import time
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 import uuid
 
 import asyncpg
@@ -25,13 +20,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
 from fastapi.routing import APIRoute
-from redis.asyncio import Redis, RedisCluster
 
 from app.api.v1.health import router as health_router
 from app.api.v1.router import api_v1_router
-
 from app.core.config import get_settings
-from app.core.kafka import KafkaEventProducer, consume_events_forever
 from app.core.elasticsearch import (
     AsyncElasticsearchService,
     IElasticsearchService,
@@ -39,7 +31,6 @@ from app.core.elasticsearch import (
     create_elasticsearch_client,
 )
 from app.core.exceptions import AppException
-from app.core.metrics import setup_metrics
 from app.core.logging import (
     AsyncElasticsearchLogHandler,
     AsyncLogBuffer,
@@ -47,16 +38,11 @@ from app.core.logging import (
     set_log_context,
     setup_log_index_template,
 )
+from app.core.metrics import setup_metrics
 from app.core.redis import close_redis_client, create_redis_client
 from app.core.security import CryptoService
 from app.db.pool import close_db_pool, create_db_pool
 from app.schemas.base import ErrorDetail, ErrorResponse
-from app.services.elasticsearch_sync import ElasticsearchSyncDispatcher
-from app.services.outbox import OutboxDispatcher
-from app.services.inventory_reservations import (
-    handle_inventory_reserved,
-    run_expiration_sweeper,
-)
 from app.services.redis_rate_limit import RATE_LIMIT_LUA_SCRIPT, rate_limiter
 
 # Setup structured application logging
@@ -70,74 +56,19 @@ logger = logging.getLogger("app.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """FastAPI lifespan context manager for startup and graceful shutdown.
-
-    Guarantees no I/O at import time. Resources are initialized once per worker process.
-    """
+    """FastAPI lifespan context manager for startup and graceful shutdown."""
     settings = get_settings()
-    logger.info("Initializing application resources for worker in %s mode...", settings.APP_NAME)
+    logger.info("Initializing application resources for %s...", settings.APP_NAME)
 
-    # 1. Initialize the raw asyncpg connection pool (PgBouncer transaction-pooling compatible)
+    # 1. Initialize asyncpg connection pool
     db_pool = await create_db_pool(settings)
     app.state.db_pool = db_pool
 
-    kafka_producer: Optional[KafkaEventProducer] = None
-    outbox_dispatcher: Optional[OutboxDispatcher] = None
-    inventory_consumer_stop: Optional[asyncio.Event] = None
-    inventory_consumer_task: Optional[asyncio.Task[None]] = None
-    reservation_sweeper_task: Optional[asyncio.Task[None]] = None
-    if settings.KAFKA_ENABLED:
-        kafka_producer = KafkaEventProducer(settings.KAFKA_BOOTSTRAP_SERVERS)
-        await kafka_producer.start()
-        outbox_dispatcher = OutboxDispatcher(
-            db_pool,
-            kafka_producer,
-            poll_interval=settings.OUTBOX_POLL_INTERVAL,
-            batch_size=settings.OUTBOX_BATCH_SIZE,
-        )
-        outbox_dispatcher.start()
-        inventory_consumer_stop = asyncio.Event()
-
-        async def handle_inventory_event(event: dict[str, Any]) -> None:
-            await handle_inventory_reserved(
-                event,
-                db_pool,
-                kafka_producer,
-                output_topic=settings.KAFKA_EVENTS_TOPIC,
-                dead_letter_topic=settings.KAFKA_INVENTORY_DLQ_TOPIC,
-            )
-
-        inventory_consumer_task = asyncio.create_task(
-            consume_events_forever(
-                bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
-                topics=[settings.KAFKA_INVENTORY_TOPIC],
-                group_id=settings.KAFKA_INVENTORY_CONSUMER_GROUP,
-                handler=handle_inventory_event,
-                stop_event=inventory_consumer_stop,
-                producer=kafka_producer,
-                dlq_topic=settings.KAFKA_INVENTORY_DLQ_TOPIC,
-            ),
-            name="kafka-inventory-reservation-consumer",
-        )
-        reservation_sweeper_task = asyncio.create_task(
-            run_expiration_sweeper(
-                db_pool,
-                settings.KAFKA_EVENTS_TOPIC,
-                interval=settings.INVENTORY_RESERVATION_SWEEP_INTERVAL,
-                stop_event=inventory_consumer_stop,
-            ),
-            name="inventory-reservation-expiration-sweeper",
-        )
-        app.state.kafka_producer = kafka_producer
-        app.state.outbox_dispatcher = outbox_dispatcher
-        app.state.inventory_consumer_task = inventory_consumer_task
-        app.state.reservation_sweeper_task = reservation_sweeper_task
-
-    # 2. Initialize Redis Client via Centralized Factory (Standalone & Cluster with pooling)
+    # 2. Initialize Redis Client
     redis_client = await create_redis_client(settings)
     app.state.redis = redis_client
 
-    # 3. Register Atomic Rate Limiter Lua Script once via SCRIPT LOAD
+    # 3. Register Atomic Rate Limiter Lua Script
     try:
         app.state.rate_limit_lua_sha = await redis_client.script_load(RATE_LIMIT_LUA_SCRIPT)
         logger.info("Registered rate limiter Lua script with SHA: %s", app.state.rate_limit_lua_sha)
@@ -155,12 +86,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     logger.info("Initialized CryptoService with active key version: %d", settings.ACTIVE_KEY_VERSION)
 
-    # 5. Initialize Elasticsearch 8 Client & Non-Blocking Asynchronous Log Buffer
+    # 5. Initialize Elasticsearch 8 Client
     es_client = create_elasticsearch_client(settings)
     es_service: IElasticsearchService
     log_buffer: Optional[AsyncLogBuffer] = None
     es_log_handler: Optional[AsyncElasticsearchLogHandler] = None
-    es_sync_dispatcher: Optional[ElasticsearchSyncDispatcher] = None
 
     if es_client is not None:
         full_log_index = f"{settings.ELASTICSEARCH_INDEX_PREFIX}_{settings.ELASTICSEARCH_LOG_INDEX}"
@@ -181,43 +111,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             formatter=StructuredLogFormatter(service=settings.APP_NAME),
         )
         root_logger.addHandler(es_log_handler)
-        # Ensure log index template in background
-        asyncio.create_task(setup_log_index_template(es_client, full_log_index))
-        logger.info("Configured Elasticsearch client pointing to %s with async log buffer", settings.ELASTICSEARCH_URL)
-
-        # Background consumer for BaseRepository's outbox-staged auto-sync
-        # events (see app/repositories/base.py, app/core/elasticsearch_registry.py).
-        es_sync_dispatcher = ElasticsearchSyncDispatcher(
-            db_pool,
-            es_service,
-            poll_interval=settings.ES_SYNC_POLL_INTERVAL,
-            batch_size=settings.ES_SYNC_BATCH_SIZE,
-            max_attempts=settings.ES_SYNC_MAX_ATTEMPTS,
-        )
-        es_sync_dispatcher.start()
+        logger.info("Configured Elasticsearch client pointing to %s", settings.ELASTICSEARCH_URL)
     else:
         es_service = NullElasticsearch()
 
     app.state.elasticsearch = es_service
     app.state.log_buffer = log_buffer
-    app.state.es_sync_dispatcher = es_sync_dispatcher
 
     yield
 
     # Graceful Shutdown
     logger.info("Closing application resources...")
-    if inventory_consumer_stop is not None:
-        inventory_consumer_stop.set()
-    if inventory_consumer_task is not None:
-        await inventory_consumer_task
-    if reservation_sweeper_task is not None:
-        await reservation_sweeper_task
-    if outbox_dispatcher is not None:
-        await outbox_dispatcher.stop()
-    if es_sync_dispatcher is not None:
-        await es_sync_dispatcher.stop()
-    if kafka_producer is not None:
-        await kafka_producer.stop()
 
     if log_buffer is not None:
         try:
@@ -247,14 +151,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 def operation_id(route: APIRoute) -> str:
-    """Short, stable operationIds ('product_list') -> clean generated API clients."""
+    """Short, stable operationIds ('user_list') -> clean generated API clients."""
     return route.name
 
 
 # Instantiate stateless FastAPI application with ORJSONResponse default
 app = FastAPI(
     title="High-Performance Stateless FastAPI Service",
-    description="Stateless 100k-concurrent-ready API with Generic Repository Pattern, Service Layer, AES-GCM encryption, Redis Cluster cache, and PgBouncer pooling",
+    description="Stateless high-performance API with raw asyncpg, AES-GCM encryption, Redis Cluster cache, Elasticsearch CQRS search, and PgBouncer pooling",
     version="2.0.0",
     default_response_class=ORJSONResponse,
     lifespan=lifespan,
@@ -280,7 +184,6 @@ async def request_id_and_tracing_middleware(
     request.state.trace_id = trace_id
     request.state.tenant_id = tenant_id
 
-    # Set coroutine logging context
     set_log_context(request_id=req_id, trace_id=trace_id, tenant_id=tenant_id)
 
     response: Response = await call_next(request)
@@ -289,7 +192,6 @@ async def request_id_and_tracing_middleware(
     response.headers["X-Request-ID"] = req_id
     response.headers["X-Trace-ID"] = trace_id
 
-    # Emit structured request log
     logger.info(
         "%s %s -> %d (%.2fms)",
         request.method,
@@ -409,11 +311,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> ORJSO
     )
 
 
-# Mount versioned API v1 router behind the Redis Lua EVALSHA rate limiter (RateLimiter reads
-# `request.app.state.redis` / `request.app.state.rate_limit_lua_sha`, both set in `lifespan()`
-# above, so this dependency only becomes active once the app has actually started).
-# Health/readiness probes are mounted separately, unrated, so K8s liveness checks are never
-# throttled.
+# Mount versioned API v1 router behind the Redis Lua rate limiter
 _settings = get_settings()
 app.include_router(
     api_v1_router,

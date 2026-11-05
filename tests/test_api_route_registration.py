@@ -17,7 +17,7 @@ def test_api_routes_are_mounted_once_under_v1() -> None:
     ]
 
     assert all(
-        path.startswith("/api/v1/") or path in {"/healthz", "/readyz"}
+        path.startswith("/api/v1/") or path in {"/healthz", "/readyz", "/metrics"}
         for path, _ in route_methods
     )
     assert all(count == 1 for count in Counter(route_methods).values())
