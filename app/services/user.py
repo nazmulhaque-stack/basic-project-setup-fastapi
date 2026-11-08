@@ -298,49 +298,114 @@ class UserService:
         return read_model
 
     async def get_user_by_id(self, user_id: uuid.UUID) -> UserRead:
-        """Fetch user by ID with Redis cache-aside (sub-millisecond read)."""
-        cached = await self.cache.get_item(str(user_id))
-        if cached is not None:
-            return UserRead(**cached)
+        """Fetch user by ID with 3-tier Self-Healing Fallback:
+        1. Check Redis L1 cache.
+        2. Check Elasticsearch document.
+        3. Fallback to PostgreSQL (Authoritative Source of Truth).
+        4. Self-Heal: Backfill both Redis and Elasticsearch.
+        5. Return response.
+        """
+        # 1. Level 1: Redis Cache-Aside
+        try:
+            cached = await self.cache.get_item(str(user_id))
+            if cached is not None:
+                return UserRead(**cached)
+        except Exception as exc:
+            logger.warning("Redis read error in get_user_by_id: %s", exc)
 
+        # 2. Level 2: Elasticsearch (Direct return without backfill)
+        try:
+            es_doc = await self.es.get_document(index="user", id_=str(user_id))
+            if es_doc is not None:
+                return UserRead(
+                    id=es_doc["id"],
+                    name=es_doc.get("name", ""),
+                    email=es_doc.get("email", ""),
+                    role=es_doc.get("role", "user"),
+                    department=es_doc.get("department"),
+                    phone_masked=None,
+                    created_at=datetime.fromisoformat(es_doc["created_at"]) if es_doc.get("created_at") else None,
+                )
+        except Exception as exc:
+            logger.warning("Elasticsearch read error in get_user_by_id: %s", exc)
+
+        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store)
         user = await self.repo.get(user_id)
         if user is None:
-            await self.cache.set_negative_cache(str(user_id))
+            try:
+                await self.cache.set_negative_cache(str(user_id))
+            except Exception:
+                pass
             raise NotFoundError(f"User with ID '{user_id}' not found.")
 
         read_model = self._to_read_schema(user)
-        await self.cache.set_item(str(user.id), read_model.model_dump(mode="json"))
+
+        # 4. Self-Heal / Backfill both Redis and Elasticsearch
+        try:
+            await self.cache.set_item(str(user.id), read_model.model_dump(mode="json"))
+        except Exception as exc:
+            logger.warning("Failed to backfill Redis: %s", exc)
+
+        try:
+            await self._sync_user_to_es(user_id)
+        except Exception as exc:
+            logger.warning("Failed to backfill Elasticsearch: %s", exc)
+
+        # 5. Return response
         return read_model
 
     # --------------------------------------------------------------------------
     # Aggregated Profile with Redis Cache-Aside & Elasticsearch CQRS
     # --------------------------------------------------------------------------
     async def get_user_profile(self, user_id: uuid.UUID) -> UserProfileRead:
-        """CQRS Profile Read: Queries Redis Cache-Aside first, then directly retrieves from Elasticsearch (NOT PostgreSQL)."""
+        """Self-Healing CQRS Profile Read:
+        1. Check Redis L1 cache.
+        2. Check Elasticsearch CQRS index.
+        3. Fallback to PostgreSQL (Source of Truth).
+        4. Self-Heal: Backfill both Elasticsearch and Redis.
+        5. Return response.
+        """
         cache_key = f"profile:{user_id}"
 
-        # 1. Level 1: Redis Cache-Aside check
-        cached = await self.cache.get_item(cache_key)
-        if cached is not None:
-            return UserProfileRead(**cached)
+        # 1. Level 1: Redis Cache-Aside
+        try:
+            cached = await self.cache.get_item(cache_key)
+            if cached is not None:
+                return UserProfileRead(**cached)
+        except Exception as exc:
+            logger.warning("Redis read error in get_user_profile: %s", exc)
 
-        # 2. Level 2: CQRS Read directly from Elasticsearch (Zero PostgreSQL queries)
-        es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
-        if es_doc is not None:
-            profile_read = UserProfileRead(**es_doc)
-            # Populate L1 Redis Cache
-            await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
-            return profile_read
+        # 2. Level 2: Elasticsearch CQRS document (Direct return without backfill)
+        try:
+            es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
+            if es_doc is not None:
+                return UserProfileRead(**es_doc)
+        except Exception as exc:
+            logger.warning("Elasticsearch read error in get_user_profile: %s", exc)
 
-        # 3. Fallback only if ES document is absent:
+        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store)
         profile = await self.repo.get_profile(user_id)
         if profile is None:
-            await self.cache.set_negative_cache(cache_key)
+            try:
+                await self.cache.set_negative_cache(cache_key)
+            except Exception:
+                pass
             raise NotFoundError(f"User with ID '{user_id}' not found.")
 
         profile_read = self._to_profile_read(profile)
-        await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
-        await self._sync_user_to_es(user_id)
+
+        # 4. Self-Heal / Backfill both Redis and Elasticsearch
+        try:
+            await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
+        except Exception as exc:
+            logger.warning("Failed to backfill Redis: %s", exc)
+
+        try:
+            await self._sync_user_to_es(user_id)
+        except Exception as exc:
+            logger.warning("Failed to backfill Elasticsearch: %s", exc)
+
+        # 5. Return response
         return profile_read
 
     async def search_user_profiles(
@@ -349,20 +414,46 @@ class UserService:
         limit: int = 20,
         offset: int = 0,
     ) -> List[UserProfileRead]:
-        """Full-text fuzzy search across aggregated profiles directly in Elasticsearch."""
-        hits, total = await self.es.search(
-            index="user_profile",
-            query=q,
-            limit=limit,
-            offset=offset,
-        )
-        results: List[UserProfileRead] = []
-        for hit in hits:
-            try:
-                results.append(UserProfileRead(**hit))
-            except Exception:
-                pass
-        return results
+        """Full-text fuzzy search across aggregated profiles with PostgreSQL fallback."""
+        try:
+            hits, total = await self.es.search(
+                index="user_profile",
+                query=q,
+                limit=limit,
+                offset=offset,
+            )
+            results: List[UserProfileRead] = []
+            for hit in hits:
+                try:
+                    results.append(UserProfileRead(**hit))
+                except Exception:
+                    pass
+            if results:
+                return results
+        except Exception as exc:
+            logger.warning("Elasticsearch profile search error (%s), falling back to PostgreSQL: %s", q, exc)
+
+        # Fallback to PostgreSQL if Elasticsearch has no documents or is unavailable
+        profiles = await self.repo.list_all_profiles()
+        matching: List[UserProfileRead] = []
+        q_lower = q.lower()
+        for p in profiles:
+            p_read = self._to_profile_read(p)
+            name_match = q_lower in p_read.name.lower()
+            email_match = q_lower in str(p_read.email).lower()
+            dept_match = p_read.department and (
+                q_lower in p_read.department.name.lower() or q_lower in p_read.department.code.lower()
+            )
+            role_match = p_read.role_info and q_lower in p_read.role_info.name.lower()
+            acc_match = any(q_lower in a.account_number.lower() for a in p_read.accounts)
+            if name_match or email_match or dept_match or role_match or acc_match:
+                matching.append(p_read)
+                try:
+                    await self._sync_user_to_es(p.user.id)
+                except Exception:
+                    pass
+
+        return matching[offset : offset + limit]
 
     async def add_user_account(self, user_id: uuid.UUID, payload: AccountCreate) -> AccountRead:
         """Adds account info to user, invalidates profile cache, updates ES, and commits transaction."""
