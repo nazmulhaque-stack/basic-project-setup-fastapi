@@ -199,13 +199,14 @@ async def list_users(
     "/{user_id}/profile",
     response_model=UserProfileRead,
     summary="Get user profile",
-    description="Complex multi-table query joining User, Department, Role, and UserAccounts with Redis Cache-Aside and Elasticsearch CQRS indexing.",
+    description="Complex multi-table query joining User, Department, Role, and UserAccounts with Redis Cache-Aside, Elasticsearch CQRS indexing, and dynamic revalidation.",
 )
 async def get_user_profile(
     user_id: uuid.UUID,
     service: UserServiceDep,
+    revalidate: Annotated[bool, Query(description="Force refresh from source of truth and update Redis/ES")] = False,
 ) -> UserProfileRead:
-    return await service.get_user_profile(user_id)
+    return await service.get_user_profile(user_id, revalidate=revalidate)
 
 
 @router.post(
@@ -253,13 +254,14 @@ async def add_user_account(
     "/{user_id}",
     response_model=UserRead,
     summary="Get user by ID",
-    description="Retrieves a user by ID using Redis cache-aside (sub-millisecond read).",
+    description="Retrieves a user by ID using Redis cache-aside (sub-millisecond read) with dynamic revalidation support.",
 )
 async def get_user(
     user_id: uuid.UUID,
     service: UserServiceDep,
+    revalidate: Annotated[bool, Query(description="Force refresh from source of truth and update Redis/ES")] = False,
 ) -> UserRead:
-    return await service.get_user_by_id(user_id)
+    return await service.get_user_by_id(user_id, revalidate=revalidate)
 
 
 @router.patch(

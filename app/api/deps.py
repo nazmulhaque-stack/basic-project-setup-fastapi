@@ -13,10 +13,12 @@ from typing import Annotated, Optional, Union
 from fastapi import Depends, Request
 from redis.asyncio import Redis, RedisCluster
 
+from app.core.cache_interface import NullCache
 from app.core.config import Settings, get_settings
 from app.core.elasticsearch import IElasticsearchService, NullElasticsearch
 from app.core.security import CryptoService
 from app.db.pool import UnitOfWork, get_db as _pool_get_db
+from app.services.executor import DynamicServiceExecutor
 
 
 # ------------------------------------------------------------------------------
@@ -78,6 +80,46 @@ def get_crypto(
 CryptoDep = Annotated[CryptoService, Depends(get_crypto)]
 
 
+# ------------------------------------------------------------------------------
+# 5. Dynamic Service Executor Dependency (Type-Safe Query/Redis/ES Orchestrator)
+# ------------------------------------------------------------------------------
+def get_executor(
+    session: SessionDep,
+    redis: RedisDep,
+    es: ElasticsearchDep,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DynamicServiceExecutor:
+    """Dependency constructing a DynamicServiceExecutor with active DB, Redis, and ES."""
+    cache_service = NullCache()
+    if redis is not None:
+        from app.services.cache import DynamicRedisCache
+
+        cache_service = DynamicRedisCache(
+            redis=redis,
+            prefix="app",
+            item_ttl=settings.CACHE_ITEM_TTL,
+            list_ttl=settings.CACHE_LIST_TTL,
+            negative_ttl=settings.CACHE_NEGATIVE_TTL,
+            lock_ttl_ms=settings.CACHE_LOCK_TTL_MS,
+            flags=settings.get_cache_flags(),
+        )
+
+    worker = None
+    if hasattr(request, "app") and hasattr(request.app, "state"):
+        worker = getattr(request.app.state, "outbox_worker", None)
+
+    return DynamicServiceExecutor(
+        db=session,
+        cache=cache_service,
+        elasticsearch=es,
+        outbox_worker=worker,
+    )
+
+
+ExecutorDep = Annotated[DynamicServiceExecutor, Depends(get_executor)]
+
+
 __all__ = [
     # Database
     "get_db",
@@ -92,4 +134,7 @@ __all__ = [
     # Crypto (AES-256-GCM AEAD)
     "get_crypto",
     "CryptoDep",
+    # Dynamic Executor
+    "get_executor",
+    "ExecutorDep",
 ]

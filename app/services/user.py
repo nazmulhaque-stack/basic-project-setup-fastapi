@@ -32,6 +32,7 @@ from app.schemas.user import (
     UserUpdate,
 )
 from app.services.cache import DynamicRedisCache
+from app.services.executor import DynamicServiceExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class UserService:
         crypto: Optional[CryptoService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
         outbox_worker: Optional[Any] = None,
+        executor: Optional[DynamicServiceExecutor] = None,
         **_: Any,
     ) -> None:
         self.db = db
@@ -55,6 +57,13 @@ class UserService:
         self.crypto: Optional[CryptoService] = crypto
         self.es: IElasticsearchService = elasticsearch or NullElasticsearch()
         self.outbox_worker = outbox_worker
+        self.executor: DynamicServiceExecutor = executor or DynamicServiceExecutor(
+            db=db,
+            cache=self.cache,
+            elasticsearch=self.es,
+            outbox_repo=self.outbox_repo,
+            outbox_worker=outbox_worker,
+        )
 
     def _to_read_schema(self, user: User) -> UserRead:
         """Decrypts phone using AAD and returns safe masked representation."""
@@ -299,39 +308,49 @@ class UserService:
 
         return read_model
 
-    async def get_user_by_id(self, user_id: uuid.UUID) -> UserRead:
-        """Fetch user by ID with 3-tier Self-Healing Fallback:
-        1. Check Redis L1 cache.
-        2. Check Elasticsearch document.
-        3. Fallback to PostgreSQL (Authoritative Source of Truth).
+    async def get_user_by_id(self, user_id: uuid.UUID, revalidate: bool = False) -> UserRead:
+        """Fetch user by ID with 3-tier Self-Healing Fallback (Redis -> ES -> PostgreSQL) and revalidation.
+        1. Check Redis L1 cache (if revalidate=False).
+        2. Check Elasticsearch document (if revalidate=False).
+        3. Fallback to PostgreSQL (Authoritative Source of Truth) or force revalidate.
         4. Self-Heal: Backfill both Redis and Elasticsearch.
         5. Return response.
         """
-        # 1. Level 1: Redis Cache-Aside
-        try:
-            cached = await self.cache.get_item(str(user_id))
-            if cached is not None:
-                return UserRead(**cached)
-        except Exception as exc:
-            logger.warning("Redis read error in get_user_by_id: %s", exc)
+        # 1. Level 1: Redis Cache-Aside & Level 2: Elasticsearch
+        if not revalidate:
+            try:
+                cached = await self.cache.get_item(str(user_id))
+                if cached is not None:
+                    if isinstance(cached, dict) and cached.get("__not_found__"):
+                        raise NotFoundError(f"User with ID '{user_id}' not found.")
+                    return UserRead(**cached)
+            except NotFoundError:
+                raise
+            except Exception as exc:
+                logger.warning("Redis read error in get_user_by_id: %s", exc)
 
-        # 2. Level 2: Elasticsearch (Direct return without backfill)
-        try:
-            es_doc = await self.es.get_document(index="user", id_=str(user_id))
-            if es_doc is not None:
-                return UserRead(
-                    id=es_doc["id"],
-                    name=es_doc.get("name", ""),
-                    email=es_doc.get("email", ""),
-                    role=es_doc.get("role", "user"),
-                    department=es_doc.get("department"),
-                    phone_masked=None,
-                    created_at=datetime.fromisoformat(es_doc["created_at"]) if es_doc.get("created_at") else None,
-                )
-        except Exception as exc:
-            logger.warning("Elasticsearch read error in get_user_by_id: %s", exc)
+            # 2. Level 2: Elasticsearch (Direct return with Redis backfill)
+            try:
+                es_doc = await self.es.get_document(index="user", id_=str(user_id))
+                if es_doc is not None:
+                    user_read = UserRead(
+                        id=es_doc["id"],
+                        name=es_doc.get("name", ""),
+                        email=es_doc.get("email", ""),
+                        role=es_doc.get("role", "user"),
+                        department=es_doc.get("department"),
+                        phone_masked=None,
+                        created_at=datetime.fromisoformat(es_doc["created_at"]) if es_doc.get("created_at") else None,
+                    )
+                    try:
+                        await self.cache.set_item(str(user_id), user_read.model_dump(mode="json"))
+                    except Exception:
+                        pass
+                    return user_read
+            except Exception as exc:
+                logger.warning("Elasticsearch read error in get_user_by_id: %s", exc)
 
-        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store)
+        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store) or forced revalidation
         user = await self.repo.get(user_id)
         if user is None:
             try:
@@ -359,33 +378,43 @@ class UserService:
     # --------------------------------------------------------------------------
     # Aggregated Profile with Redis Cache-Aside & Elasticsearch CQRS
     # --------------------------------------------------------------------------
-    async def get_user_profile(self, user_id: uuid.UUID) -> UserProfileRead:
+    async def get_user_profile(self, user_id: uuid.UUID, revalidate: bool = False) -> UserProfileRead:
         """Self-Healing CQRS Profile Read:
-        1. Check Redis L1 cache.
-        2. Check Elasticsearch CQRS index.
-        3. Fallback to PostgreSQL (Source of Truth).
+        1. Check Redis L1 cache (if revalidate=False).
+        2. Check Elasticsearch CQRS index (if revalidate=False).
+        3. Fallback to PostgreSQL (Source of Truth) or force revalidate.
         4. Self-Heal: Backfill both Elasticsearch and Redis.
         5. Return response.
         """
         cache_key = f"profile:{user_id}"
 
-        # 1. Level 1: Redis Cache-Aside
-        try:
-            cached = await self.cache.get_item(cache_key)
-            if cached is not None:
-                return UserProfileRead(**cached)
-        except Exception as exc:
-            logger.warning("Redis read error in get_user_profile: %s", exc)
+        # 1. Level 1: Redis Cache-Aside & Level 2: Elasticsearch
+        if not revalidate:
+            try:
+                cached = await self.cache.get_item(cache_key)
+                if cached is not None:
+                    if isinstance(cached, dict) and cached.get("__not_found__"):
+                        raise NotFoundError(f"User with ID '{user_id}' not found.")
+                    return UserProfileRead(**cached)
+            except NotFoundError:
+                raise
+            except Exception as exc:
+                logger.warning("Redis read error in get_user_profile: %s", exc)
 
-        # 2. Level 2: Elasticsearch CQRS document (Direct return without backfill)
-        try:
-            es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
-            if es_doc is not None:
-                return UserProfileRead(**es_doc)
-        except Exception as exc:
-            logger.warning("Elasticsearch read error in get_user_profile: %s", exc)
+            # 2. Level 2: Elasticsearch CQRS document
+            try:
+                es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
+                if es_doc is not None:
+                    profile_read = UserProfileRead(**es_doc)
+                    try:
+                        await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
+                    except Exception:
+                        pass
+                    return profile_read
+            except Exception as exc:
+                logger.warning("Elasticsearch read error in get_user_profile: %s", exc)
 
-        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store)
+        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store) or forced revalidation
         profile = await self.repo.get_profile(user_id)
         if profile is None:
             try:
@@ -579,27 +608,32 @@ class UserService:
         limit: int = 20,
         offset: int = 0,
     ) -> List[UserRead]:
-        """Full-text fuzzy search offloaded directly to Elasticsearch."""
-        hits, total = await self.es.search(
-            index="user",
-            query=q,
+        """Full-text fuzzy search offloaded directly to Elasticsearch with graceful DB fallback."""
+        return await self.executor.execute_search(
+            es_index="user",
+            es_query=q,
             limit=limit,
             offset=offset,
+            to_schema=lambda h: UserRead(
+                id=h["id"],
+                name=h.get("name", ""),
+                email=h.get("email", ""),
+                role=h.get("role", "user"),
+                department=h.get("department"),
+                department_id=h.get("department_id"),
+                role_id=h.get("role_id"),
+                phone_masked=None,
+                created_at=datetime.fromisoformat(h["created_at"]) if h.get("created_at") else None,
+            ),
+            fallback_sql="""
+                SELECT id, name, email, role, department, created_at
+                FROM users
+                WHERE name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%'
+                ORDER BY created_at DESC
+                LIMIT $2 OFFSET $3
+            """,
+            fallback_params=[q, limit, offset],
         )
-        results: List[UserRead] = []
-        for hit in hits:
-            results.append(
-                UserRead(
-                    id=hit["id"],
-                    name=hit.get("name", ""),
-                    email=hit.get("email", ""),
-                    role=hit.get("role", "user"),
-                    department=hit.get("department"),
-                    phone_masked=None,
-                    created_at=datetime.fromisoformat(hit["created_at"]) if hit.get("created_at") else None,
-                )
-            )
-        return results
 
     async def update_user(self, user_id: uuid.UUID, payload: UserUpdate) -> UserRead:
         """Partially update user fields with selective re-encryption and cache invalidation."""
