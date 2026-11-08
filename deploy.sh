@@ -11,9 +11,8 @@
 #      random one (DB_PASSWORD, REDIS_PASSWORD, ELASTICSEARCH_PASSWORD,
 #      GRAFANA_ADMIN_PASSWORD, ENCRYPTION_KEYS, BLIND_INDEX_KEY) — never
 #      touches a value you've already customized.
-#   3. Builds and starts the full stack (Postgres, PgBouncer, Redis 7,
-#      Elasticsearch 8 + Kibana, Kafka, Prometheus + Grafana + exporters,
-#      Nginx, and the FastAPI app itself via Gunicorn) with
+#   3. Builds and starts the core stack (Postgres, PgBouncer, Redis 7,
+#      Elasticsearch 8, Nginx, and the FastAPI app itself via Gunicorn) with
 #      deploy/docker-compose.yml.
 #   4. Waits for the app's /healthz and /readyz endpoints, then prints every
 #      service's URL (ports read straight from .env).
@@ -21,9 +20,9 @@
 # Usage:
 #   ./deploy.sh              Full setup + build + start (safe to re-run)
 #   ./deploy.sh --rebuild    Force a clean image rebuild (--no-cache) first
-#   ./deploy.sh --verify     Live-check every service (DB, PgBouncer, Redis
-#                            Cluster, Elasticsearch, Kafka, Nginx, app, k8s
-#                            manifests) and print PASS/FAIL for each
+#   ./deploy.sh --verify     Live-check every service (DB, PgBouncer, Redis,
+#                            Elasticsearch, Nginx, app, k8s manifests)
+#                            and print PASS/FAIL for each
 #   ./deploy.sh --logs       Follow the app container's logs
 #   ./deploy.sh --status     Show container status
 #   ./deploy.sh --down       Stop and remove all containers (keeps volumes)
@@ -273,9 +272,6 @@ print_summary() {
     printf '  %-28s http://127.0.0.1:%s\n' "App (direct)"        "$(get_env_var APP_PORT 8000)"
     printf '  %-28s http://127.0.0.1:%s\n' "App (via Nginx)"     "$(get_env_var NGINX_PORT 80)"
     printf '  %-28s http://127.0.0.1:%s/docs\n' "API docs"       "$(get_env_var APP_PORT 8000)"
-    printf '  %-28s http://127.0.0.1:%s\n' "Kibana"              "$(get_env_var KIBANA_PORT 5601)"
-    printf '  %-28s http://127.0.0.1:%s\n' "Prometheus"          "$(get_env_var PROMETHEUS_PORT 9090)"
-    printf '  %-28s http://127.0.0.1:%s\n' "Grafana"             "$(get_env_var GRAFANA_PORT 3000)"
     printf '  %-28s127.0.0.1:%s\n' "Postgres (direct)"           "$(get_env_var POSTGRES_PORT 5432)"
     printf '  %-28s127.0.0.1:%s\n' "PgBouncer (app uses this)"   "$(get_env_var PGBOUNCER_PORT 6432)"
     printf '  %-28shttp://127.0.0.1:%s\n' "Elasticsearch"        "$(get_env_var ELASTICSEARCH_PORT 9200)"
@@ -297,7 +293,7 @@ run_setup() {
         dc build
     fi
 
-    c_info "Starting the full stack (Postgres, PgBouncer, Redis, Elasticsearch, Kafka, Prometheus, Grafana, Nginx, app)..."
+    c_info "Starting the core stack (Postgres, PgBouncer, Redis, Elasticsearch, Nginx, app)..."
     dc up -d
 
     wait_for_app
@@ -359,14 +355,6 @@ verify_stack() {
     check "Cluster status is not red"                     bash -c "curl -sf http://127.0.0.1:${es_port}/_cluster/health | grep -qv '\"status\":\"red\"'"
 
     echo
-    echo "── Kafka ──────────────────────────────────────────────────────"
-    if [ "$(get_env_var KAFKA_ENABLED false)" = "true" ]; then
-        check "Broker lists topics"                       docker exec demo_kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
-    else
-        c_warn "KAFKA_ENABLED=false — skipped (the app isn't using Kafka in this mode; set KAFKA_ENABLED=true in .env to enable it)."
-    fi
-
-    echo
     echo "── Application & Nginx ─────────────────────────────────────────"
     check "App /healthz (liveness)"                       curl -sf "http://127.0.0.1:${app_port}/healthz"
     check "App /readyz (DB + Redis + Elasticsearch all reachable)" curl -sf "http://127.0.0.1:${app_port}/readyz"
@@ -386,7 +374,7 @@ verify_stack() {
 
     echo
     if [ "$overall_ok" = "1" ]; then
-        c_ok "All checks passed — Postgres, PgBouncer, Redis, Elasticsearch, Kafka (if enabled), the app, and Nginx are all healthy end to end."
+        c_ok "All checks passed — Postgres, PgBouncer, Redis, Elasticsearch, the app, and Nginx are all healthy end to end."
     else
         c_error "One or more checks failed (see the FAIL lines above). Run './deploy.sh --logs' or 'docker compose -f $COMPOSE_FILE logs <service>' to investigate."
     fi
