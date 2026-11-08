@@ -43,6 +43,7 @@ from app.core.redis import close_redis_client, create_redis_client
 from app.core.security import CryptoService
 from app.db.pool import close_db_pool, create_db_pool
 from app.schemas.base import ErrorDetail, ErrorResponse
+from app.services.outbox_worker import OutboxWorker
 from app.services.redis_rate_limit import RATE_LIMIT_LUA_SCRIPT, rate_limiter
 
 # Setup structured application logging
@@ -118,10 +119,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.elasticsearch = es_service
     app.state.log_buffer = log_buffer
 
+    # 6. Initialize Transactional Outbox Background Auto-Sync Worker
+    outbox_worker: Optional[OutboxWorker] = None
+    if getattr(settings, "OUTBOX_ENABLED", True) and db_pool is not None:
+        outbox_worker = OutboxWorker(
+            db_pool=db_pool,
+            elasticsearch=es_service,
+            poll_interval=getattr(settings, "OUTBOX_POLL_INTERVAL", 1.0),
+            batch_size=getattr(settings, "OUTBOX_BATCH_SIZE", 50),
+            max_retries=getattr(settings, "OUTBOX_MAX_RETRIES", 5),
+        )
+        outbox_worker.start()
+    app.state.outbox_worker = outbox_worker
+
     yield
 
     # Graceful Shutdown
     logger.info("Closing application resources...")
+
+    if outbox_worker is not None:
+        try:
+            await outbox_worker.stop()
+        except Exception as exc:
+            logger.warning("Error stopping Outbox auto-sync worker: %s", exc)
 
     if log_buffer is not None:
         try:

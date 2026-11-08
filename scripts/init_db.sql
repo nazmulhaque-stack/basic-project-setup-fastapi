@@ -56,6 +56,23 @@ CREATE TABLE IF NOT EXISTS user_accounts (
 CREATE INDEX IF NOT EXISTS ix_user_accounts_user_id ON user_accounts (user_id);
 CREATE INDEX IF NOT EXISTS ix_user_accounts_account_number ON user_accounts (account_number);
 
+-- 5. Transactional Outbox Table (Tracks ES Synchronization)
+CREATE TABLE IF NOT EXISTS outbox (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    aggregate_type VARCHAR(50) NOT NULL,
+    aggregate_id VARCHAR(64) NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    retry_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_outbox_pending ON outbox (status, created_at) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS ix_outbox_aggregate ON outbox (aggregate_type, aggregate_id);
+
 -- Seed initial departments and roles
 INSERT INTO departments (name, code, description) VALUES
 ('Engineering', 'ENG', 'Software Engineering & Platform Infrastructure'),

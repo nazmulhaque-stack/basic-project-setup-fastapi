@@ -9,6 +9,7 @@ import uuid
 
 from fastapi import APIRouter, Body, Query, status
 
+from app.schemas.outbox import OutboxEventRead
 from app.schemas.user import (
     AccountCreate,
     AccountRead,
@@ -94,6 +95,35 @@ async def sync_users_to_es(
     service: UserServiceDep,
 ) -> dict:
     return await service.sync_all_to_es()
+
+
+@router.get(
+    "/outbox",
+    response_model=List[OutboxEventRead],
+    summary="List Outbox events",
+    description="Returns Transactional Outbox records tracking PostgreSQL -> Elasticsearch synchronization status, publish timestamp, and retry count.",
+)
+async def list_outbox_events(
+    service: UserServiceDep,
+    limit: Annotated[int, Query(ge=1, le=100, description="Max outbox records")] = 50,
+    status: Annotated[Optional[str], Query(description="Filter by outbox status: PENDING, PUBLISHED, FAILED")] = None,
+) -> List[OutboxEventRead]:
+    events = await service.list_outbox_events(limit=limit, status=status)
+    return [
+        OutboxEventRead(
+            id=e.id,
+            aggregate_type=e.aggregate_type,
+            aggregate_id=e.aggregate_id,
+            event_type=e.event_type,
+            payload=e.payload,
+            status=e.status,
+            retry_count=e.retry_count,
+            last_error=e.last_error,
+            created_at=e.created_at,
+            published_at=e.published_at,
+        )
+        for e in events
+    ]
 
 
 # ------------------------------------------------------------------------------

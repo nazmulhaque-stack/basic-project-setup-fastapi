@@ -283,6 +283,12 @@ class Settings(BaseSettings):
     CACHE_ENABLE_NEGATIVE_CACHE: bool = True
     CACHE_ENABLE_STAMPEDE_LOCK: bool = True
 
+    # Transactional Outbox & Background Elasticsearch Synchronization
+    OUTBOX_ENABLED: bool = Field(default=True, description="Enable transactional outbox processing")
+    OUTBOX_POLL_INTERVAL: float = Field(default=1.0, description="Interval in seconds between outbox worker polls")
+    OUTBOX_BATCH_SIZE: int = Field(default=50, description="Max outbox records processed per batch")
+    OUTBOX_MAX_RETRIES: int = Field(default=5, description="Max retry attempts for failed outbox sync events")
+
     # Encryption (AES-256-GCM + Blind Index)
     # Map of version_int -> 64-char hex string (32 bytes)
     ENCRYPTION_KEYS: str = Field(

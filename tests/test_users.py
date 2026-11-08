@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.base import decode_cursor, encode_cursor
+from app.schemas.outbox import OutboxEventRead
 from app.schemas.user import (
     AccountCreate,
     AccountRead,
@@ -139,4 +140,27 @@ def test_user_create_with_string_department() -> None:
     })
     assert user.department == "Engineering"
     assert user.role == "Administrator"
+
+
+def test_outbox_event_schema() -> None:
+    """Verifies Transactional Outbox schema and serialization."""
+    event_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    event = OutboxEventRead(
+        id=event_id,
+        aggregate_type="user",
+        aggregate_id=str(uuid.uuid4()),
+        event_type="CREATE",
+        payload={"user": {"name": "Test User"}, "profile": {}},
+        status="PUBLISHED",
+        retry_count=0,
+        last_error=None,
+        created_at=now,
+        published_at=now,
+    )
+    assert event.id == event_id
+    assert event.status == "PUBLISHED"
+    assert event.published_at == now
+    assert event.payload["user"]["name"] == "Test User"
+
 

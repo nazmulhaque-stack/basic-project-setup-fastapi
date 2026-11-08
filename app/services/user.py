@@ -1,11 +1,12 @@
 """User Service: Clean domain orchestration with direct Redis caching and Elasticsearch search (no OOP BaseService)."""
 
+import asyncio
 from datetime import datetime, timezone
 import logging
 from typing import Annotated, Any, Dict, List, Optional
 import uuid
 
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from app.api.deps import CryptoDep, ElasticsearchDep, RedisDep, SessionDep
 from app.core.cache_interface import ICacheService, NullCache
@@ -14,7 +15,9 @@ from app.core.elasticsearch import IElasticsearchService, NullElasticsearch
 from app.core.exceptions import ConflictError, DecryptionError, NotFoundError
 from app.core.security import CryptoService
 from app.db.pool import UnitOfWork
+from app.models.outbox import OutboxEvent
 from app.models.user import Department, Role, User, UserAccount, UserProfile
+from app.repositories.outbox import OutboxRepository
 from app.repositories.user import UserRepository
 from app.schemas.base import decode_cursor, encode_cursor
 from app.schemas.user import (
@@ -34,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 class UserService:
-    """User business logic, PII encryption, Redis caching, and Elasticsearch search."""
+    """User business logic, PII encryption, Redis caching, Transactional Outbox, and Elasticsearch search."""
 
     def __init__(
         self,
@@ -42,13 +45,16 @@ class UserService:
         cache: Optional[ICacheService] = None,
         crypto: Optional[CryptoService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
+        outbox_worker: Optional[Any] = None,
         **_: Any,
     ) -> None:
         self.db = db
         self.repo = UserRepository(db)
+        self.outbox_repo = OutboxRepository(db)
         self.cache: ICacheService = cache or NullCache()
         self.crypto: Optional[CryptoService] = crypto
         self.es: IElasticsearchService = elasticsearch or NullElasticsearch()
+        self.outbox_worker = outbox_worker
 
     def _to_read_schema(self, user: User) -> UserRead:
         """Decrypts phone using AAD and returns safe masked representation."""
@@ -131,41 +137,76 @@ class UserService:
         )
 
     # --------------------------------------------------------------------------
-    # Elasticsearch Synchronization (Write Path)
+    # Transactional Outbox & Elasticsearch Synchronization (Write Path)
     # --------------------------------------------------------------------------
-    async def _sync_user_to_es(self, user_id: uuid.UUID) -> None:
-        """Synchronizes user entity and aggregated profile document to Elasticsearch."""
+    async def _build_user_es_payload(self, user_id: uuid.UUID) -> Dict[str, Any]:
+        """Constructs both User and UserProfile documents for Outbox payload."""
         profile = await self.repo.get_profile(user_id)
         if profile is None:
-            return
+            return {}
 
         user = profile.user
-        # 1. Sync 'user' index
-        await self.es.index_document(
-            index="user",
-            id_=str(user.id),
-            document={
-                "id": str(user.id),
-                "name": user.name,
-                "email": user.email,
-                "role": user.role,
-                "department": user.department,
-                "created_at": user.created_at.isoformat() if user.created_at else None,
-            },
-        )
+        user_doc = {
+            "id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+            "department": user.department,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
 
-        # 2. Sync 'user_profile' index (Full denormalized CQRS document)
         profile_read = self._to_profile_read(profile)
-        doc = profile_read.model_dump(mode="json")
-        doc["department_name"] = profile_read.department.name if profile_read.department else None
-        doc["department_code"] = profile_read.department.code if profile_read.department else None
-        doc["role_name"] = profile_read.role_info.name if profile_read.role_info else None
-        doc["account_numbers"] = [a.account_number for a in profile_read.accounts]
-        await self.es.index_document(
-            index="user_profile",
-            id_=str(user.id),
-            document=doc,
-        )
+        profile_doc = profile_read.model_dump(mode="json")
+        profile_doc["department_name"] = profile_read.department.name if profile_read.department else None
+        profile_doc["department_code"] = profile_read.department.code if profile_read.department else None
+        profile_doc["role_name"] = profile_read.role_info.name if profile_read.role_info else None
+        profile_doc["account_numbers"] = [a.account_number for a in profile_read.accounts]
+
+        return {
+            "user": user_doc,
+            "profile": profile_doc,
+        }
+
+    async def _dispatch_outbox_sync(self, event: OutboxEvent) -> None:
+        """Dispatches outbox event synchronization to Elasticsearch."""
+        if self.outbox_worker is not None:
+            asyncio.create_task(self.outbox_worker.sync_now(event.id))
+        else:
+            try:
+                agg_id = str(event.aggregate_id)
+                if event.event_type in ("CREATE", "UPDATE", "ACCOUNT_ADDED"):
+                    user_doc = event.payload.get("user")
+                    if user_doc:
+                        await self.es.index_document(index="user", id_=agg_id, document=user_doc)
+                    profile_doc = event.payload.get("profile")
+                    if profile_doc:
+                        await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
+                elif event.event_type == "DELETE":
+                    await self.es.delete_document(index="user", id_=agg_id)
+                    await self.es.delete_document(index="user_profile", id_=agg_id)
+
+                now = datetime.now(timezone.utc)
+                await self.outbox_repo.mark_published(event.id, published_at=now)
+            except Exception as exc:
+                logger.warning("Direct outbox sync fallback failed: %s", exc)
+
+    async def list_outbox_events(
+        self,
+        limit: int = 50,
+        status: Optional[str] = None,
+    ) -> List[OutboxEvent]:
+        """Lists recent Transactional Outbox records tracking PostgreSQL -> ES sync status."""
+        return await self.outbox_repo.list_events(limit=limit, status=status)
+
+    async def _sync_user_to_es(self, user_id: uuid.UUID) -> None:
+        """Direct fallback sync for user entity and profile document to Elasticsearch."""
+        payload = await self._build_user_es_payload(user_id)
+        if not payload:
+            return
+        if "user" in payload:
+            await self.es.index_document(index="user", id_=str(user_id), document=payload["user"])
+        if "profile" in payload:
+            await self.es.index_document(index="user_profile", id_=str(user_id), document=payload["profile"])
 
     async def sync_all_to_es(self) -> Dict[str, Any]:
         """Bulk synchronizes all users and profiles from PostgreSQL into Elasticsearch."""
@@ -235,15 +276,24 @@ class UserService:
 
         read_model = self._to_read_schema(created)
 
-        # 5. Invalidate Redis list cache and store item
+        # 5. Insert Transactional Outbox Event (BEFORE commit, inside same atomic transaction!)
+        es_payload = await self._build_user_es_payload(created.id)
+        outbox_event = await self.outbox_repo.create_event(
+            aggregate_type="user",
+            aggregate_id=str(created.id),
+            event_type="CREATE",
+            payload=es_payload,
+        )
+
+        # 6. Invalidate Redis list cache and store item
         await self.cache.invalidate_lists()
         await self.cache.set_item(str(created.id), read_model.model_dump(mode="json"))
 
-        # 6. Commit Database Transaction
+        # 7. Commit Database Transaction (Atomic: User + Outbox event committed together)
         await self.db.commit()
 
-        # 7. Sync Elasticsearch (both user and user_profile documents)
-        await self._sync_user_to_es(created.id)
+        # 8. Dispatch Outbox sync (Immediate execution + background auto-sync retry on failure)
+        await self._dispatch_outbox_sync(outbox_event)
 
         return read_model
 
@@ -333,14 +383,23 @@ class UserService:
         )
         created = await self.repo.create_account(account)
 
+        # Insert Transactional Outbox Event (BEFORE commit!)
+        es_payload = await self._build_user_es_payload(user_id)
+        outbox_event = await self.outbox_repo.create_event(
+            aggregate_type="user",
+            aggregate_id=str(user_id),
+            event_type="ACCOUNT_ADDED",
+            payload=es_payload,
+        )
+
         # Invalidate profile cache so next read fetches updated accounts
         await self.cache.delete_item(f"profile:{user_id}")
 
-        # Commit DB transaction
+        # Commit DB transaction (Atomic: Account + Outbox event committed together)
         await self.db.commit()
 
-        # Sync Elasticsearch profile document immediately on write
-        await self._sync_user_to_es(user_id)
+        # Dispatch Outbox sync (Immediate execution + background auto-sync retry on failure)
+        await self._dispatch_outbox_sync(outbox_event)
 
         return AccountRead(
             id=created.id,
@@ -482,21 +541,38 @@ class UserService:
         updated = await self.repo.update(user)
         read_model = self._to_read_schema(updated)
 
+        # Insert Transactional Outbox Event (BEFORE commit!)
+        es_payload = await self._build_user_es_payload(updated.id)
+        outbox_event = await self.outbox_repo.create_event(
+            aggregate_type="user",
+            aggregate_id=str(updated.id),
+            event_type="UPDATE",
+            payload=es_payload,
+        )
+
         # Invalidate Redis item, profile, & list cache
         await self.cache.delete_item(str(user_id))
         await self.cache.delete_item(f"profile:{user_id}")
         await self.cache.invalidate_lists()
 
-        # Commit DB transaction
+        # Commit DB transaction (Atomic: User update + Outbox event committed together)
         await self.db.commit()
 
-        # Sync Elasticsearch (both user and user_profile documents) immediately on write
-        await self._sync_user_to_es(updated.id)
+        # Dispatch Outbox sync (Immediate execution + background auto-sync retry on failure)
+        await self._dispatch_outbox_sync(outbox_event)
 
         return read_model
 
     async def delete_user(self, user_id: uuid.UUID) -> None:
-        """Delete user, purge Redis cache, and delete document from Elasticsearch."""
+        """Delete user, purge Redis cache, and register delete event in Transactional Outbox."""
+        # Insert Outbox delete event BEFORE commit
+        outbox_event = await self.outbox_repo.create_event(
+            aggregate_type="user",
+            aggregate_id=str(user_id),
+            event_type="DELETE",
+            payload={},
+        )
+
         deleted = await self.repo.delete(user_id)
         if not deleted:
             raise NotFoundError(f"User with ID '{user_id}' not found.")
@@ -506,12 +582,11 @@ class UserService:
         await self.cache.delete_item(f"profile:{user_id}")
         await self.cache.invalidate_lists()
 
-        # Commit DB transaction
+        # Commit DB transaction (Atomic: Delete + Outbox event committed together)
         await self.db.commit()
 
-        # Delete from Elasticsearch immediately on write
-        await self.es.delete_document(index="user", id_=str(user_id))
-        await self.es.delete_document(index="user_profile", id_=str(user_id))
+        # Dispatch Outbox sync (Deletes from ES and marks outbox published)
+        await self._dispatch_outbox_sync(outbox_event)
 
 
 # ------------------------------------------------------------------------------
@@ -543,13 +618,19 @@ def get_user_service(
     cache: UserCacheDep,
     crypto: CryptoDep,
     es: ElasticsearchDep,
+    request: Request,
 ) -> UserService:
-    """Dependency composing database, Redis, AES-256-GCM, and Elasticsearch into UserService."""
+    """Dependency composing database, Redis, AES-256-GCM, Outbox, and Elasticsearch into UserService."""
+    worker = None
+    if hasattr(request, "app") and hasattr(request.app, "state"):
+        worker = getattr(request.app.state, "outbox_worker", None)
+
     return UserService(
         db=session,
         cache=cache,
         crypto=crypto,
         elasticsearch=es,
+        outbox_worker=worker,
     )
 
 
