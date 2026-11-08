@@ -285,7 +285,9 @@ class UserService:
             payload=es_payload,
         )
 
-        # 6. Invalidate Redis list cache and store item
+        # 6. Cache synchronization:
+        #    - Invalidate list cache (O(1) version bump) to prevent stale paginated list reads.
+        #    - Pre-warm item cache (write-through) for instant sub-millisecond subsequent reads.
         await self.cache.invalidate_lists()
         await self.cache.set_item(str(created.id), read_model.model_dump(mode="json"))
 
