@@ -10,6 +10,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/", summary="Root Status", include_in_schema=False)
+async def root() -> Dict[str, str]:
+    """Root endpoint welcoming clients and directing them to API documentation."""
+    return {
+        "status": "healthy",
+        "service": "High-Performance Stateless FastAPI Service",
+        "docs": "/docs",
+        "health": "/healthz",
+    }
+
+
 @router.get(
     "/healthz",
     summary="Liveness Probe",

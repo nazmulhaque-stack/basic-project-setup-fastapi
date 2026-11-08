@@ -98,3 +98,45 @@ def test_user_profile_schemas() -> None:
     assert profile.accounts[0].account_number == "ACC-123456"
     assert profile.total_balance_cents == 250000
     assert profile.account_count == 1
+
+
+def test_user_create_with_zero_department_and_role_id() -> None:
+    """Verifies that Swagger default zeros for department_id and role_id are safely handled without FK crashes."""
+    user = UserCreate.model_validate({
+        "name": "string",
+        "email": "user2@example.com",
+        "role": "user",
+        "department_id": 0,
+        "role_id": 0,
+        "phone": "+14155552673",
+        "accounts": [
+            {
+                "account_number": "ACC-TEST-001",
+                "account_type": "checking",
+                "balance_cents": 0,
+                "currency": "USD",
+                "status": "active",
+            }
+        ],
+    })
+    assert user.name == "string"
+    assert user.email == "user2@example.com"
+    # department_id = 0 should be stripped/ignored so it doesn't cause foreign key 0 error
+    assert user.department is None
+    assert user.phone == "+14155552673"
+    assert len(user.accounts) == 1
+    assert user.accounts[0].account_number == "ACC-TEST-001"
+
+
+def test_user_create_with_string_department() -> None:
+    """Verifies that text/string department names are stored correctly."""
+    user = UserCreate.model_validate({
+        "name": "Sarah Connor",
+        "email": "sarah@cyberdyne.com",
+        "role": "Administrator",
+        "department": "Engineering",
+        "phone": "+14155552674",
+    })
+    assert user.department == "Engineering"
+    assert user.role == "Administrator"
+

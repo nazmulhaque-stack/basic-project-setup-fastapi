@@ -22,14 +22,13 @@ CREATE TABLE IF NOT EXISTS roles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 3. Users Table
+-- 3. Users Table (Text/String relations, no strict FK constraints)
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) NOT NULL UNIQUE,
-    role VARCHAR(50) NOT NULL,
-    department_id INTEGER REFERENCES departments(id) ON DELETE SET NULL,
-    role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
+    role VARCHAR(50) NOT NULL DEFAULT 'user',
+    department VARCHAR(100),
     phone_encrypted TEXT NOT NULL,
     phone_blind_index VARCHAR(64) NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -38,14 +37,13 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS ix_users_email ON users (email);
 CREATE INDEX IF NOT EXISTS ix_users_phone_blind_index ON users (phone_blind_index);
 CREATE INDEX IF NOT EXISTS ix_users_role ON users (role);
-CREATE INDEX IF NOT EXISTS ix_users_department_id ON users (department_id);
-CREATE INDEX IF NOT EXISTS ix_users_role_id ON users (role_id);
+CREATE INDEX IF NOT EXISTS ix_users_department ON users (department);
 CREATE INDEX IF NOT EXISTS ix_users_created_at_id ON users (created_at, id);
 
 -- 4. User Accounts Table
 CREATE TABLE IF NOT EXISTS user_accounts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
     account_number VARCHAR(64) NOT NULL UNIQUE,
     account_type VARCHAR(50) NOT NULL DEFAULT 'checking',
     balance_cents BIGINT NOT NULL DEFAULT 0,

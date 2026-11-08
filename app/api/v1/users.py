@@ -7,7 +7,7 @@ and full-text Elasticsearch fuzzy search.
 from typing import Annotated, List, Optional
 import uuid
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Body, Query, status
 
 from app.schemas.user import (
     AccountCreate,
@@ -107,7 +107,44 @@ async def sync_users_to_es(
     description="Creates a user with AES-256-GCM AEAD encryption, HMAC blind indexing, Redis caching, and direct Elasticsearch indexing.",
 )
 async def create_user(
-    payload: UserCreate,
+    payload: Annotated[
+        UserCreate,
+        Body(
+            openapi_examples={
+                "corporate_admin": {
+                    "summary": "Administrator with Corporate Account",
+                    "description": "Full-featured user in Engineering department with an initial corporate account.",
+                    "value": {
+                        "name": "Sarah Connor",
+                        "email": "sarah.connor@example.com",
+                        "role": "Administrator",
+                        "department": "Engineering",
+                        "phone": "+14155552671",
+                        "accounts": [
+                            {
+                                "account_number": "ACC-CORP-1001",
+                                "account_type": "corporate",
+                                "balance_cents": 500000,
+                                "currency": "USD",
+                                "status": "active"
+                            }
+                        ]
+                    }
+                },
+                "standard_user": {
+                    "summary": "Standard User (Without Accounts)",
+                    "description": "Basic user with Operations department and standard user role.",
+                    "value": {
+                        "name": "Alex Mercer",
+                        "email": "alex.mercer@example.com",
+                        "role": "user",
+                        "department": "Operations",
+                        "phone": "+14155559876"
+                    }
+                }
+            }
+        )
+    ],
     service: UserServiceDep,
 ) -> UserRead:
     return await service.create_user(payload)
@@ -150,7 +187,33 @@ async def get_user_profile(
 )
 async def add_user_account(
     user_id: uuid.UUID,
-    payload: AccountCreate,
+    payload: Annotated[
+        AccountCreate,
+        Body(
+            openapi_examples={
+                "savings": {
+                    "summary": "Savings Account",
+                    "value": {
+                        "account_number": "ACC-SAV-2026",
+                        "account_type": "savings",
+                        "balance_cents": 250000,
+                        "currency": "USD",
+                        "status": "active"
+                    }
+                },
+                "corporate": {
+                    "summary": "Corporate Checking Account",
+                    "value": {
+                        "account_number": "ACC-CORP-5050",
+                        "account_type": "corporate",
+                        "balance_cents": 1000000,
+                        "currency": "USD",
+                        "status": "active"
+                    }
+                }
+            }
+        )
+    ],
     service: UserServiceDep,
 ) -> AccountRead:
     return await service.add_user_account(user_id, payload)
@@ -177,7 +240,26 @@ async def get_user(
 )
 async def update_user(
     user_id: uuid.UUID,
-    payload: UserUpdate,
+    payload: Annotated[
+        UserUpdate,
+        Body(
+            openapi_examples={
+                "update_department_and_phone": {
+                    "summary": "Update Department & Phone",
+                    "value": {
+                        "department": "Finance",
+                        "phone": "+14155558899"
+                    }
+                },
+                "promote_role": {
+                    "summary": "Promote Role to Manager",
+                    "value": {
+                        "role": "Manager"
+                    }
+                }
+            }
+        )
+    ],
     service: UserServiceDep,
 ) -> UserRead:
     return await service.update_user(user_id, payload)

@@ -16,6 +16,7 @@ def _row_to_user(row: Any) -> User:
         name=row["name"],
         email=row["email"],
         role=row["role"],
+        department=row.get("department"),
         phone_encrypted=row["phone_encrypted"],
         phone_blind_index=row["phone_blind_index"],
         department_id=row.get("department_id"),
@@ -30,30 +31,27 @@ def _row_to_profile(row: Any) -> UserProfile:
         name=row["user_name"],
         email=row["user_email"],
         role=row["user_role"],
+        department=row.get("user_department"),
         phone_encrypted=row["user_phone_encrypted"],
         phone_blind_index=row["user_phone_blind_index"],
-        department_id=row["department_id"],
-        role_id=row["role_id"],
         created_at=row["user_created_at"],
     )
 
     dept: Optional[Department] = None
-    if row["department_id"] and row["dept_name"]:
+    if row.get("user_department"):
         dept = Department(
-            id=row["department_id"],
-            name=row["dept_name"],
-            code=row["dept_code"],
-            description=row["dept_description"],
+            id=row.get("dept_id"),
+            name=row["dept_name"] or row["user_department"],
+            code=row["dept_code"] or row["user_department"],
+            description=row.get("dept_description"),
         )
 
-    role: Optional[Role] = None
-    if row["role_id"] and row["role_name"]:
-        role = Role(
-            id=row["role_id"],
-            name=row["role_name"],
-            description=row["role_description"],
-            permissions=list(row["role_permissions"] or []),
-        )
+    role: Optional[Role] = Role(
+        id=row.get("role_id"),
+        name=row["role_name"] or row["user_role"],
+        description=row.get("role_description"),
+        permissions=list(row["role_permissions"] or []),
+    )
 
     accounts_data = row["accounts_json"]
     if isinstance(accounts_data, str):
@@ -91,17 +89,18 @@ PROFILE_BASE_QUERY = """
         u.name AS user_name,
         u.email AS user_email,
         u.role AS user_role,
+        u.department AS user_department,
         u.phone_encrypted AS user_phone_encrypted,
         u.phone_blind_index AS user_phone_blind_index,
         u.created_at AS user_created_at,
-        u.department_id,
-        u.role_id,
-        d.name AS dept_name,
-        d.code AS dept_code,
+        d.id AS dept_id,
+        COALESCE(d.name, u.department) AS dept_name,
+        COALESCE(d.code, u.department) AS dept_code,
         d.description AS dept_description,
-        r.name AS role_name,
+        r.id AS role_id,
+        COALESCE(r.name, u.role) AS role_name,
         r.description AS role_description,
-        r.permissions AS role_permissions,
+        COALESCE(r.permissions, '{}') AS role_permissions,
         COALESCE(
             json_agg(
                 json_build_object(
@@ -118,8 +117,8 @@ PROFILE_BASE_QUERY = """
         ) AS accounts_json,
         COALESCE(SUM(a.balance_cents), 0)::bigint AS total_balance_cents
     FROM users u
-    LEFT JOIN departments d ON d.id = u.department_id
-    LEFT JOIN roles r ON r.id = u.role_id
+    LEFT JOIN departments d ON (LOWER(d.name) = LOWER(u.department) OR LOWER(d.code) = LOWER(u.department))
+    LEFT JOIN roles r ON LOWER(r.name) = LOWER(u.role)
     LEFT JOIN user_accounts a ON a.user_id = u.id
 """
 
@@ -144,8 +143,8 @@ class UserRepository:
 
     async def create(self, user: User) -> User:
         query = """
-            INSERT INTO users (id, name, email, role, phone_encrypted, phone_blind_index, department_id, role_id, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO users (id, name, email, role, department, phone_encrypted, phone_blind_index, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING *
         """
         row = await self.db.fetchrow(
@@ -154,10 +153,9 @@ class UserRepository:
             user.name,
             user.email,
             user.role,
+            user.department,
             user.phone_encrypted,
             user.phone_blind_index,
-            user.department_id,
-            user.role_id,
             user.created_at or datetime.now(timezone.utc),
         )
         return _row_to_user(row)
@@ -165,8 +163,8 @@ class UserRepository:
     async def update(self, user: User) -> User:
         query = """
             UPDATE users
-            SET name = $1, email = $2, role = $3, phone_encrypted = $4, phone_blind_index = $5, department_id = $6, role_id = $7
-            WHERE id = $8
+            SET name = $1, email = $2, role = $3, department = $4, phone_encrypted = $5, phone_blind_index = $6
+            WHERE id = $7
             RETURNING *
         """
         row = await self.db.fetchrow(
@@ -174,10 +172,9 @@ class UserRepository:
             user.name,
             user.email,
             user.role,
+            user.department,
             user.phone_encrypted,
             user.phone_blind_index,
-            user.department_id,
-            user.role_id,
             user.id,
         )
         return _row_to_user(row)
@@ -220,14 +217,14 @@ class UserRepository:
     # Complex Aggregated Query: User Profile (User + Department + Role + Accounts)
     # --------------------------------------------------------------------------
     async def get_profile(self, user_id: uuid.UUID) -> Optional[UserProfile]:
-        """Complex query joining users, departments, roles, and user_accounts in a single round-trip."""
-        query = f"{PROFILE_BASE_QUERY} WHERE u.id = $1 GROUP BY u.id, d.id, r.id"
+        """Complex query joining users, departments, roles, and user_accounts on text/string relations."""
+        query = f"{PROFILE_BASE_QUERY} WHERE u.id = $1 GROUP BY u.id, d.id, r.id, d.name, d.code, d.description, r.name, r.description, r.permissions"
         row = await self.db.fetchrow(query, user_id)
         return _row_to_profile(row) if row else None
 
     async def list_all_profiles(self) -> List[UserProfile]:
         """Fetches all user profiles for bulk Elasticsearch synchronization."""
-        query = f"{PROFILE_BASE_QUERY} GROUP BY u.id, d.id, r.id ORDER BY u.created_at ASC"
+        query = f"{PROFILE_BASE_QUERY} GROUP BY u.id, d.id, r.id, d.name, d.code, d.description, r.name, r.description, r.permissions ORDER BY u.created_at ASC"
         rows = await self.db.fetch(query)
         return [_row_to_profile(r) for r in rows]
 

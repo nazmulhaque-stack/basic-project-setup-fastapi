@@ -66,8 +66,9 @@ class UserService:
             name=user.name,
             email=user.email,
             role=user.role,
-            department_id=user.department_id,
-            role_id=user.role_id,
+            department=user.department,
+            department_id=user.department_id or user.department,
+            role_id=user.role_id or user.role,
             phone_masked=masked_phone,
             created_at=user.created_at or datetime.now(timezone.utc),
         )
@@ -148,6 +149,7 @@ class UserService:
                 "name": user.name,
                 "email": user.email,
                 "role": user.role,
+                "department": user.department,
                 "created_at": user.created_at.isoformat() if user.created_at else None,
             },
         )
@@ -204,8 +206,9 @@ class UserService:
             name=payload.name,
             email=str(payload.email),
             role=payload.role,
-            department_id=payload.department_id,
-            role_id=payload.role_id,
+            department=payload.department,
+            department_id=None,
+            role_id=None,
             phone_encrypted=phone_encrypted,
             phone_blind_index=phone_blind_index,
             created_at=datetime.now(timezone.utc),
@@ -439,6 +442,7 @@ class UserService:
                     name=hit.get("name", ""),
                     email=hit.get("email", ""),
                     role=hit.get("role", "user"),
+                    department=hit.get("department"),
                     phone_masked=None,
                     created_at=datetime.fromisoformat(hit["created_at"]) if hit.get("created_at") else None,
                 )
@@ -463,10 +467,8 @@ class UserService:
             user.name = payload.name
         if payload.role is not None:
             user.role = payload.role
-        if payload.department_id is not None:
-            user.department_id = payload.department_id
-        if payload.role_id is not None:
-            user.role_id = payload.role_id
+        if payload.department is not None:
+            user.department = payload.department
 
         if payload.phone is not None:
             if self.crypto is not None:

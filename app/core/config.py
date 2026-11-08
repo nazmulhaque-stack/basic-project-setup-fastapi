@@ -10,10 +10,10 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -99,6 +99,20 @@ class Settings(BaseSettings):
     APP_NAME: str = "HighPerfStatelessService"
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, v: Any) -> bool:
+        """Tolerates string values like 'release', 'production', 'dev', etc."""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            v_clean = v.strip().lower()
+            if v_clean in ("true", "1", "yes", "debug", "dev", "development"):
+                return True
+            if v_clean in ("false", "0", "no", "release", "prod", "production"):
+                return False
+        return False
 
     # PostgreSQL / PgBouncer Connection & Pooling
     # Database Credentials & Individual Connection Parameters
