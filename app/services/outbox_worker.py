@@ -85,21 +85,43 @@ class OutboxWorker:
         event_type = event.event_type.upper()
         payload = event.payload or {}
 
+        # Safe decoding if payload was double-encoded or stored as string
+        if isinstance(payload, str):
+            try:
+                parsed = orjson.loads(payload)
+                if isinstance(parsed, str):
+                    parsed = orjson.loads(parsed)
+                payload = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                payload = {}
+
         if agg_type in ("user", "user_profile"):
             if event_type in ("CREATE", "UPDATE", "ACCOUNT_ADDED"):
-                # 1. Sync User index document
-                user_doc = payload.get("user")
-                if user_doc:
+                # 1. Sync User index document: handles both direct doc or nested {"user": {...}}
+                user_doc = payload.get("user") if isinstance(payload, dict) and "user" in payload else payload
+                if isinstance(user_doc, str):
+                    try:
+                        user_doc = orjson.loads(user_doc)
+                    except Exception:
+                        user_doc = {}
+
+                if isinstance(user_doc, dict) and user_doc:
                     await self.es.index_document(index="user", id_=agg_id, document=user_doc)
 
-                # 2. Sync UserProfile index document
-                profile_doc = payload.get("profile")
-                if profile_doc:
+                # 2. Sync UserProfile index document if present
+                profile_doc = payload.get("profile") if isinstance(payload, dict) else None
+                if isinstance(profile_doc, dict) and profile_doc:
                     await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
 
             elif event_type == "DELETE":
                 await self.es.delete_document(index="user", id_=agg_id)
                 await self.es.delete_document(index="user_profile", id_=agg_id)
+        else:
+            if event_type in ("CREATE", "UPDATE"):
+                if isinstance(payload, dict) and payload:
+                    await self.es.index_document(index=agg_type, id_=agg_id, document=payload)
+            elif event_type == "DELETE":
+                await self.es.delete_document(index=agg_type, id_=agg_id)
 
     async def process_batch(self) -> int:
         """Processes one batch of pending outbox events using FOR UPDATE SKIP LOCKED."""

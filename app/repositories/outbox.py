@@ -16,10 +16,19 @@ from app.models.outbox import OutboxEvent
 
 def _row_to_outbox(row: Any) -> OutboxEvent:
     raw_payload = row["payload"]
+    payload_dict: Dict[str, Any]
     if isinstance(raw_payload, str):
-        payload_dict = orjson.loads(raw_payload)
+        try:
+            parsed = orjson.loads(raw_payload)
+            if isinstance(parsed, str):
+                parsed = orjson.loads(parsed)
+            payload_dict = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            payload_dict = {}
+    elif isinstance(raw_payload, dict):
+        payload_dict = raw_payload
     else:
-        payload_dict = raw_payload or {}
+        payload_dict = {}
 
     return OutboxEvent(
         id=row["id"],
