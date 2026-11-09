@@ -485,6 +485,7 @@ class UserService:
         limit: int = 20,
         offset: int = 0,
         include_aggregations: bool = False,
+        use_cache: bool = True
     ) -> UserSearchResult:
         """Complex search orchestrating multi-field full-text, faceted filters, numeric ranges, aggregations, and DB fallback."""
         if isinstance(query, UserSearchQuery):
@@ -512,228 +513,229 @@ class UserService:
         # ----------------------------------------------------------------------
         # 1. Primary: Elasticsearch Complex Bool Query against `user_profile`
         # ----------------------------------------------------------------------
-        try:
-            must_clauses: List[Dict[str, Any]] = []
-            filter_clauses: List[Dict[str, Any]] = []
+        if use_cache:
+            try:
+                must_clauses: List[Dict[str, Any]] = []
+                filter_clauses: List[Dict[str, Any]] = []
 
-            if params.q and params.q.strip():
-                cleaned_q = params.q.strip()
-                must_clauses.append({
-                    "multi_match": {
-                        "query": cleaned_q,
-                        "fields": [
-                            "name^3",
-                            "email^2",
-                            "department^1.5",
-                            "department_name^1.5",
-                            "department_code^1.5",
-                            "role^1.5",
-                            "role_name^1.5",
-                            "account_numbers^2",
-                        ],
-                        "fuzziness": "AUTO",
-                        "prefix_length": 2,
-                    }
-                })
-            else:
-                must_clauses.append({"match_all": {}})
+                if params.q and params.q.strip():
+                    cleaned_q = params.q.strip()
+                    must_clauses.append({
+                        "multi_match": {
+                            "query": cleaned_q,
+                            "fields": [
+                                "name^3",
+                                "email^2",
+                                "department^1.5",
+                                "department_name^1.5",
+                                "department_code^1.5",
+                                "role^1.5",
+                                "role_name^1.5",
+                                "account_numbers^2",
+                            ],
+                            "fuzziness": "AUTO",
+                            "prefix_length": 2,
+                        }
+                    })
+                else:
+                    must_clauses.append({"match_all": {}})
 
-            if params.department:
-                dept_val = params.department.strip()
-                filter_clauses.append({
+                if params.department:
+                    dept_val = params.department.strip()
+                    filter_clauses.append({
+                        "bool": {
+                            "should": [
+                                {"term": {"department.keyword": dept_val}},
+                                {"term": {"department_code.keyword": dept_val}},
+                                {"term": {"department_name.keyword": dept_val}},
+                                {"match": {"department": dept_val}},
+                                {"match": {"department_name": dept_val}},
+                            ],
+                            "minimum_should_match": 1,
+                        }
+                    })
+
+                if params.role:
+                    role_val = params.role.strip()
+                    filter_clauses.append({
+                        "bool": {
+                            "should": [
+                                {"term": {"role.keyword": role_val}},
+                                {"term": {"role_name.keyword": role_val}},
+                                {"match": {"role": role_val}},
+                                {"match": {"role_name": role_val}},
+                            ],
+                            "minimum_should_match": 1,
+                        }
+                    })
+
+                if params.account_type:
+                    filter_clauses.append({
+                        "term": {"account_types.keyword": params.account_type.strip().lower()}
+                    })
+
+                if params.currency:
+                    filter_clauses.append({
+                        "term": {"currencies.keyword": params.currency.strip().upper()}
+                    })
+
+                balance_range: Dict[str, Any] = {}
+                if params.min_balance_cents is not None:
+                    balance_range["gte"] = params.min_balance_cents
+                if params.max_balance_cents is not None:
+                    balance_range["lte"] = params.max_balance_cents
+                if balance_range:
+                    filter_clauses.append({"range": {"total_balance_cents": balance_range}})
+
+                accounts_range: Dict[str, Any] = {}
+                if params.min_accounts is not None:
+                    accounts_range["gte"] = params.min_accounts
+                if params.max_accounts is not None:
+                    accounts_range["lte"] = params.max_accounts
+                if accounts_range:
+                    filter_clauses.append({"range": {"account_count": accounts_range}})
+
+                date_range: Dict[str, Any] = {}
+                if params.created_after is not None:
+                    date_range["gte"] = params.created_after.isoformat()
+                if params.created_before is not None:
+                    date_range["lte"] = params.created_before.isoformat()
+                if date_range:
+                    filter_clauses.append({"range": {"created_at": date_range}})
+
+                es_query = {
                     "bool": {
-                        "should": [
-                            {"term": {"department.keyword": dept_val}},
-                            {"term": {"department_code.keyword": dept_val}},
-                            {"term": {"department_name.keyword": dept_val}},
-                            {"match": {"department": dept_val}},
-                            {"match": {"department_name": dept_val}},
-                        ],
-                        "minimum_should_match": 1,
+                        "must": must_clauses,
+                        "filter": filter_clauses,
                     }
-                })
-
-            if params.role:
-                role_val = params.role.strip()
-                filter_clauses.append({
-                    "bool": {
-                        "should": [
-                            {"term": {"role.keyword": role_val}},
-                            {"term": {"role_name.keyword": role_val}},
-                            {"match": {"role": role_val}},
-                            {"match": {"role_name": role_val}},
-                        ],
-                        "minimum_should_match": 1,
-                    }
-                })
-
-            if params.account_type:
-                filter_clauses.append({
-                    "term": {"account_types.keyword": params.account_type.strip().lower()}
-                })
-
-            if params.currency:
-                filter_clauses.append({
-                    "term": {"currencies.keyword": params.currency.strip().upper()}
-                })
-
-            balance_range: Dict[str, Any] = {}
-            if params.min_balance_cents is not None:
-                balance_range["gte"] = params.min_balance_cents
-            if params.max_balance_cents is not None:
-                balance_range["lte"] = params.max_balance_cents
-            if balance_range:
-                filter_clauses.append({"range": {"total_balance_cents": balance_range}})
-
-            accounts_range: Dict[str, Any] = {}
-            if params.min_accounts is not None:
-                accounts_range["gte"] = params.min_accounts
-            if params.max_accounts is not None:
-                accounts_range["lte"] = params.max_accounts
-            if accounts_range:
-                filter_clauses.append({"range": {"account_count": accounts_range}})
-
-            date_range: Dict[str, Any] = {}
-            if params.created_after is not None:
-                date_range["gte"] = params.created_after.isoformat()
-            if params.created_before is not None:
-                date_range["lte"] = params.created_before.isoformat()
-            if date_range:
-                filter_clauses.append({"range": {"created_at": date_range}})
-
-            es_query = {
-                "bool": {
-                    "must": must_clauses,
-                    "filter": filter_clauses,
-                }
-            }
-
-            sort_field = params.sort_by or "created_at"
-            sort_order = (params.sort_order or "desc").lower()
-
-            es_sort: List[Any] = []
-            if sort_field in ("_score", "score", "relevance"):
-                es_sort.append({"_score": {"order": sort_order}})
-            elif sort_field in ("total_balance_cents", "account_count", "created_at"):
-                es_sort.append({sort_field: {"order": sort_order}})
-            elif sort_field in ("name", "email"):
-                es_sort.append({f"{sort_field}.keyword": {"order": sort_order, "unmapped_type": "keyword"}})
-            else:
-                es_sort.append({"created_at": {"order": "desc"}})
-
-            es_aggs: Dict[str, Any] = {}
-            if params.include_aggregations:
-                es_aggs = {
-                    "departments": {"terms": {"field": "department_name.keyword", "size": 15}},
-                    "roles": {"terms": {"field": "role_name.keyword", "size": 15}},
-                    "account_types": {"terms": {"field": "account_types.keyword", "size": 15}},
-                    "currencies": {"terms": {"field": "currencies.keyword", "size": 15}},
-                    "balance_stats": {"stats": {"field": "total_balance_cents"}},
                 }
 
-            search_body: Dict[str, Any] = {
-                "query": es_query,
-                "sort": es_sort,
-                "from": params.offset,
-                "size": params.limit,
-            }
-            if es_aggs:
-                search_body["aggs"] = es_aggs
+                sort_field = params.sort_by or "created_at"
+                sort_order = (params.sort_order or "desc").lower()
 
-            # First try against `user_profile` index (has accounts and balances)
-            resp = await self.es.search_raw(index="user_profile", body=search_body)
-            hits = resp.get("hits", {}).get("hits", [])
-            total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
+                es_sort: List[Any] = []
+                if sort_field in ("_score", "score", "relevance"):
+                    es_sort.append({"_score": {"order": sort_order}})
+                elif sort_field in ("total_balance_cents", "account_count", "created_at"):
+                    es_sort.append({sort_field: {"order": sort_order}})
+                elif sort_field in ("name", "email"):
+                    es_sort.append({f"{sort_field}.keyword": {"order": sort_order, "unmapped_type": "keyword"}})
+                else:
+                    es_sort.append({"created_at": {"order": "desc"}})
 
-            # If user_profile returned 0 results, check if basic `user` index has hits (e.g. users without accounts)
-            if not hits and not (params.account_type or params.currency or params.min_balance_cents or params.max_balance_cents or params.min_accounts):
-                resp = await self.es.search_raw(index="user", body=search_body)
+                es_aggs: Dict[str, Any] = {}
+                if params.include_aggregations:
+                    es_aggs = {
+                        "departments": {"terms": {"field": "department_name.keyword", "size": 15}},
+                        "roles": {"terms": {"field": "role_name.keyword", "size": 15}},
+                        "account_types": {"terms": {"field": "account_types.keyword", "size": 15}},
+                        "currencies": {"terms": {"field": "currencies.keyword", "size": 15}},
+                        "balance_stats": {"stats": {"field": "total_balance_cents"}},
+                    }
+
+                search_body: Dict[str, Any] = {
+                    "query": es_query,
+                    "sort": es_sort,
+                    "from": params.offset,
+                    "size": params.limit,
+                }
+                if es_aggs:
+                    search_body["aggs"] = es_aggs
+
+                # First try against `user_profile` index (has accounts and balances)
+                resp = await self.es.search_raw(index="user_profile", body=search_body)
                 hits = resp.get("hits", {}).get("hits", [])
                 total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
 
-            if hits or total > 0 or not self.db:
-                parsed_items: List[UserProfileRead] = []
-                for h in hits:
-                    src = h.get("_source", {})
-                    user_id = uuid.UUID(str(src["id"])) if isinstance(src.get("id"), (str, uuid.UUID)) else src.get("id")
+                # If user_profile returned 0 results, check if basic `user` index has hits (e.g. users without accounts)
+                if not hits and not (params.account_type or params.currency or params.min_balance_cents or params.max_balance_cents or params.min_accounts):
+                    resp = await self.es.search_raw(index="user", body=search_body)
+                    hits = resp.get("hits", {}).get("hits", [])
+                    total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
 
-                    dept_data = src.get("department")
-                    if isinstance(dept_data, dict):
-                        dept = DepartmentRead(**dept_data)
-                    elif isinstance(dept_data, str) and dept_data.strip():
-                        dept = DepartmentRead(id=0, name=dept_data, code=src.get("department_code") or dept_data, description="")
-                    else:
-                        dept = DepartmentRead(id=0, name="", code="", description="")
+                if hits or total > 0 or not self.db:
+                    parsed_items: List[UserProfileRead] = []
+                    for h in hits:
+                        src = h.get("_source", {})
+                        user_id = uuid.UUID(str(src["id"])) if isinstance(src.get("id"), (str, uuid.UUID)) else src.get("id")
 
-                    role_data = src.get("role_info")
-                    if isinstance(role_data, dict):
-                        role_info = RoleRead(**role_data)
-                    elif isinstance(role_data, str) and role_data.strip():
-                        role_info = RoleRead(id=0, name=role_data, description="", permissions=[])
-                    else:
-                        role_info = RoleRead(id=0, name=src.get("role", "user"), description="", permissions=[])
+                        dept_data = src.get("department")
+                        if isinstance(dept_data, dict):
+                            dept = DepartmentRead(**dept_data)
+                        elif isinstance(dept_data, str) and dept_data.strip():
+                            dept = DepartmentRead(id=0, name=dept_data, code=src.get("department_code") or dept_data, description="")
+                        else:
+                            dept = DepartmentRead(id=0, name="", code="", description="")
 
-                    accs = [
-                        AccountRead(
-                            id=uuid.UUID(str(acc["id"])),
-                            account_number=acc["account_number"],
-                            account_type=acc.get("account_type", "checking"),
-                            balance_cents=int(acc.get("balance_cents", 0)),
-                            currency=acc.get("currency", "USD"),
-                            status=acc.get("status", "active"),
-                            created_at=_parse_datetime(acc.get("created_at")),
+                        role_data = src.get("role_info")
+                        if isinstance(role_data, dict):
+                            role_info = RoleRead(**role_data)
+                        elif isinstance(role_data, str) and role_data.strip():
+                            role_info = RoleRead(id=0, name=role_data, description="", permissions=[])
+                        else:
+                            role_info = RoleRead(id=0, name=src.get("role", "user"), description="", permissions=[])
+
+                        accs = [
+                            AccountRead(
+                                id=uuid.UUID(str(acc["id"])),
+                                account_number=acc["account_number"],
+                                account_type=acc.get("account_type", "checking"),
+                                balance_cents=int(acc.get("balance_cents", 0)),
+                                currency=acc.get("currency", "USD"),
+                                status=acc.get("status", "active"),
+                                created_at=_parse_datetime(acc.get("created_at")),
+                            )
+                            for acc in (src.get("accounts") or [])
+                            if isinstance(acc, dict) and "id" in acc
+                        ]
+
+                        parsed_items.append(
+                            UserProfileRead(
+                                id=user_id,
+                                name=src.get("name", ""),
+                                email=src.get("email", ""),
+                                role=src.get("role", "user"),
+                                department=dept,
+                                role_info=role_info,
+                                accounts=accs,
+                                total_balance_cents=int(src.get("total_balance_cents") or 0),
+                                account_count=int(src.get("account_count") or len(accs)),
+                                phone_masked=src.get("phone_masked"),
+                                created_at=_parse_datetime(src.get("created_at")),
+                            )
                         )
-                        for acc in (src.get("accounts") or [])
-                        if isinstance(acc, dict) and "id" in acc
-                    ]
 
-                    parsed_items.append(
-                        UserProfileRead(
-                            id=user_id,
-                            name=src.get("name", ""),
-                            email=src.get("email", ""),
-                            role=src.get("role", "user"),
-                            department=dept,
-                            role_info=role_info,
-                            accounts=accs,
-                            total_balance_cents=int(src.get("total_balance_cents") or 0),
-                            account_count=int(src.get("account_count") or len(accs)),
-                            phone_masked=src.get("phone_masked"),
-                            created_at=_parse_datetime(src.get("created_at")),
+                    parsed_aggs: Optional[SearchAggregations] = None
+                    if params.include_aggregations and "aggregations" in resp:
+                        raw_aggs = resp["aggregations"]
+                        dept_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("departments", {}).get("buckets", [])}
+                        role_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("roles", {}).get("buckets", [])}
+                        type_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("account_types", {}).get("buckets", [])}
+                        curr_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("currencies", {}).get("buckets", [])}
+                        bal_stats = raw_aggs.get("balance_stats", {})
+                        parsed_aggs = SearchAggregations(
+                            departments=dept_counts,
+                            roles=role_counts,
+                            account_types=type_counts,
+                            currencies=curr_counts,
+                            total_balance_cents={
+                                "sum": bal_stats.get("sum", 0),
+                                "avg": bal_stats.get("avg", 0),
+                                "min": bal_stats.get("min", 0),
+                                "max": bal_stats.get("max", 0),
+                                "count": bal_stats.get("count", 0),
+                            },
                         )
-                    )
 
-                parsed_aggs: Optional[SearchAggregations] = None
-                if params.include_aggregations and "aggregations" in resp:
-                    raw_aggs = resp["aggregations"]
-                    dept_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("departments", {}).get("buckets", [])}
-                    role_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("roles", {}).get("buckets", [])}
-                    type_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("account_types", {}).get("buckets", [])}
-                    curr_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("currencies", {}).get("buckets", [])}
-                    bal_stats = raw_aggs.get("balance_stats", {})
-                    parsed_aggs = SearchAggregations(
-                        departments=dept_counts,
-                        roles=role_counts,
-                        account_types=type_counts,
-                        currencies=curr_counts,
-                        total_balance_cents={
-                            "sum": bal_stats.get("sum", 0),
-                            "avg": bal_stats.get("avg", 0),
-                            "min": bal_stats.get("min", 0),
-                            "max": bal_stats.get("max", 0),
-                            "count": bal_stats.get("count", 0),
-                        },
+                    return UserSearchResult(
+                        total=total,
+                        items=parsed_items,
+                        limit=params.limit,
+                        offset=params.offset,
+                        aggregations=parsed_aggs,
                     )
-
-                return UserSearchResult(
-                    total=total,
-                    items=parsed_items,
-                    limit=params.limit,
-                    offset=params.offset,
-                    aggregations=parsed_aggs,
-                )
-        except Exception as exc:
-            logger.warning("Elasticsearch complex search failed: %s. Falling back to PostgreSQL.", exc)
+            except Exception as exc:
+                logger.warning("Elasticsearch complex search failed: %s. Falling back to PostgreSQL.", exc)
 
         # ----------------------------------------------------------------------
         # 2. Secondary Fallback: PostgreSQL Complex Raw SQL Search
@@ -990,13 +992,19 @@ class UserService:
                     payload = event.payload or {}
                     user_doc = payload.get("user") if isinstance(payload, dict) and "user" in payload else payload
                     if isinstance(user_doc, dict) and user_doc:
-                        await self.es.index_document(index="user", id_=agg_id, document=user_doc)
+                        indexed = await self.es.index_document(index="user", id_=agg_id, document=user_doc)
+                        if not indexed:
+                            raise RuntimeError(f"Elasticsearch rejected user document {agg_id}.")
                     profile_doc = payload.get("profile") if isinstance(payload, dict) else None
                     if isinstance(profile_doc, dict) and profile_doc:
-                        await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
+                        indexed = await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
+                        if not indexed:
+                            raise RuntimeError(f"Elasticsearch rejected user profile document {agg_id}.")
                 elif event.event_type == "DELETE":
-                    await self.es.delete_document(index="user", id_=agg_id)
-                    await self.es.delete_document(index="user_profile", id_=agg_id)
+                    user_deleted = await self.es.delete_document(index="user", id_=agg_id)
+                    profile_deleted = await self.es.delete_document(index="user_profile", id_=agg_id)
+                    if not user_deleted or not profile_deleted:
+                        raise RuntimeError(f"Elasticsearch rejected deletion for user {agg_id}.")
 
                 now = datetime.now(timezone.utc)
                 await self.outbox_repo.mark_published(event.id, published_at=now)

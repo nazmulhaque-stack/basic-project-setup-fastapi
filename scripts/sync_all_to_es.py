@@ -3,17 +3,24 @@
 Uses raw asyncpg with Keyset pagination and Elasticsearch _bulk API with streaming NDJSON.
 """
 
+import argparse
 import asyncio
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime
 import json
 import logging
 import os
+from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 import uuid
 
 import asyncpg
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.core.config import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -22,7 +29,15 @@ DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgrespassword@local
 ES_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 INDEX_PREFIX = os.getenv("ELASTICSEARCH_INDEX_PREFIX", "demo")
 CHUNK_SIZE = int(os.getenv("SYNC_CHUNK_SIZE", "5000"))
-MAX_SYNC = int(os.getenv("SYNC_MAX_USERS", "0"))  # 0 means all users
+
+
+@asynccontextmanager
+async def db_connection(dsn: str) -> AsyncIterator[asyncpg.Connection]:
+    conn = await asyncpg.connect(dsn)
+    try:
+        yield conn
+    finally:
+        await conn.close()
 
 
 def serialize_doc(obj: Any) -> Any:
@@ -33,7 +48,35 @@ def serialize_doc(obj: Any) -> Any:
     return str(obj)
 
 
-async def init_indices(es_client: httpx.AsyncClient, profile_index: str, user_index: str) -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Synchronize PostgreSQL users and profiles to Elasticsearch.")
+    parser.add_argument(
+        "--recreate-indices",
+        action="store_true",
+        help="Delete and recreate the user/profile indices before syncing (removes stale ES documents).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional maximum number of users to sync; default 0 means all PostgreSQL users.",
+    )
+    return parser.parse_args()
+
+
+def resolve_sync_target(total_users: int, limit: int = 0) -> int:
+    if limit < 0:
+        raise ValueError("Sync limit cannot be negative.")
+    return min(total_users, limit) if limit else total_users
+
+
+async def init_indices(
+    es_client: httpx.AsyncClient,
+    profile_index: str,
+    user_index: str,
+    *,
+    recreate: bool = False,
+) -> None:
     """Creates Elasticsearch indices with optimized settings and explicit mappings if they don't exist."""
     profile_mapping = {
         "settings": {
@@ -137,6 +180,8 @@ async def init_indices(es_client: httpx.AsyncClient, profile_index: str, user_in
                     "type": "text",
                     "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
                 },
+                "department_id": {"type": "keyword"},
+                "role_id": {"type": "keyword"},
                 "department": {
                     "type": "text",
                     "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
@@ -151,31 +196,51 @@ async def init_indices(es_client: httpx.AsyncClient, profile_index: str, user_in
 
     for idx_name, mapping in [(profile_index, profile_mapping), (user_index, user_mapping)]:
         check_resp = await es_client.head(f"/{idx_name}")
-        if check_resp.status_code == 404:
+        if check_resp.status_code == 200 and recreate:
+            logger.warning("Deleting Elasticsearch index for full rebuild: %s", idx_name)
+            delete_resp = await es_client.delete(f"/{idx_name}")
+            delete_resp.raise_for_status()
+        elif check_resp.status_code not in (200, 404):
+            check_resp.raise_for_status()
+
+        if check_resp.status_code == 404 or recreate:
             logger.info("Creating index: %s", idx_name)
             create_resp = await es_client.put(f"/{idx_name}", json=mapping)
-            if create_resp.status_code not in (200, 201):
-                logger.warning("Failed to create index %s: %s", idx_name, create_resp.text)
+            create_resp.raise_for_status()
         else:
             logger.info("Index already exists: %s", idx_name)
 
 
-async def sync_users():
-    logger.info("Connecting to PostgreSQL: %s", DB_URL)
-    conn = await asyncpg.connect(DB_URL)
+async def sync_users(recreate_indices: bool = False, limit: int = 0) -> None:
+    settings = get_settings()
+    if limit < 0:
+        raise ValueError("Sync limit cannot be negative.")
+    db_url = settings.DATABASE_URL
+    es_url = settings.ELASTICSEARCH_URL
+    index_prefix = settings.ELASTICSEARCH_INDEX_PREFIX
+    auth = None
+    headers: Dict[str, str] = {}
+    if settings.ELASTICSEARCH_API_KEY:
+        headers["Authorization"] = f"ApiKey {settings.ELASTICSEARCH_API_KEY}"
+    elif settings.ELASTICSEARCH_USERNAME and settings.ELASTICSEARCH_PASSWORD:
+        auth = (settings.ELASTICSEARCH_USERNAME, settings.ELASTICSEARCH_PASSWORD)
+    verify: Any = settings.ELASTICSEARCH_CA_CERTS or settings.ELASTICSEARCH_VERIFY_CERTS
 
-    logger.info("Connecting to Elasticsearch: %s", ES_URL)
-    async with httpx.AsyncClient(base_url=ES_URL, timeout=60.0) as es_client:
+    logger.info("Connecting to PostgreSQL and Elasticsearch: %s", es_url)
+    async with db_connection(db_url) as conn, httpx.AsyncClient(
+        base_url=es_url,
+        timeout=max(60.0, settings.ELASTICSEARCH_TIMEOUT),
+        auth=auth,
+        headers=headers,
+        verify=verify,
+    ) as es_client:
         # Check ES health
         resp = await es_client.get("/_cluster/health")
-        if resp.status_code != 200:
-            logger.error("Elasticsearch not healthy: %s", resp.text)
-            await conn.close()
-            return
+        resp.raise_for_status()
 
-        user_index = f"{INDEX_PREFIX}_user"
-        profile_index = f"{INDEX_PREFIX}_user_profile"
-        await init_indices(es_client, profile_index, user_index)
+        user_index = f"{index_prefix}_user"
+        profile_index = f"{index_prefix}_user_profile"
+        await init_indices(es_client, profile_index, user_index, recreate=recreate_indices)
 
         # Pre-fetch lookup caches for departments and roles
         dept_rows = await conn.fetch("SELECT id, name, code, description FROM departments")
@@ -202,12 +267,17 @@ async def sync_users():
             role_lookup[r["name"].lower()] = r_obj
 
         total_users = await conn.fetchval("SELECT count(*) FROM users;")
-        target_sync = MAX_SYNC if (MAX_SYNC > 0 and MAX_SYNC < total_users) else total_users
+        target_sync = resolve_sync_target(total_users, limit)
+        is_full_sync = target_sync == total_users
         logger.info("Total users in PostgreSQL: %d | Target sync: %d", total_users, target_sync)
 
         # Temporarily disable index refresh for maximum bulk ingest throughput
-        await es_client.put(f"/{profile_index}/_settings", json={"index": {"refresh_interval": "-1"}})
-        await es_client.put(f"/{user_index}/_settings", json={"index": {"refresh_interval": "-1"}})
+        for index_name in (profile_index, user_index):
+            settings_resp = await es_client.put(
+                f"/{index_name}/_settings",
+                json={"index": {"refresh_interval": "-1"}},
+            )
+            settings_resp.raise_for_status()
 
         last_created_at: Optional[datetime] = None
         last_id: Optional[uuid.UUID] = None
@@ -282,10 +352,10 @@ async def sync_users():
                     if isinstance(raw_accs, str):
                         try:
                             raw_accs = json.loads(raw_accs)
-                        except Exception:
-                            raw_accs = []
-                    elif not isinstance(raw_accs, list):
-                        raw_accs = []
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError(f"Invalid accounts JSON for user {user_id}.") from exc
+                    if not isinstance(raw_accs, list):
+                        raise RuntimeError(f"Expected accounts list for user {user_id}.")
 
                     profile_doc = {
                         "id": user_id,
@@ -304,7 +374,9 @@ async def sync_users():
                         "role_name": role_dict["name"],
                         "account_numbers": [a["account_number"] for a in raw_accs if isinstance(a, dict) and "account_number" in a],
                         "account_types": [a.get("account_type") for a in raw_accs if isinstance(a, dict) and "account_type" in a],
-                        "currencies": list(set(a.get("currency") for a in raw_accs if isinstance(a, dict) and "currency" in a)),
+                        "currencies": sorted(
+                            {a["currency"] for a in raw_accs if isinstance(a, dict) and a.get("currency")}
+                        ),
                     }
 
                     user_doc = {
@@ -313,6 +385,8 @@ async def sync_users():
                         "email": r["email"],
                         "role": r["role"],
                         "department": r["department"],
+                        "department_id": r["department"],
+                        "role_id": r["role"],
                         "phone_masked": "***",
                         "account_count": int(r["account_count"]),
                         "total_balance_cents": int(r["total_balance_cents"]),
@@ -331,9 +405,16 @@ async def sync_users():
                     content=ndjson_payload,
                     headers={"Content-Type": "application/x-ndjson"},
                 )
-                if bulk_resp.status_code not in (200, 201):
-                    logger.error("Bulk sync error: %s", bulk_resp.text[:500])
-                    break
+                bulk_resp.raise_for_status()
+                bulk_result = bulk_resp.json()
+                if bulk_result.get("errors"):
+                    failures = [
+                        item.get("index", {})
+                        for item in bulk_result.get("items", [])
+                        if item.get("index", {}).get("error")
+                    ]
+                    logger.error("Elasticsearch rejected %d documents; first errors: %s", len(failures), failures[:5])
+                    raise RuntimeError(f"Elasticsearch bulk indexing failed for {len(failures)} documents.")
 
                 last_row = rows[-1]
                 last_created_at = last_row["created_at"]
@@ -349,15 +430,36 @@ async def sync_users():
         finally:
             # Restore normal refresh interval and force commit
             logger.info("Restoring refresh interval and refreshing indices...")
-            await es_client.put(f"/{profile_index}/_settings", json={"index": {"refresh_interval": "1s"}})
-            await es_client.put(f"/{user_index}/_settings", json={"index": {"refresh_interval": "1s"}})
-            await es_client.post(f"/{profile_index}/_refresh")
-            await es_client.post(f"/{user_index}/_refresh")
+            for index_name in (profile_index, user_index):
+                settings_resp = await es_client.put(
+                    f"/{index_name}/_settings",
+                    json={"index": {"refresh_interval": "1s"}},
+                )
+                settings_resp.raise_for_status()
+                refresh_resp = await es_client.post(f"/{index_name}/_refresh")
+                refresh_resp.raise_for_status()
+
+        if synced_count != target_sync:
+            raise RuntimeError(
+                f"PostgreSQL returned {synced_count} users to sync, expected {target_sync}; "
+                "the database may have changed during synchronization."
+            )
+
+        if is_full_sync:
+            for index_name in (profile_index, user_index):
+                count_resp = await es_client.get(f"/{index_name}/_count")
+                count_resp.raise_for_status()
+                es_count = int(count_resp.json()["count"])
+                if es_count != total_users:
+                    raise RuntimeError(
+                        f"Full sync verification failed for {index_name}: "
+                        f"PostgreSQL has {total_users} users but Elasticsearch has {es_count} documents. "
+                        "Rerun with --recreate-indices to remove stale documents and rebuild."
+                    )
 
         logger.info("Elasticsearch synchronization completed: %d users synced!", synced_count)
 
-    await conn.close()
-
 
 if __name__ == "__main__":
-    asyncio.run(sync_users())
+    args = parse_args()
+    asyncio.run(sync_users(recreate_indices=args.recreate_indices, limit=args.limit))

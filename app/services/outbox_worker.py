@@ -106,22 +106,32 @@ class OutboxWorker:
                         user_doc = {}
 
                 if isinstance(user_doc, dict) and user_doc:
-                    await self.es.index_document(index="user", id_=agg_id, document=user_doc)
+                    indexed = await self.es.index_document(index="user", id_=agg_id, document=user_doc)
+                    if not indexed:
+                        raise RuntimeError(f"Elasticsearch rejected user document {agg_id}.")
 
                 # 2. Sync UserProfile index document if present
                 profile_doc = payload.get("profile") if isinstance(payload, dict) else None
                 if isinstance(profile_doc, dict) and profile_doc:
-                    await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
+                    indexed = await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
+                    if not indexed:
+                        raise RuntimeError(f"Elasticsearch rejected user profile document {agg_id}.")
 
             elif event_type == "DELETE":
-                await self.es.delete_document(index="user", id_=agg_id)
-                await self.es.delete_document(index="user_profile", id_=agg_id)
+                user_deleted = await self.es.delete_document(index="user", id_=agg_id)
+                profile_deleted = await self.es.delete_document(index="user_profile", id_=agg_id)
+                if not user_deleted or not profile_deleted:
+                    raise RuntimeError(f"Elasticsearch rejected deletion for user {agg_id}.")
         else:
             if event_type in ("CREATE", "UPDATE"):
                 if isinstance(payload, dict) and payload:
-                    await self.es.index_document(index=agg_type, id_=agg_id, document=payload)
+                    indexed = await self.es.index_document(index=agg_type, id_=agg_id, document=payload)
+                    if not indexed:
+                        raise RuntimeError(f"Elasticsearch rejected {agg_type} document {agg_id}.")
             elif event_type == "DELETE":
-                await self.es.delete_document(index=agg_type, id_=agg_id)
+                deleted = await self.es.delete_document(index=agg_type, id_=agg_id)
+                if not deleted:
+                    raise RuntimeError(f"Elasticsearch rejected deletion of {agg_type} document {agg_id}.")
 
     async def process_batch(self) -> int:
         """Processes one batch of pending outbox events using FOR UPDATE SKIP LOCKED."""

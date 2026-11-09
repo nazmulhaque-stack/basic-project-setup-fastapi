@@ -935,6 +935,26 @@ This traverses millions of records with constant $O(1)$ retrieval cost — the s
 - **Backpressure Protection**: If Elasticsearch is congested and the buffer reaches capacity, debug-level logs are dropped first, ensuring HTTP request workers are never blocked waiting on the logging pipeline.
 - **Log Index Lifecycle**: Log records are routed to `app-logs` timeseries indices with automated retention pruning (`ELASTICSEARCH_LOG_RETENTION_DAYS`, default 30 days).
 
+### User index full resynchronization
+
+PostgreSQL is the source of truth. The user outbox worker syncs new changes, while [`scripts/sync_all_to_es.py`](scripts/sync_all_to_es.py) backfills existing users, profiles, and accounts in batches and verifies Elasticsearch document counts.
+
+Run a normal upsert sync with the same `DATABASE_URL` and Elasticsearch settings as the application:
+
+```bash
+python scripts/sync_all_to_es.py
+```
+
+To remove stale Elasticsearch documents and rebuild the user indices from PostgreSQL:
+
+```bash
+python scripts/sync_all_to_es.py --recreate-indices
+```
+
+The sync has no implicit user-count cap: it reads the PostgreSQL total and syncs all users by default. A partial sync requires an explicit `--limit N`.
+
+`--recreate-indices` deletes and recreates only `{ELASTICSEARCH_INDEX_PREFIX}_user` and `{ELASTICSEARCH_INDEX_PREFIX}_user_profile`; searches against these indices will be unavailable/incomplete until the backfill finishes. Run it during a maintenance window, and avoid concurrent database writes while rebuilding. Bulk or connectivity errors stop the script with a non-zero exit instead of reporting a false success.
+
 ### 6. Log Search API & Histogram Aggregations
 
 Structured logs can be inspected programmatically via [`app/services/log_search.py`](app/services/log_search.py):

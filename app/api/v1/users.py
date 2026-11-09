@@ -78,50 +78,50 @@ async def search_users(
     return await service.search_users(query)
 
 
-@router.post(
-    "/search",
+@router.get(
+    "/search-no-cache",
     response_model=UserSearchResult,
-    summary="Complex search users (JSON Query Body)",
-    description="Advanced search endpoint accepting a structured JSON payload with complex query conditions, ranges, and aggregations.",
+    summary="Search users with complex filters",
+    description="Multi-field full-text fuzzy search with faceted filters, numeric balance/account ranges, date ranges, sorting, and optional aggregations.",
 )
-async def search_users_complex(
-    query: Annotated[
-        UserSearchQuery,
-        Body(
-            openapi_examples={
-                "complex_query_by_balance_and_dept": {
-                    "summary": "Engineering Users with High Balance",
-                    "description": "Fuzzy query with department filter, minimum balance of $10,000, sorted by total balance descending.",
-                    "value": {
-                        "q": "Connor",
-                        "department": "Engineering",
-                        "min_balance_cents": 1000000,
-                        "currency": "USD",
-                        "sort_by": "total_balance_cents",
-                        "sort_order": "desc",
-                        "include_aggregations": True,
-                        "limit": 10,
-                        "offset": 0,
-                    },
-                },
-                "corporate_account_query": {
-                    "summary": "Corporate Account Search with Range",
-                    "description": "Searches for users holding active corporate accounts with at least 2 accounts total.",
-                    "value": {
-                        "account_type": "corporate",
-                        "min_accounts": 2,
-                        "include_aggregations": True,
-                        "sort_by": "account_count",
-                        "sort_order": "desc",
-                    },
-                },
-            }
-        ),
-    ],
+async def search_users(
     service: UserServiceDep,
+    q: Annotated[Optional[str], Query(description="Full-text fuzzy search query matching name, email, department, role, account numbers")] = None,
+    department: Annotated[Optional[str], Query(description="Filter by department name or code")] = None,
+    role: Annotated[Optional[str], Query(description="Filter by authorization role")] = None,
+    account_type: Annotated[Optional[str], Query(description="Filter by account type: corporate, savings, checking, investment")] = None,
+    currency: Annotated[Optional[str], Query(description="Filter by 3-letter currency code (e.g. USD, EUR, GBP)")] = None,
+    min_balance_cents: Annotated[Optional[int], Query(ge=0, description="Minimum total balance across accounts in cents")] = None,
+    max_balance_cents: Annotated[Optional[int], Query(ge=0, description="Maximum total balance across accounts in cents")] = None,
+    min_accounts: Annotated[Optional[int], Query(ge=0, description="Minimum number of attached accounts")] = None,
+    max_accounts: Annotated[Optional[int], Query(ge=0, description="Maximum number of attached accounts")] = None,
+    created_after: Annotated[Optional[datetime], Query(description="Filter users created on or after this timestamp")] = None,
+    created_before: Annotated[Optional[datetime], Query(description="Filter users created on or before this timestamp")] = None,
+    sort_by: Annotated[Optional[str], Query(description="Sort field: created_at, total_balance_cents, account_count, name, email, _score")] = "created_at",
+    sort_order: Annotated[Optional[str], Query(pattern="^(asc|desc|ASC|DESC)$", description="Sort direction: asc or desc")] = "desc",
+    include_aggregations: Annotated[bool, Query(description="Compute and return faceted aggregations by department, role, currency, and balance stats")] = False,
+    limit: Annotated[int, Query(ge=1, le=100, description="Max results per page")] = 20,
+    offset: Annotated[int, Query(ge=0, description="Search result offset")] = 0,
 ) -> UserSearchResult:
-    return await service.search_users(query)
-
+    query = UserSearchQuery(
+        q=q,
+        department=department,
+        role=role,
+        account_type=account_type,
+        currency=currency,
+        min_balance_cents=min_balance_cents,
+        max_balance_cents=max_balance_cents,
+        min_accounts=min_accounts,
+        max_accounts=max_accounts,
+        created_after=created_after,
+        created_before=created_before,
+        sort_by=sort_by or "created_at",
+        sort_order=sort_order or "desc",
+        include_aggregations=include_aggregations,
+        limit=limit,
+        offset=offset,
+    )
+    return await service.search_users(query, use_cache=False)
 
 # ------------------------------------------------------------------------------
 # 2. CREATE USER (POST /users)
