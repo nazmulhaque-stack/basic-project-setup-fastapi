@@ -1,7 +1,7 @@
 """User repository: direct asyncpg hand-written SQL queries (no ORM, no BaseRepository inheritance)."""
 
 from datetime import datetime, timezone
-from typing import Any, List, Mapping, Optional, Tuple, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 import uuid
 
 import orjson
@@ -209,8 +209,18 @@ class UserRepository:
         return _row_to_user(row) if row is not None else user
 
     async def delete(self, user_id: uuid.UUID) -> bool:
+        await self.db.execute("DELETE FROM user_accounts WHERE user_id = $1", user_id)
         res = await self.db.execute("DELETE FROM users WHERE id = $1", user_id)
         return res != "DELETE 0"
+
+    async def get_existing_account_numbers(self, account_numbers: List[str]) -> List[str]:
+        if not account_numbers:
+            return []
+        rows = await self.db.fetch(
+            "SELECT account_number FROM user_accounts WHERE account_number = ANY($1::varchar[])",
+            account_numbers,
+        )
+        return [r["account_number"] for r in rows]
 
     async def list_keyset(
         self,
@@ -264,6 +274,145 @@ class UserRepository:
         """
         rows = await self.db.fetch(sql, pattern, safe_limit, safe_offset)
         return [_row_to_user(r) for r in rows]
+
+    async def search_complex(
+        self,
+        q: Optional[str] = None,
+        department: Optional[str] = None,
+        role: Optional[str] = None,
+        account_type: Optional[str] = None,
+        currency: Optional[str] = None,
+        min_balance_cents: Optional[int] = None,
+        max_balance_cents: Optional[int] = None,
+        min_accounts: Optional[int] = None,
+        max_accounts: Optional[int] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        sort_by: Optional[str] = "created_at",
+        sort_order: Optional[str] = "desc",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Hand-written asyncpg SQL query with dynamic WHERE, HAVING, aggregation, and window total count."""
+        where_clauses: List[str] = []
+        having_clauses: List[str] = []
+        params: List[Any] = []
+
+        if q and q.strip():
+            pattern = f"%{q.strip()}%"
+            params.append(pattern)
+            p_idx = len(params)
+            where_clauses.append(
+                f"(u.name ILIKE ${p_idx} OR u.email ILIKE ${p_idx} OR u.role ILIKE ${p_idx} "
+                f"OR u.department ILIKE ${p_idx} OR a.account_number ILIKE ${p_idx})"
+            )
+
+        if department:
+            params.append(department.strip())
+            p_idx = len(params)
+            where_clauses.append(
+                f"(LOWER(u.department) = LOWER(${p_idx}) OR LOWER(d.code) = LOWER(${p_idx}) OR LOWER(d.name) = LOWER(${p_idx}))"
+            )
+
+        if role:
+            params.append(role.strip())
+            p_idx = len(params)
+            where_clauses.append(f"LOWER(u.role) = LOWER(${p_idx})")
+
+        if account_type:
+            params.append(account_type.strip())
+            p_idx = len(params)
+            where_clauses.append(f"LOWER(a.account_type) = LOWER(${p_idx})")
+
+        if currency:
+            params.append(currency.strip().upper())
+            p_idx = len(params)
+            where_clauses.append(f"UPPER(a.currency) = ${p_idx}")
+
+        if created_after:
+            params.append(created_after)
+            p_idx = len(params)
+            where_clauses.append(f"u.created_at >= ${p_idx}")
+
+        if created_before:
+            params.append(created_before)
+            p_idx = len(params)
+            where_clauses.append(f"u.created_at <= ${p_idx}")
+
+        if min_balance_cents is not None:
+            params.append(min_balance_cents)
+            p_idx = len(params)
+            having_clauses.append(f"COALESCE(SUM(a.balance_cents), 0) >= ${p_idx}")
+
+        if max_balance_cents is not None:
+            params.append(max_balance_cents)
+            p_idx = len(params)
+            having_clauses.append(f"COALESCE(SUM(a.balance_cents), 0) <= ${p_idx}")
+
+        if min_accounts is not None:
+            params.append(min_accounts)
+            p_idx = len(params)
+            having_clauses.append(f"COUNT(a.id) >= ${p_idx}")
+
+        if max_accounts is not None:
+            params.append(max_accounts)
+            p_idx = len(params)
+            having_clauses.append(f"COUNT(a.id) <= ${p_idx}")
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        having_sql = f"HAVING {' AND '.join(having_clauses)}" if having_clauses else ""
+
+        safe_order = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+        sort_map = {
+            "created_at": f"u.created_at {safe_order}, u.id ASC",
+            "total_balance_cents": f"total_balance_cents {safe_order}, u.id ASC",
+            "account_count": f"account_count {safe_order}, u.id ASC",
+            "name": f"u.name {safe_order}, u.id ASC",
+            "email": f"u.email {safe_order}, u.id ASC",
+        }
+        order_by_sql = sort_map.get(str(sort_by).lower(), f"u.created_at {safe_order}, u.id ASC")
+
+        safe_limit = min(100, max(1, limit))
+        safe_offset = max(0, offset)
+
+        params.append(safe_limit)
+        limit_idx = len(params)
+        params.append(safe_offset)
+        offset_idx = len(params)
+
+        sql = f"""
+            SELECT 
+                u.id,
+                u.name,
+                u.email,
+                u.role,
+                u.department,
+                u.phone_encrypted,
+                u.phone_blind_index,
+                u.created_at,
+                d.id AS dept_id,
+                COALESCE(d.name, u.department) AS dept_name,
+                COALESCE(d.code, u.department) AS dept_code,
+                r.id AS role_id,
+                COALESCE(r.name, u.role) AS role_name,
+                COALESCE(SUM(a.balance_cents), 0)::bigint AS total_balance_cents,
+                COUNT(a.id)::int AS account_count,
+                COUNT(*) OVER() AS full_count
+            FROM users u
+            LEFT JOIN user_accounts a ON a.user_id = u.id
+            LEFT JOIN departments d ON (LOWER(d.name) = LOWER(u.department) OR LOWER(d.code) = LOWER(u.department))
+            LEFT JOIN roles r ON LOWER(r.name) = LOWER(u.role)
+            {where_sql}
+            GROUP BY u.id, u.name, u.email, u.role, u.department, u.phone_encrypted, u.phone_blind_index, u.created_at, d.id, d.name, d.code, r.id, r.name
+            {having_sql}
+            ORDER BY {order_by_sql}
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """
+
+        rows = await self.db.fetch(sql, *params)
+        total_count = int(rows[0]["full_count"]) if rows else 0
+        items = [dict(r) for r in rows]
+        return items, total_count
 
     # --------------------------------------------------------------------------
     # Complex Aggregated Query: User Profile (User + Department + Role + Accounts)

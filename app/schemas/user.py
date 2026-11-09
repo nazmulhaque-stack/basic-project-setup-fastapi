@@ -10,7 +10,7 @@ Enforces:
 
 from datetime import datetime
 import re
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import uuid
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -208,6 +208,9 @@ class UserRead(BaseModel):
     department_id: Optional[Union[str, int]] = None
     role_id: Optional[Union[str, int]] = None
     phone_masked: Optional[str] = Field(default=None, description="Masked phone number protecting user PII")
+    accounts: Optional[List[AccountRead]] = Field(default=None, description="Attached user accounts if populated")
+    total_balance_cents: Optional[int] = Field(default=None, description="Total balance in cents across all attached accounts")
+    account_count: Optional[int] = Field(default=None, description="Total number of active attached accounts")
     created_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -240,6 +243,46 @@ class UserProfileRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SearchAggregations(BaseModel):
+    """Faceted search aggregations across dimensions and balance statistics."""
+    departments: Dict[str, int] = Field(default_factory=dict, description="Counts by department")
+    roles: Dict[str, int] = Field(default_factory=dict, description="Counts by role")
+    account_types: Dict[str, int] = Field(default_factory=dict, description="Counts by account type")
+    currencies: Dict[str, int] = Field(default_factory=dict, description="Counts by currency")
+    total_balance_cents: Dict[str, Any] = Field(default_factory=dict, description="Balance statistics: sum, avg, min, max, count")
+
+
+class UserSearchQuery(BaseModel):
+    """Comprehensive complex search query parameters for full-text, filters, ranges, and sorting."""
+    q: Optional[str] = Field(default=None, description="Full-text fuzzy search matching name, email, department, role, account numbers")
+    department: Optional[str] = Field(default=None, description="Filter by department name or code")
+    role: Optional[str] = Field(default=None, description="Filter by authorization role")
+    account_type: Optional[str] = Field(default=None, description="Filter by account type: corporate, savings, checking, investment")
+    currency: Optional[str] = Field(default=None, description="Filter by ISO 3-letter currency code (e.g. USD, EUR, GBP)")
+    min_balance_cents: Optional[int] = Field(default=None, ge=0, description="Minimum total balance across accounts in cents")
+    max_balance_cents: Optional[int] = Field(default=None, ge=0, description="Maximum total balance across accounts in cents")
+    min_accounts: Optional[int] = Field(default=None, ge=0, description="Minimum number of attached accounts")
+    max_accounts: Optional[int] = Field(default=None, ge=0, description="Maximum number of attached accounts")
+    created_after: Optional[datetime] = Field(default=None, description="Filter users created on or after this timestamp")
+    created_before: Optional[datetime] = Field(default=None, description="Filter users created on or before this timestamp")
+    sort_by: Optional[str] = Field(default="created_at", description="Sort field: created_at, total_balance_cents, account_count, name, email, _score")
+    sort_order: Optional[str] = Field(default="desc", pattern="^(asc|desc|ASC|DESC)$", description="Sort direction: asc or desc")
+    limit: int = Field(default=20, ge=1, le=100, description="Max results per page")
+    offset: int = Field(default=0, ge=0, description="Pagination offset")
+    include_aggregations: bool = Field(default=False, description="Compute and return faceted aggregations")
+
+
+class UserSearchResult(BaseModel):
+    """Rich complex search result with items, total count, pagination, and optional faceted aggregations."""
+    total: int = Field(default=0, description="Total matching documents across entire index")
+    items: List[UserRead] = Field(default_factory=list, description="Matching users list")
+    limit: int = 20
+    offset: int = 0
+    aggregations: Optional[SearchAggregations] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 __all__ = [
     "DepartmentRead",
     "RoleRead",
@@ -251,4 +294,7 @@ __all__ = [
     "UserRead",
     "UserPage",
     "UserProfileRead",
+    "SearchAggregations",
+    "UserSearchQuery",
+    "UserSearchResult",
 ]

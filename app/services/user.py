@@ -3,9 +3,10 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, Union
 import uuid
 
+import asyncpg
 from fastapi import Depends, Request
 
 from app.api.deps import CryptoDep, ElasticsearchDep, RedisDep, SessionDep
@@ -16,15 +17,22 @@ from app.core.exceptions import ConflictError, DecryptionError, NotFoundError
 from app.core.security import CryptoService
 from app.db.pool import UnitOfWork
 from app.models.outbox import OutboxEvent
-from app.models.user import User, UserAccount
+from app.models.user import User, UserAccount, UserProfile
 from app.repositories.outbox import OutboxRepository
 from app.repositories.user import UserRepository
 from app.schemas.base import decode_cursor, encode_cursor
 from app.schemas.user import (
+    AccountRead,
+    DepartmentRead,
+    RoleRead,
+    SearchAggregations,
     UserCreate,
     UserPage,
     UserRead,
+    UserSearchQuery,
+    UserSearchResult,
     UserUpdate,
+    UserProfileRead,
 )
 from app.services.cache import DynamicRedisCache
 
@@ -95,42 +103,75 @@ class UserService:
             email=str(payload.email),
             role=payload.role,
             department=payload.department,
-            department_id=None,
-            role_id=None,
+            department_id=payload.department_id,
+            role_id=payload.role_id,
             phone_encrypted=phone_encrypted,
             phone_blind_index=phone_blind_index,
             created_at=datetime.now(timezone.utc),
         )
 
-        created = await self.repo.create(user)
-
-        # Optional initial accounts creation in a single batch (no loop)
+        # Validate accounts uniqueness upfront
         if payload.accounts:
-            now = datetime.now(timezone.utc)
-            accounts = [
-                UserAccount(
-                    id=uuid.uuid4(),
-                    user_id=user_id,
-                    account_number=acc.account_number,
-                    account_type=acc.account_type,
-                    balance_cents=acc.balance_cents,
-                    currency=acc.currency,
-                    status=acc.status,
-                    created_at=now,
-                    updated_at=now,
-                )
-                for acc in payload.accounts
-            ]
-            await self.repo.create_accounts(accounts)
+            acc_numbers = [acc.account_number for acc in payload.accounts]
+            existing_accounts = await self.repo.get_existing_account_numbers(acc_numbers)
+            if existing_accounts:
+                raise ConflictError(f"Account number '{existing_accounts[0]}' already exists.")
 
-        read_model = self._to_read_schema(created)
+        try:
+            created = await self.repo.create(user)
 
-        # Stage Outbox Event BEFORE DB commit (Atomic consistency)
+            # Optional initial accounts creation in a single batch (no loop)
+            accounts_read: Optional[List[AccountRead]] = None
+            total_balance_cents: Optional[int] = None
+            account_count: Optional[int] = None
+            if payload.accounts:
+                now = datetime.now(timezone.utc)
+                accounts = [
+                    UserAccount(
+                        id=uuid.uuid4(),
+                        user_id=user_id,
+                        account_number=acc.account_number,
+                        account_type=acc.account_type,
+                        balance_cents=acc.balance_cents,
+                        currency=acc.currency,
+                        status=acc.status,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    for acc in payload.accounts
+                ]
+                await self.repo.create_accounts(accounts)
+                accounts_read = [
+                    AccountRead(
+                        id=acc.id,
+                        account_number=acc.account_number,
+                        account_type=acc.account_type,
+                        balance_cents=acc.balance_cents,
+                        currency=acc.currency,
+                        status=acc.status,
+                        created_at=acc.created_at,
+                    )
+                    for acc in accounts
+                ]
+                account_count = len(accounts_read)
+                total_balance_cents = sum(acc.balance_cents for acc in accounts_read)
+        except asyncpg.exceptions.UniqueViolationError as exc:
+            raise ConflictError(f"Unique constraint violation: {exc.detail or exc}")
+
+        read_model = self._to_read_schema(
+            created,
+            accounts=accounts_read,
+            total_balance_cents=total_balance_cents,
+            account_count=account_count,
+        )
+
+        # Stage Outbox Event BEFORE DB commit (Syncs both User and UserProfile to Elasticsearch)
+        es_payload = await self._build_user_es_payload(created.id)
         outbox_event = await self.outbox_repo.create_event(
             aggregate_type="user",
             aggregate_id=str(created.id),
             event_type="CREATE",
-            payload=self._build_user_es_doc(created),
+            payload=es_payload,
         )
 
         # Cache synchronization:
@@ -138,6 +179,7 @@ class UserService:
         #   - Pre-warm item cache (write-through) for instant sub-millisecond subsequent reads.
         await self.cache.invalidate_lists()
         await self.cache.set_item(str(created.id), read_model.model_dump(mode="json"))
+        await self.cache.delete_item(f"profile:{created.id}")
 
         # Atomic commit
         await self.db.commit()
@@ -210,6 +252,67 @@ class UserService:
             logger.warning("Failed to backfill Elasticsearch: %s", exc)
 
         return read_model
+
+    # --------------------------------------------------------------------------
+    # 2b. GET USER PROFILE (GET /users/{user_id}/profile)
+    # --------------------------------------------------------------------------
+    async def get_user_profile(self, user_id: uuid.UUID) -> UserProfileRead:
+        """Fetch rich user profile with 3-tier Self-Healing Fallback (Redis -> ES -> PostgreSQL)."""
+        cache_key = f"profile:{user_id}"
+
+        # Level 1: Redis L1 Cache-Aside
+        try:
+            cached = await self.cache.get_item(cache_key)
+            if cached is not None:
+                if isinstance(cached, dict) and cached.get("__not_found__"):
+                    raise NotFoundError(f"User with ID '{user_id}' not found.")
+                return UserProfileRead(**cached)
+        except NotFoundError:
+            raise
+        except Exception as exc:
+            logger.warning("Redis read error in get_user_profile: %s", exc)
+
+        # Level 2: Elasticsearch L2
+        try:
+            es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
+            if es_doc is not None:
+                profile_read = UserProfileRead(**es_doc)
+                try:
+                    await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
+                except Exception:
+                    pass
+                return profile_read
+        except Exception as exc:
+            logger.warning("Elasticsearch read error in get_user_profile: %s", exc)
+
+        # Level 3: Fallback to PostgreSQL (Authoritative Store)
+        profile = await self.repo.get_profile(user_id)
+        if profile is None:
+            try:
+                await self.cache.set_negative_cache(cache_key)
+            except Exception:
+                pass
+            raise NotFoundError(f"User with ID '{user_id}' not found.")
+
+        profile_read = self._to_profile_read(profile)
+
+        # Self-Heal: Backfill both Redis and Elasticsearch
+        try:
+            await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
+        except Exception as exc:
+            logger.warning("Failed to backfill Redis profile: %s", exc)
+
+        try:
+            profile_doc = profile_read.model_dump(mode="json")
+            profile_doc["department_name"] = profile_read.department.name if profile_read.department else None
+            profile_doc["department_code"] = profile_read.department.code if profile_read.department else None
+            profile_doc["role_name"] = profile_read.role_info.name if profile_read.role_info else None
+            profile_doc["account_numbers"] = [a.account_number for a in profile_read.accounts]
+            await self.es.index_document(index="user_profile", id_=str(user_id), document=profile_doc)
+        except Exception as exc:
+            logger.warning("Failed to backfill Elasticsearch profile: %s", exc)
+
+        return profile_read
 
     # --------------------------------------------------------------------------
     # 3. LIST USERS (GET /users - Keyset Cursor Pagination)
@@ -298,12 +401,13 @@ class UserService:
         updated = await self.repo.update(user)
         read_model = self._to_read_schema(updated)
 
-        # Stage Outbox Event BEFORE DB commit
+        # Stage Outbox Event BEFORE DB commit (Syncs both User and UserProfile to Elasticsearch)
+        es_payload = await self._build_user_es_payload(updated.id)
         outbox_event = await self.outbox_repo.create_event(
             aggregate_type="user",
             aggregate_id=str(updated.id),
             event_type="UPDATE",
-            payload=self._build_user_es_doc(updated),
+            payload=es_payload,
         )
 
         # Invalidate Redis item & list cache
@@ -347,62 +451,317 @@ class UserService:
         await self._dispatch_outbox_sync(outbox_event)
 
     # --------------------------------------------------------------------------
-    # 6. SEARCH USERS (GET /users/search - Elasticsearch with PostgreSQL Fallback)
+    # 6. COMPLEX SEARCH USERS (Elasticsearch CQRS with PostgreSQL Fallback)
     # --------------------------------------------------------------------------
     async def search_users(
         self,
-        q: str,
+        query: Optional[Union[UserSearchQuery, str]] = None,
+        *,
+        q: Optional[str] = None,
+        department: Optional[str] = None,
+        role: Optional[str] = None,
+        account_type: Optional[str] = None,
+        currency: Optional[str] = None,
+        min_balance_cents: Optional[int] = None,
+        max_balance_cents: Optional[int] = None,
+        min_accounts: Optional[int] = None,
+        max_accounts: Optional[int] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        sort_by: Optional[str] = "created_at",
+        sort_order: Optional[str] = "desc",
         limit: int = 20,
         offset: int = 0,
-    ) -> List[UserRead]:
-        """Search users: Elasticsearch fuzzy search first; if no hits or ES unavailable, fallback to PostgreSQL."""
-        cleaned_q = (q or "").strip()
-        if not cleaned_q:
-            return []
-
-        safe_limit = min(100, max(1, limit))
-        safe_offset = max(0, offset)
-
-        # 1. Primary: Elasticsearch Full-Text Fuzzy Search
-        try:
-            hits, _ = await self.es.search(
-                index="user",
-                query=cleaned_q,
-                limit=safe_limit,
-                offset=safe_offset,
+        include_aggregations: bool = False,
+    ) -> UserSearchResult:
+        """Complex search orchestrating multi-field full-text, faceted filters, numeric ranges, aggregations, and DB fallback."""
+        if isinstance(query, UserSearchQuery):
+            params = query
+        else:
+            params = UserSearchQuery(
+                q=q or (query if isinstance(query, str) else None),
+                department=department,
+                role=role,
+                account_type=account_type,
+                currency=currency,
+                min_balance_cents=min_balance_cents,
+                max_balance_cents=max_balance_cents,
+                min_accounts=min_accounts,
+                max_accounts=max_accounts,
+                created_after=created_after,
+                created_before=created_before,
+                sort_by=sort_by or "created_at",
+                sort_order=sort_order or "desc",
+                limit=limit,
+                offset=offset,
+                include_aggregations=include_aggregations,
             )
-            if hits:
-                return [
-                    UserRead(
-                        id=hit["id"],
-                        name=hit.get("name", ""),
-                        email=hit.get("email", ""),
-                        role=hit.get("role", "user"),
-                        department=hit.get("department"),
-                        department_id=hit.get("department_id") or hit.get("department"),
-                        role_id=hit.get("role_id") or hit.get("role"),
-                        phone_masked=hit.get("phone_masked"),
-                        created_at=_parse_datetime(hit.get("created_at")),
-                    )
-                    for hit in hits
-                ]
-        except Exception as exc:
-            logger.warning("Elasticsearch search failed for '%s': %s. Falling back to PostgreSQL.", cleaned_q, exc)
 
-        # 2. Secondary Fallback: PostgreSQL Direct Database Search
-        users = await self.repo.search(
-            query=cleaned_q,
-            limit=safe_limit,
-            offset=safe_offset,
+        # ----------------------------------------------------------------------
+        # 1. Primary: Elasticsearch Complex Bool Query against `user_profile`
+        # ----------------------------------------------------------------------
+        try:
+            must_clauses: List[Dict[str, Any]] = []
+            filter_clauses: List[Dict[str, Any]] = []
+
+            if params.q and params.q.strip():
+                cleaned_q = params.q.strip()
+                must_clauses.append({
+                    "multi_match": {
+                        "query": cleaned_q,
+                        "fields": [
+                            "name^3",
+                            "email^2",
+                            "department^1.5",
+                            "department_name^1.5",
+                            "department_code^1.5",
+                            "role^1.5",
+                            "role_name^1.5",
+                            "account_numbers^2",
+                        ],
+                        "fuzziness": "AUTO",
+                        "prefix_length": 2,
+                    }
+                })
+            else:
+                must_clauses.append({"match_all": {}})
+
+            if params.department:
+                dept_val = params.department.strip()
+                filter_clauses.append({
+                    "bool": {
+                        "should": [
+                            {"term": {"department.keyword": dept_val}},
+                            {"term": {"department_code.keyword": dept_val}},
+                            {"term": {"department_name.keyword": dept_val}},
+                            {"match": {"department": dept_val}},
+                            {"match": {"department_name": dept_val}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                })
+
+            if params.role:
+                role_val = params.role.strip()
+                filter_clauses.append({
+                    "bool": {
+                        "should": [
+                            {"term": {"role.keyword": role_val}},
+                            {"term": {"role_name.keyword": role_val}},
+                            {"match": {"role": role_val}},
+                            {"match": {"role_name": role_val}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                })
+
+            if params.account_type:
+                filter_clauses.append({
+                    "term": {"account_types.keyword": params.account_type.strip().lower()}
+                })
+
+            if params.currency:
+                filter_clauses.append({
+                    "term": {"currencies.keyword": params.currency.strip().upper()}
+                })
+
+            balance_range: Dict[str, Any] = {}
+            if params.min_balance_cents is not None:
+                balance_range["gte"] = params.min_balance_cents
+            if params.max_balance_cents is not None:
+                balance_range["lte"] = params.max_balance_cents
+            if balance_range:
+                filter_clauses.append({"range": {"total_balance_cents": balance_range}})
+
+            accounts_range: Dict[str, Any] = {}
+            if params.min_accounts is not None:
+                accounts_range["gte"] = params.min_accounts
+            if params.max_accounts is not None:
+                accounts_range["lte"] = params.max_accounts
+            if accounts_range:
+                filter_clauses.append({"range": {"account_count": accounts_range}})
+
+            date_range: Dict[str, Any] = {}
+            if params.created_after is not None:
+                date_range["gte"] = params.created_after.isoformat()
+            if params.created_before is not None:
+                date_range["lte"] = params.created_before.isoformat()
+            if date_range:
+                filter_clauses.append({"range": {"created_at": date_range}})
+
+            es_query = {
+                "bool": {
+                    "must": must_clauses,
+                    "filter": filter_clauses,
+                }
+            }
+
+            sort_field = params.sort_by or "created_at"
+            sort_order = (params.sort_order or "desc").lower()
+
+            es_sort: List[Any] = []
+            if sort_field in ("_score", "score", "relevance"):
+                es_sort.append({"_score": {"order": sort_order}})
+            elif sort_field in ("total_balance_cents", "account_count", "created_at"):
+                es_sort.append({sort_field: {"order": sort_order}})
+            elif sort_field in ("name", "email"):
+                es_sort.append({f"{sort_field}.keyword": {"order": sort_order, "unmapped_type": "keyword"}})
+            else:
+                es_sort.append({"created_at": {"order": "desc"}})
+
+            es_aggs: Dict[str, Any] = {}
+            if params.include_aggregations:
+                es_aggs = {
+                    "departments": {"terms": {"field": "department_name.keyword", "size": 15}},
+                    "roles": {"terms": {"field": "role_name.keyword", "size": 15}},
+                    "account_types": {"terms": {"field": "account_types.keyword", "size": 15}},
+                    "currencies": {"terms": {"field": "currencies.keyword", "size": 15}},
+                    "balance_stats": {"stats": {"field": "total_balance_cents"}},
+                }
+
+            search_body: Dict[str, Any] = {
+                "query": es_query,
+                "sort": es_sort,
+                "from": params.offset,
+                "size": params.limit,
+            }
+            if es_aggs:
+                search_body["aggs"] = es_aggs
+
+            # First try against `user_profile` index (has accounts and balances)
+            resp = await self.es.search_raw(index="user_profile", body=search_body)
+            hits = resp.get("hits", {}).get("hits", [])
+            total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
+
+            # If user_profile returned 0 results, check if basic `user` index has hits (e.g. users without accounts)
+            if not hits and not (params.account_type or params.currency or params.min_balance_cents or params.max_balance_cents or params.min_accounts):
+                resp = await self.es.search_raw(index="user", body=search_body)
+                hits = resp.get("hits", {}).get("hits", [])
+                total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
+
+            if hits or total > 0 or not self.db:
+                parsed_items = [
+                    UserRead(
+                        id=h["_source"].get("id"),
+                        name=h["_source"].get("name", ""),
+                        email=h["_source"].get("email", ""),
+                        role=h["_source"].get("role", "user"),
+                        department=h["_source"].get("department_name") or h["_source"].get("department"),
+                        department_id=h["_source"].get("department_code") or h["_source"].get("department_id"),
+                        role_id=h["_source"].get("role_name") or h["_source"].get("role_id"),
+                        phone_masked=h["_source"].get("phone_masked"),
+                        total_balance_cents=h["_source"].get("total_balance_cents"),
+                        account_count=h["_source"].get("account_count"),
+                        accounts=[
+                            AccountRead(**acc)
+                            for acc in (h["_source"].get("accounts") or [])
+                            if isinstance(acc, dict) and "id" in acc
+                        ] or None,
+                        created_at=_parse_datetime(h["_source"].get("created_at")),
+                    )
+                    for h in hits
+                    if "_source" in h
+                ]
+
+                parsed_aggs: Optional[SearchAggregations] = None
+                if params.include_aggregations and "aggregations" in resp:
+                    raw_aggs = resp["aggregations"]
+                    dept_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("departments", {}).get("buckets", [])}
+                    role_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("roles", {}).get("buckets", [])}
+                    type_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("account_types", {}).get("buckets", [])}
+                    curr_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("currencies", {}).get("buckets", [])}
+                    bal_stats = raw_aggs.get("balance_stats", {})
+                    parsed_aggs = SearchAggregations(
+                        departments=dept_counts,
+                        roles=role_counts,
+                        account_types=type_counts,
+                        currencies=curr_counts,
+                        total_balance_cents={
+                            "sum": bal_stats.get("sum", 0),
+                            "avg": bal_stats.get("avg", 0),
+                            "min": bal_stats.get("min", 0),
+                            "max": bal_stats.get("max", 0),
+                            "count": bal_stats.get("count", 0),
+                        },
+                    )
+
+                return UserSearchResult(
+                    total=total,
+                    items=parsed_items,
+                    limit=params.limit,
+                    offset=params.offset,
+                    aggregations=parsed_aggs,
+                )
+        except Exception as exc:
+            logger.warning("Elasticsearch complex search failed: %s. Falling back to PostgreSQL.", exc)
+
+        # ----------------------------------------------------------------------
+        # 2. Secondary Fallback: PostgreSQL Complex Raw SQL Search
+        # ----------------------------------------------------------------------
+        db_rows, db_total = await self.repo.search_complex(
+            q=params.q,
+            department=params.department,
+            role=params.role,
+            account_type=params.account_type,
+            currency=params.currency,
+            min_balance_cents=params.min_balance_cents,
+            max_balance_cents=params.max_balance_cents,
+            min_accounts=params.min_accounts,
+            max_accounts=params.max_accounts,
+            created_after=params.created_after,
+            created_before=params.created_before,
+            sort_by=params.sort_by,
+            sort_order=params.sort_order,
+            limit=params.limit,
+            offset=params.offset,
         )
-        return [self._to_read_schema(u) for u in users]
+
+        fallback_items = []
+        for r in db_rows:
+            masked_phone = r.get("phone_encrypted")
+            if self.crypto is not None and r.get("phone_encrypted"):
+                aad = f"users.phone:{r['id']}".encode("utf-8")
+                try:
+                    plain = self.crypto.decrypt(r["phone_encrypted"], aad=aad)
+                    masked_phone = self.crypto.mask_phone(plain)
+                except Exception:
+                    masked_phone = "***"
+            fallback_items.append(
+                UserRead(
+                    id=r["id"],
+                    name=r["name"],
+                    email=r["email"],
+                    role=r["role"],
+                    department=r.get("dept_name") or r.get("department"),
+                    department_id=r.get("dept_code") or r.get("department"),
+                    role_id=r.get("role_name") or r.get("role"),
+                    phone_masked=masked_phone,
+                    total_balance_cents=r.get("total_balance_cents"),
+                    account_count=r.get("account_count"),
+                    created_at=r.get("created_at"),
+                )
+            )
+
+        return UserSearchResult(
+            total=db_total,
+            items=fallback_items,
+            limit=params.limit,
+            offset=params.offset,
+            aggregations=None,
+        )
 
     
 
     # --------------------------------------------------------------------------
     # Helper Mappings & CQRS Synchronization
     # --------------------------------------------------------------------------
-    def _to_read_schema(self, user: User) -> UserRead:
+    def _to_read_schema(
+        self,
+        user: User,
+        accounts: Optional[List[AccountRead]] = None,
+        total_balance_cents: Optional[int] = None,
+        account_count: Optional[int] = None,
+    ) -> UserRead:
         """Decrypts phone using AAD and returns safe masked representation."""
         masked_phone = user.phone_encrypted
         if self.crypto is not None and user.phone_encrypted:
@@ -422,18 +781,129 @@ class UserService:
             department_id=user.department_id or user.department,
             role_id=user.role_id or user.role,
             phone_masked=masked_phone,
+            accounts=accounts,
+            total_balance_cents=total_balance_cents,
+            account_count=account_count,
+            created_at=user.created_at or datetime.now(timezone.utc),
+        )
+
+    def _to_profile_read(self, profile: UserProfile) -> UserProfileRead:
+        """Converts UserProfile domain model to UserProfileRead schema with phone masking."""
+        user = profile.user
+        masked_phone = user.phone_encrypted
+        if self.crypto is not None and user.phone_encrypted:
+            aad = f"users.phone:{user.id}".encode("utf-8")
+            try:
+                plain_phone = self.crypto.decrypt(user.phone_encrypted, aad=aad)
+                masked_phone = self.crypto.mask_phone(plain_phone)
+            except DecryptionError:
+                masked_phone = "***"
+
+        dept_read: Optional[DepartmentRead] = None
+        if profile.department:
+            dept_read = DepartmentRead(
+                id=profile.department.id,
+                name=profile.department.name,
+                code=profile.department.code,
+                description=profile.department.description,
+            )
+
+        role_read: Optional[RoleRead] = None
+        if profile.role_info:
+            role_read = RoleRead(
+                id=profile.role_info.id,
+                name=profile.role_info.name,
+                description=profile.role_info.description,
+                permissions=profile.role_info.permissions,
+            )
+
+        accounts_read: List[AccountRead] = [
+            AccountRead(
+                id=acc.id,
+                account_number=acc.account_number,
+                account_type=acc.account_type,
+                balance_cents=acc.balance_cents,
+                currency=acc.currency,
+                status=acc.status,
+                created_at=acc.created_at,
+            )
+            for acc in profile.accounts
+        ]
+
+        return UserProfileRead(
+            id=user.id,
+            name=user.name,
+            email=user.email,
+            role=user.role,
+            phone_masked=masked_phone,
+            department=dept_read,
+            role_info=role_read,
+            accounts=accounts_read,
+            total_balance_cents=profile.total_balance_cents,
+            account_count=len(profile.accounts),
             created_at=user.created_at or datetime.now(timezone.utc),
         )
 
     def _build_user_es_doc(self, user: User) -> Dict[str, Any]:
         """Constructs Elasticsearch document shape for User indexing."""
+        masked_phone = None
+        if self.crypto is not None and user.phone_encrypted:
+            aad = f"users.phone:{user.id}".encode("utf-8")
+            try:
+                plain_phone = self.crypto.decrypt(user.phone_encrypted, aad=aad)
+                masked_phone = self.crypto.mask_phone(plain_phone)
+            except DecryptionError:
+                masked_phone = "***"
+
         return {
             "id": str(user.id),
             "name": user.name,
             "email": user.email,
             "role": user.role,
             "department": user.department,
+            "department_id": user.department_id or user.department,
+            "role_id": user.role_id or user.role,
+            "phone_masked": masked_phone,
             "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+
+    async def _build_user_es_payload(self, user_id: uuid.UUID) -> Dict[str, Any]:
+        """Constructs both User and UserProfile documents for Outbox payload."""
+        profile = await self.repo.get_profile(user_id)
+        if profile is None:
+            user = await self.repo.get(user_id)
+            if not user:
+                return {}
+            return {"user": self._build_user_es_doc(user)}
+
+        user = profile.user
+        profile_read = self._to_profile_read(profile)
+
+        user_doc = {
+            "id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+            "department": user.department,
+            "department_id": user.department_id or user.department,
+            "role_id": user.role_id or user.role,
+            "phone_masked": profile_read.phone_masked,
+            "account_count": profile_read.account_count,
+            "total_balance_cents": profile_read.total_balance_cents,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+
+        profile_doc = profile_read.model_dump(mode="json")
+        profile_doc["department_name"] = profile_read.department.name if profile_read.department else None
+        profile_doc["department_code"] = profile_read.department.code if profile_read.department else None
+        profile_doc["role_name"] = profile_read.role_info.name if profile_read.role_info else None
+        profile_doc["account_numbers"] = [a.account_number for a in profile_read.accounts]
+        profile_doc["account_types"] = [a.account_type for a in profile_read.accounts]
+        profile_doc["currencies"] = list(set(a.currency for a in profile_read.accounts))
+
+        return {
+            "user": user_doc,
+            "profile": profile_doc,
         }
 
     async def _dispatch_outbox_sync(self, event: OutboxEvent) -> None:
@@ -444,10 +914,16 @@ class UserService:
             try:
                 agg_id = str(event.aggregate_id)
                 if event.event_type in ("CREATE", "UPDATE"):
-                    if event.payload:
-                        await self.es.index_document(index="user", id_=agg_id, document=event.payload)
+                    payload = event.payload or {}
+                    user_doc = payload.get("user") if isinstance(payload, dict) and "user" in payload else payload
+                    if isinstance(user_doc, dict) and user_doc:
+                        await self.es.index_document(index="user", id_=agg_id, document=user_doc)
+                    profile_doc = payload.get("profile") if isinstance(payload, dict) else None
+                    if isinstance(profile_doc, dict) and profile_doc:
+                        await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
                 elif event.event_type == "DELETE":
                     await self.es.delete_document(index="user", id_=agg_id)
+                    await self.es.delete_document(index="user_profile", id_=agg_id)
 
                 now = datetime.now(timezone.utc)
                 await self.outbox_repo.mark_published(event.id, published_at=now)
