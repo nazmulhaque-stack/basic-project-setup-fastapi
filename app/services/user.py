@@ -31,6 +31,18 @@ from app.services.cache import DynamicRedisCache
 logger = logging.getLogger(__name__)
 
 
+def _parse_datetime(val: Any) -> Optional[datetime]:
+    """Safely parses string or datetime value into Optional[datetime]."""
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            return datetime.fromisoformat(val.strip())
+        except ValueError:
+            return None
+    return None
+
+
 class UserService:
     """User domain service: PII cryptography, Redis L1 caching, Transactional Outbox, and Elasticsearch search."""
 
@@ -92,21 +104,24 @@ class UserService:
 
         created = await self.repo.create(user)
 
-        # Optional initial accounts creation
+        # Optional initial accounts creation in a single batch (no loop)
         if payload.accounts:
-            for acc_payload in payload.accounts:
-                account_model = UserAccount(
+            now = datetime.now(timezone.utc)
+            accounts = [
+                UserAccount(
                     id=uuid.uuid4(),
                     user_id=user_id,
-                    account_number=acc_payload.account_number,
-                    account_type=acc_payload.account_type,
-                    balance_cents=acc_payload.balance_cents,
-                    currency=acc_payload.currency,
-                    status=acc_payload.status,
-                    created_at=datetime.now(timezone.utc),
-                    updated_at=datetime.now(timezone.utc),
+                    account_number=acc.account_number,
+                    account_type=acc.account_type,
+                    balance_cents=acc.balance_cents,
+                    currency=acc.currency,
+                    status=acc.status,
+                    created_at=now,
+                    updated_at=now,
                 )
-                await self.repo.create_account(account_model)
+                for acc in payload.accounts
+            ]
+            await self.repo.create_accounts(accounts)
 
         read_model = self._to_read_schema(created)
 
@@ -141,7 +156,7 @@ class UserService:
         try:
             cached = await self.cache.get_item(str(user_id))
             if cached is not None:
-                if isinstance(cached, dict) and cached.get("__not_found__"):
+                if cached.get("__not_found__"):
                     raise NotFoundError(f"User with ID '{user_id}' not found.")
                 return UserRead(**cached)
         except NotFoundError:
@@ -159,8 +174,10 @@ class UserService:
                     email=es_doc.get("email", ""),
                     role=es_doc.get("role", "user"),
                     department=es_doc.get("department"),
-                    phone_masked=None,
-                    created_at=datetime.fromisoformat(es_doc["created_at"]) if es_doc.get("created_at") else None,
+                    department_id=es_doc.get("department_id") or es_doc.get("department"),
+                    role_id=es_doc.get("role_id") or es_doc.get("role"),
+                    phone_masked=es_doc.get("phone_masked"),
+                    created_at=_parse_datetime(es_doc.get("created_at")),
                 )
                 try:
                     await self.cache.set_item(str(user_id), user_read.model_dump(mode="json"))
@@ -205,9 +222,12 @@ class UserService:
     ) -> UserPage:
         """List users using keyset (cursor) B-Tree pagination and Redis list caching."""
         safe_limit = min(100, max(1, limit))
-        filter_params = {"limit": safe_limit, "cursor": cursor, "role": role}
 
-        cached_page = await self.cache.get_paginated(**filter_params)
+        cached_page = await self.cache.get_paginated(
+            limit=safe_limit,
+            cursor=cursor,
+            role=role,
+        )
         if cached_page is not None:
             return UserPage(**cached_page)
 
@@ -226,19 +246,17 @@ class UserService:
         items_schema = [self._to_read_schema(u) for u in users_db]
 
         next_cursor: Optional[str] = None
-        if has_next and users_db:
-            last_item = users_db[-1]
-            if last_item.created_at:
-                next_cursor = encode_cursor(last_item.created_at, last_item.id)
+        if has_next and users_db and users_db[-1].created_at:
+            next_cursor = encode_cursor(users_db[-1].created_at, users_db[-1].id)
 
-        page_result: Dict[str, Any] = {
-            "items": [item.model_dump(mode="json") for item in items_schema],
-            "next_cursor": next_cursor,
-            "limit": safe_limit,
-        }
-
-        await self.cache.set_paginated(page_result, **filter_params)
-        return UserPage(**page_result)
+        user_page = UserPage(items=items_schema, next_cursor=next_cursor)
+        await self.cache.set_paginated(
+            user_page.model_dump(mode="json"),
+            limit=safe_limit,
+            cursor=cursor,
+            role=role,
+        )
+        return user_page
 
     # --------------------------------------------------------------------------
     # 4. UPDATE USER (PATCH /users/{user_id})
@@ -263,6 +281,10 @@ class UserService:
             user.role = payload.role
         if payload.department is not None:
             user.department = payload.department
+        if payload.department_id is not None:
+            user.department_id = payload.department_id
+        if payload.role_id is not None:
+            user.role_id = payload.role_id
 
         if payload.phone is not None:
             if self.crypto is not None:
@@ -360,11 +382,7 @@ class UserService:
                         department_id=hit.get("department_id") or hit.get("department"),
                         role_id=hit.get("role_id") or hit.get("role"),
                         phone_masked=hit.get("phone_masked"),
-                        created_at=(
-                            datetime.fromisoformat(hit["created_at"])
-                            if isinstance(hit.get("created_at"), str)
-                            else hit.get("created_at")
-                        ),
+                        created_at=_parse_datetime(hit.get("created_at")),
                     )
                     for hit in hits
                 ]

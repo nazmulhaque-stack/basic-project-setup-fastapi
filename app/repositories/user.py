@@ -1,7 +1,7 @@
 """User repository: direct asyncpg hand-written SQL queries (no ORM, no BaseRepository inheritance)."""
 
 from datetime import datetime, timezone
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple, cast
 import uuid
 
 import orjson
@@ -22,6 +22,37 @@ def _row_to_user(row: Any) -> User:
         department_id=row.get("department_id"),
         role_id=row.get("role_id"),
         created_at=row["created_at"],
+    )
+
+
+def _parse_account_dict(acc: Any, user_id: uuid.UUID) -> UserAccount:
+    """Safely converts an account mapping or JSON dictionary into a UserAccount dataclass."""
+    acc_dict: Mapping[str, Any] = cast(Mapping[str, Any], acc) if isinstance(acc, Mapping) else {}
+    raw_id = acc_dict.get("id")
+    try:
+        acc_id = raw_id if isinstance(raw_id, uuid.UUID) else uuid.UUID(str(raw_id))
+    except (ValueError, TypeError):
+        acc_id = uuid.uuid4()
+
+    created_at: Optional[datetime] = None
+    raw_dt = acc_dict.get("created_at")
+    if isinstance(raw_dt, datetime):
+        created_at = raw_dt
+    elif isinstance(raw_dt, str) and raw_dt.strip():
+        try:
+            created_at = datetime.fromisoformat(raw_dt.strip())
+        except ValueError:
+            created_at = None
+
+    return UserAccount(
+        id=acc_id,
+        user_id=user_id,
+        account_number=str(acc_dict.get("account_number", "")),
+        account_type=str(acc_dict.get("account_type", "checking")),
+        balance_cents=int(acc_dict.get("balance_cents") or 0),
+        currency=str(acc_dict.get("currency", "USD")),
+        status=str(acc_dict.get("status", "active")),
+        created_at=created_at,
     )
 
 
@@ -54,25 +85,23 @@ def _row_to_profile(row: Any) -> UserProfile:
     )
 
     accounts_data = row["accounts_json"]
-    if isinstance(accounts_data, str):
-        accounts_list = orjson.loads(accounts_data)
+    accounts_list: List[Any]
+    if isinstance(accounts_data, (str, bytes)):
+        try:
+            parsed = orjson.loads(accounts_data)
+            accounts_list = cast(List[Any], parsed) if isinstance(parsed, list) else []
+        except Exception:
+            accounts_list = []
+    elif isinstance(accounts_data, list):
+        accounts_list = cast(List[Any], accounts_data)
     else:
-        accounts_list = accounts_data or []
+        accounts_list = []
 
-    accounts: List[UserAccount] = []
-    for acc in accounts_list:
-        accounts.append(
-            UserAccount(
-                id=uuid.UUID(str(acc["id"])),
-                user_id=user.id,
-                account_number=acc["account_number"],
-                account_type=acc.get("account_type", "checking"),
-                balance_cents=int(acc.get("balance_cents", 0)),
-                currency=acc.get("currency", "USD"),
-                status=acc.get("status", "active"),
-                created_at=datetime.fromisoformat(acc["created_at"]) if acc.get("created_at") else None,
-            )
-        )
+    accounts: List[UserAccount] = [
+        _parse_account_dict(acc, user.id)
+        for acc in accounts_list
+        if isinstance(acc, (dict, Mapping))
+    ]
 
     return UserProfile(
         user=user,
@@ -158,7 +187,7 @@ class UserRepository:
             user.phone_blind_index,
             user.created_at or datetime.now(timezone.utc),
         )
-        return _row_to_user(row)
+        return _row_to_user(row) if row is not None else user
 
     async def update(self, user: User) -> User:
         query = """
@@ -177,7 +206,7 @@ class UserRepository:
             user.phone_blind_index,
             user.id,
         )
-        return _row_to_user(row)
+        return _row_to_user(row) if row is not None else user
 
     async def delete(self, user_id: uuid.UUID) -> bool:
         res = await self.db.execute("DELETE FROM users WHERE id = $1", user_id)
@@ -187,7 +216,7 @@ class UserRepository:
         self,
         limit: int = 50,
         cursor_dt: Optional[datetime] = None,
-        cursor_id: Optional[Any] = None,
+        cursor_id: Optional[uuid.UUID] = None,
         role: Optional[str] = None,
     ) -> Tuple[List[User], bool]:
         clauses: List[str] = []
@@ -272,6 +301,8 @@ class UserRepository:
             account.created_at or datetime.now(timezone.utc),
             account.updated_at or datetime.now(timezone.utc),
         )
+        if row is None:
+            return account
         return UserAccount(
             id=row["id"],
             user_id=row["user_id"],
@@ -282,6 +313,38 @@ class UserRepository:
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    async def create_accounts(self, accounts: List[UserAccount]) -> None:
+        """Bulk insert multiple accounts in a single query without looping."""
+        if not accounts:
+            return
+        query = """
+            INSERT INTO user_accounts (id, user_id, account_number, account_type, balance_cents, currency, status, created_at, updated_at)
+            SELECT * FROM UNNEST(
+                $1::uuid[],
+                $2::uuid[],
+                $3::varchar[],
+                $4::varchar[],
+                $5::bigint[],
+                $6::varchar[],
+                $7::varchar[],
+                $8::timestamptz[],
+                $9::timestamptz[]
+            )
+        """
+        now = datetime.now(timezone.utc)
+        await self.db.execute(
+            query,
+            [a.id for a in accounts],
+            [a.user_id for a in accounts],
+            [a.account_number for a in accounts],
+            [a.account_type for a in accounts],
+            [a.balance_cents for a in accounts],
+            [a.currency for a in accounts],
+            [a.status for a in accounts],
+            [a.created_at or now for a in accounts],
+            [a.updated_at or now for a in accounts],
         )
 
     async def list_departments(self) -> List[Department]:
