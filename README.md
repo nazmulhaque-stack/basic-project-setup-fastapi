@@ -953,7 +953,7 @@ python scripts/sync_all_to_es.py --recreate-indices
 
 The sync has no implicit user-count cap: it reads the PostgreSQL total and syncs all users by default. A partial sync requires an explicit `--limit N`.
 
-`--recreate-indices` deletes and recreates only `{ELASTICSEARCH_INDEX_PREFIX}_user` and `{ELASTICSEARCH_INDEX_PREFIX}_user_profile`; searches against these indices will be unavailable/incomplete until the backfill finishes. Run it during a maintenance window, and avoid concurrent database writes while rebuilding. Bulk or connectivity errors stop the script with a non-zero exit instead of reporting a false success.
+`--recreate-indices` deletes and recreates only `{ELASTICSEARCH_INDEX_PREFIX}_user` and `{ELASTICSEARCH_INDEX_PREFIX}_user_profile`; searches against these indices will be unavailable/incomplete until the backfill finishes. Run it during a maintenance window, and avoid concurrent database writes while rebuilding. Elasticsearch bulk requests default to 500 users per request (`ES_BULK_BATCH_SIZE`), with bounded retries for transient network errors (`ES_SYNC_REQUEST_RETRIES`). If Elasticsearch stays unavailable, the sync exits with an error and can be rerun safely because document IDs are deterministic; failures are not reported as success.
 
 ### 6. Log Search API & Histogram Aggregations
 

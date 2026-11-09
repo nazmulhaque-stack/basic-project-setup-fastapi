@@ -308,16 +308,34 @@ class UserRepository:
             )
 
         if department:
-            params.append(department.strip())
-            p_idx = len(params)
-            where_clauses.append(
-                f"(LOWER(u.department) = LOWER(${p_idx}) OR LOWER(d.code) = LOWER(${p_idx}) OR LOWER(d.name) = LOWER(${p_idx}))"
+            dept_term = department.strip()
+            dept_matches = await self.db.fetch(
+                "SELECT name, code FROM departments WHERE LOWER(name) = LOWER($1) OR LOWER(code) = LOWER($1)",
+                dept_term,
             )
+            dept_values = {dept_term}
+            for dm in dept_matches:
+                if dm["name"]:
+                    dept_values.add(dm["name"])
+                if dm["code"]:
+                    dept_values.add(dm["code"])
+            params.append(list(dept_values))
+            p_idx = len(params)
+            where_clauses.append(f"u.department = ANY(${p_idx}::text[])")
 
         if role:
-            params.append(role.strip())
+            role_term = role.strip()
+            role_matches = await self.db.fetch(
+                "SELECT name FROM roles WHERE LOWER(name) = LOWER($1)",
+                role_term,
+            )
+            role_values = {role_term}
+            for rm in role_matches:
+                if rm["name"]:
+                    role_values.add(rm["name"])
+            params.append(list(role_values))
             p_idx = len(params)
-            where_clauses.append(f"LOWER(u.role) = LOWER(${p_idx})")
+            where_clauses.append(f"u.role = ANY(${p_idx}::text[])")
 
         if account_type:
             params.append(account_type.strip())
@@ -380,6 +398,77 @@ class UserRepository:
         params.append(safe_offset)
         offset_idx = len(params)
 
+        has_account_filters = bool(having_clauses or account_type or currency or (q and q.strip()))
+
+        if not has_account_filters:
+            user_order_map = {
+                "created_at": f"u.created_at {safe_order}, u.id ASC",
+                "name": f"u.name {safe_order}, u.id ASC",
+                "email": f"u.email {safe_order}, u.id ASC",
+            }
+            user_order_by = user_order_map.get(str(sort_by).lower(), f"u.created_at {safe_order}, u.id ASC")
+
+            # Fast user-first pagination (avoids full-table scan on 10M rows)
+            sql = f"""
+                WITH user_subset AS (
+                    SELECT u.id, u.name, u.email, u.role, u.department, u.phone_encrypted, u.phone_blind_index, u.created_at
+                    FROM users u
+                    {where_sql}
+                    ORDER BY {user_order_by}
+                    LIMIT ${limit_idx} OFFSET ${offset_idx}
+                )
+                SELECT 
+                    u.id,
+                    u.name,
+                    u.email,
+                    u.role,
+                    u.department,
+                    u.phone_encrypted,
+                    u.phone_blind_index,
+                    u.created_at,
+                    d.id AS dept_id,
+                    COALESCE(d.name, u.department) AS dept_name,
+                    COALESCE(d.code, u.department) AS dept_code,
+                    d.description AS dept_description,
+                    r.id AS role_id,
+                    COALESCE(r.name, u.role) AS role_name,
+                    r.description AS role_description,
+                    COALESCE(r.permissions, '{{}}') AS role_permissions,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'id', a.id,
+                                'account_number', a.account_number,
+                                'account_type', a.account_type,
+                                'balance_cents', a.balance_cents,
+                                'currency', a.currency,
+                                'status', a.status,
+                                'created_at', a.created_at
+                            )
+                        ) FILTER (WHERE a.id IS NOT NULL),
+                        '[]'::json
+                    ) AS accounts_json,
+                    COALESCE(SUM(a.balance_cents), 0)::bigint AS total_balance_cents,
+                    COUNT(a.id)::int AS account_count
+                FROM user_subset u
+                LEFT JOIN user_accounts a ON a.user_id = u.id
+                LEFT JOIN departments d ON (d.name = u.department OR d.code = u.department)
+                LEFT JOIN roles r ON r.name = u.role
+                GROUP BY u.id, u.name, u.email, u.role, u.department, u.phone_encrypted, u.phone_blind_index, u.created_at, d.id, d.name, d.code, d.description, r.id, r.name, r.description, r.permissions
+                ORDER BY {user_order_by}
+            """
+            rows = await self.db.fetch(sql, *params)
+            count_params = params[:limit_idx - 1]
+            if where_clauses:
+                count_sql = f"SELECT count(*) FROM users u {where_sql}"
+                total_val = await self.db.fetchval(count_sql, *count_params)
+                total_count = int(total_val or 0)
+            else:
+                total_val = await self.db.fetchval("SELECT count(*) FROM users")
+                total_count = int(total_val or 0)
+            items = [dict(r) for r in rows]
+            return items, total_count
+
         sql = f"""
             SELECT 
                 u.id,
@@ -413,12 +502,11 @@ class UserRepository:
                     '[]'::json
                 ) AS accounts_json,
                 COALESCE(SUM(a.balance_cents), 0)::bigint AS total_balance_cents,
-                COUNT(a.id)::int AS account_count,
-                COUNT(*) OVER() AS full_count
+                COUNT(a.id)::int AS account_count
             FROM users u
             LEFT JOIN user_accounts a ON a.user_id = u.id
-            LEFT JOIN departments d ON (LOWER(d.name) = LOWER(u.department) OR LOWER(d.code) = LOWER(u.department))
-            LEFT JOIN roles r ON LOWER(r.name) = LOWER(u.role)
+            LEFT JOIN departments d ON (d.name = u.department OR d.code = u.department)
+            LEFT JOIN roles r ON r.name = u.role
             {where_sql}
             GROUP BY u.id, u.name, u.email, u.role, u.department, u.phone_encrypted, u.phone_blind_index, u.created_at, d.id, d.name, d.code, d.description, r.id, r.name, r.description, r.permissions
             {having_sql}
@@ -427,8 +515,8 @@ class UserRepository:
         """
 
         rows = await self.db.fetch(sql, *params)
-        total_count = int(rows[0]["full_count"]) if rows else 0
         items = [dict(r) for r in rows]
+        total_count = len(items) if len(items) < safe_limit and safe_offset == 0 else safe_offset + len(items) + (1 if len(items) == safe_limit else 0)
         return items, total_count
 
     # --------------------------------------------------------------------------

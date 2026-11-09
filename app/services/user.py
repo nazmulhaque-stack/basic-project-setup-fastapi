@@ -511,6 +511,12 @@ class UserService:
             )
 
         # ----------------------------------------------------------------------
+        # Direct PostgreSQL Search (No Caching)
+        # ----------------------------------------------------------------------
+        if not use_cache:
+            return await self.search_users_db_only(params)
+
+        # ----------------------------------------------------------------------
         # 1. Primary: Elasticsearch Complex Bool Query against `user_profile`
         # ----------------------------------------------------------------------
         if use_cache:
@@ -653,93 +659,138 @@ class UserService:
                     hits = resp.get("hits", {}).get("hits", [])
                     total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
 
-                if hits or total > 0 or not self.db:
-                    parsed_items: List[UserProfileRead] = []
-                    for h in hits:
-                        src = h.get("_source", {})
-                        user_id = uuid.UUID(str(src["id"])) if isinstance(src.get("id"), (str, uuid.UUID)) else src.get("id")
+                parsed_items: List[UserProfileRead] = []
+                for h in hits:
+                    src = h.get("_source", {})
+                    user_id = uuid.UUID(str(src["id"])) if isinstance(src.get("id"), (str, uuid.UUID)) else src.get("id")
 
-                        dept_data = src.get("department")
-                        if isinstance(dept_data, dict):
-                            dept = DepartmentRead(**dept_data)
-                        elif isinstance(dept_data, str) and dept_data.strip():
-                            dept = DepartmentRead(id=0, name=dept_data, code=src.get("department_code") or dept_data, description="")
-                        else:
-                            dept = DepartmentRead(id=0, name="", code="", description="")
+                    dept_data = src.get("department")
+                    if isinstance(dept_data, dict):
+                        dept = DepartmentRead(**dept_data)
+                    elif isinstance(dept_data, str) and dept_data.strip():
+                        dept = DepartmentRead(id=0, name=dept_data, code=src.get("department_code") or dept_data, description="")
+                    else:
+                        dept = DepartmentRead(id=0, name="", code="", description="")
 
-                        role_data = src.get("role_info")
-                        if isinstance(role_data, dict):
-                            role_info = RoleRead(**role_data)
-                        elif isinstance(role_data, str) and role_data.strip():
-                            role_info = RoleRead(id=0, name=role_data, description="", permissions=[])
-                        else:
-                            role_info = RoleRead(id=0, name=src.get("role", "user"), description="", permissions=[])
+                    role_data = src.get("role_info")
+                    if isinstance(role_data, dict):
+                        role_info = RoleRead(**role_data)
+                    elif isinstance(role_data, str) and role_data.strip():
+                        role_info = RoleRead(id=0, name=role_data, description="", permissions=[])
+                    else:
+                        role_info = RoleRead(id=0, name=src.get("role", "user"), description="", permissions=[])
 
-                        accs = [
-                            AccountRead(
-                                id=uuid.UUID(str(acc["id"])),
-                                account_number=acc["account_number"],
-                                account_type=acc.get("account_type", "checking"),
-                                balance_cents=int(acc.get("balance_cents", 0)),
-                                currency=acc.get("currency", "USD"),
-                                status=acc.get("status", "active"),
-                                created_at=_parse_datetime(acc.get("created_at")),
-                            )
-                            for acc in (src.get("accounts") or [])
-                            if isinstance(acc, dict) and "id" in acc
-                        ]
-
-                        parsed_items.append(
-                            UserProfileRead(
-                                id=user_id,
-                                name=src.get("name", ""),
-                                email=src.get("email", ""),
-                                role=src.get("role", "user"),
-                                department=dept,
-                                role_info=role_info,
-                                accounts=accs,
-                                total_balance_cents=int(src.get("total_balance_cents") or 0),
-                                account_count=int(src.get("account_count") or len(accs)),
-                                phone_masked=src.get("phone_masked"),
-                                created_at=_parse_datetime(src.get("created_at")),
-                            )
+                    accs = [
+                        AccountRead(
+                            id=uuid.UUID(str(acc["id"])),
+                            account_number=acc["account_number"],
+                            account_type=acc.get("account_type", "checking"),
+                            balance_cents=int(acc.get("balance_cents", 0)),
+                            currency=acc.get("currency", "USD"),
+                            status=acc.get("status", "active"),
+                            created_at=_parse_datetime(acc.get("created_at")),
                         )
+                        for acc in (src.get("accounts") or [])
+                        if isinstance(acc, dict) and "id" in acc
+                    ]
 
-                    parsed_aggs: Optional[SearchAggregations] = None
-                    if params.include_aggregations and "aggregations" in resp:
-                        raw_aggs = resp["aggregations"]
-                        dept_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("departments", {}).get("buckets", [])}
-                        role_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("roles", {}).get("buckets", [])}
-                        type_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("account_types", {}).get("buckets", [])}
-                        curr_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("currencies", {}).get("buckets", [])}
-                        bal_stats = raw_aggs.get("balance_stats", {})
-                        parsed_aggs = SearchAggregations(
-                            departments=dept_counts,
-                            roles=role_counts,
-                            account_types=type_counts,
-                            currencies=curr_counts,
-                            total_balance_cents={
-                                "sum": bal_stats.get("sum", 0),
-                                "avg": bal_stats.get("avg", 0),
-                                "min": bal_stats.get("min", 0),
-                                "max": bal_stats.get("max", 0),
-                                "count": bal_stats.get("count", 0),
-                            },
+                    parsed_items.append(
+                        UserProfileRead(
+                            id=user_id,
+                            name=src.get("name", ""),
+                            email=src.get("email", ""),
+                            role=src.get("role", "user"),
+                            department=dept,
+                            role_info=role_info,
+                            accounts=accs,
+                            total_balance_cents=int(src.get("total_balance_cents") or 0),
+                            account_count=int(src.get("account_count") or len(accs)),
+                            phone_masked=src.get("phone_masked"),
+                            created_at=_parse_datetime(src.get("created_at")),
                         )
-
-                    return UserSearchResult(
-                        total=total,
-                        items=parsed_items,
-                        limit=params.limit,
-                        offset=params.offset,
-                        aggregations=parsed_aggs,
                     )
+
+                parsed_aggs: Optional[SearchAggregations] = None
+                if params.include_aggregations and "aggregations" in resp:
+                    raw_aggs = resp["aggregations"]
+                    dept_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("departments", {}).get("buckets", [])}
+                    role_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("roles", {}).get("buckets", [])}
+                    type_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("account_types", {}).get("buckets", [])}
+                    curr_counts = {b["key"]: b["doc_count"] for b in raw_aggs.get("currencies", {}).get("buckets", [])}
+                    bal_stats = raw_aggs.get("balance_stats", {})
+                    parsed_aggs = SearchAggregations(
+                        departments=dept_counts,
+                        roles=role_counts,
+                        account_types=type_counts,
+                        currencies=curr_counts,
+                        total_balance_cents={
+                            "sum": bal_stats.get("sum", 0),
+                            "avg": bal_stats.get("avg", 0),
+                            "min": bal_stats.get("min", 0),
+                            "max": bal_stats.get("max", 0),
+                            "count": bal_stats.get("count", 0),
+                        },
+                    )
+
+                return UserSearchResult(
+                    total=total,
+                    items=parsed_items,
+                    limit=params.limit,
+                    offset=params.offset,
+                    aggregations=parsed_aggs,
+                )
             except Exception as exc:
                 logger.warning("Elasticsearch complex search failed: %s. Falling back to PostgreSQL.", exc)
 
         # ----------------------------------------------------------------------
         # 2. Secondary Fallback: PostgreSQL Complex Raw SQL Search
         # ----------------------------------------------------------------------
+        return await self.search_users_db_only(params)
+
+    async def search_users_db_only(
+        self,
+        query: Optional[UserSearchQuery] = None,
+        *,
+        q: Optional[str] = None,
+        department: Optional[str] = None,
+        role: Optional[str] = None,
+        account_type: Optional[str] = None,
+        currency: Optional[str] = None,
+        min_balance_cents: Optional[int] = None,
+        max_balance_cents: Optional[int] = None,
+        min_accounts: Optional[int] = None,
+        max_accounts: Optional[int] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        sort_by: Optional[str] = "created_at",
+        sort_order: Optional[str] = "desc",
+        limit: int = 20,
+        offset: int = 0,
+        include_aggregations: bool = False,
+    ) -> UserSearchResult:
+        """Search users strictly against PostgreSQL database with zero caching (no Redis, no Elasticsearch)."""
+        if isinstance(query, UserSearchQuery):
+            params = query
+        else:
+            params = UserSearchQuery(
+                q=q or (query if isinstance(query, str) else None),
+                department=department,
+                role=role,
+                account_type=account_type,
+                currency=currency,
+                min_balance_cents=min_balance_cents,
+                max_balance_cents=max_balance_cents,
+                min_accounts=min_accounts,
+                max_accounts=max_accounts,
+                created_after=created_after,
+                created_before=created_before,
+                sort_by=sort_by or "created_at",
+                sort_order=sort_order or "desc",
+                limit=limit,
+                offset=offset,
+                include_aggregations=include_aggregations,
+            )
+
         db_rows, db_total = await self.repo.search_complex(
             q=params.q,
             department=params.department,
@@ -758,7 +809,7 @@ class UserService:
             offset=params.offset,
         )
 
-        fallback_items: List[UserProfileRead] = []
+        items: List[UserProfileRead] = []
         for r in db_rows:
             masked_phone = r.get("phone_encrypted")
             if self.crypto is not None and r.get("phone_encrypted"):
@@ -805,7 +856,7 @@ class UserService:
                 if isinstance(acc, dict) and "id" in acc
             ]
 
-            fallback_items.append(
+            items.append(
                 UserProfileRead(
                     id=r["id"],
                     name=r["name"],
@@ -823,7 +874,7 @@ class UserService:
 
         return UserSearchResult(
             total=db_total,
-            items=fallback_items,
+            items=items,
             limit=params.limit,
             offset=params.offset,
             aggregations=None,

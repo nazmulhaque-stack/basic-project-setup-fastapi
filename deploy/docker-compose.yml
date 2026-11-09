@@ -156,6 +156,12 @@ services:
             ES_SYNC_POLL_INTERVAL: ${ES_SYNC_POLL_INTERVAL:-1.0}
             ES_SYNC_BATCH_SIZE: ${ES_SYNC_BATCH_SIZE:-100}
             ES_SYNC_MAX_ATTEMPTS: ${ES_SYNC_MAX_ATTEMPTS:-10}
+            GUNICORN_RELOAD: "true"
+        volumes:
+            - ../app:/app/app
+            - ../scripts:/app/scripts
+            - ../tests:/app/tests
+            - ./gunicorn.conf.py:/app/deploy/gunicorn.conf.py:ro
         ports:
             - "${APP_PORT:-8000}:8000"
         depends_on:

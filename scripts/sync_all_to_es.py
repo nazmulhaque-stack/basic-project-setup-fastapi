@@ -21,6 +21,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import get_settings
+from app.db.pool import normalize_asyncpg_dsn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,11 +30,16 @@ DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgrespassword@local
 ES_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 INDEX_PREFIX = os.getenv("ELASTICSEARCH_INDEX_PREFIX", "demo")
 CHUNK_SIZE = int(os.getenv("SYNC_CHUNK_SIZE", "5000"))
+BULK_BATCH_SIZE = int(os.getenv("ES_BULK_BATCH_SIZE", "2500"))
+ES_REQUEST_RETRIES = int(os.getenv("ES_SYNC_REQUEST_RETRIES", "5"))
 
 
 @asynccontextmanager
 async def db_connection(dsn: str) -> AsyncIterator[asyncpg.Connection]:
-    conn = await asyncpg.connect(dsn)
+    conn = await asyncpg.connect(
+        normalize_asyncpg_dsn(dsn),
+        statement_cache_size=0,
+    )
     try:
         yield conn
     finally:
@@ -68,6 +74,65 @@ def resolve_sync_target(total_users: int, limit: int = 0) -> int:
     if limit < 0:
         raise ValueError("Sync limit cannot be negative.")
     return min(total_users, limit) if limit else total_users
+
+
+async def request_with_retry(
+    es_client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Retries transient failures for idempotent sync, settings, and refresh requests."""
+    for attempt in range(ES_REQUEST_RETRIES):
+        try:
+            response = await es_client.request(method, url, **kwargs)
+            if response.status_code not in (429, 500, 502, 503, 504):
+                return response
+            if attempt == ES_REQUEST_RETRIES - 1:
+                response.raise_for_status()
+            logger.warning(
+                "Elasticsearch returned HTTP %d for %s %s (attempt %d/%d).",
+                response.status_code,
+                method,
+                url,
+                attempt + 1,
+                ES_REQUEST_RETRIES,
+            )
+        except httpx.TransportError as exc:
+            if attempt == ES_REQUEST_RETRIES - 1:
+                raise
+            logger.warning(
+                "Elasticsearch transport error for %s %s (attempt %d/%d): %s",
+                method,
+                url,
+                attempt + 1,
+                ES_REQUEST_RETRIES,
+                exc,
+            )
+        await asyncio.sleep(min(2**attempt, 30))
+
+    raise RuntimeError(f"Elasticsearch request retries exhausted: {method} {url}")
+
+
+async def restore_indices(es_client: httpx.AsyncClient, indices: List[str], *, suppress_errors: bool) -> None:
+    errors: List[str] = []
+    for index_name in indices:
+        for method, path, kwargs in (
+            ("PUT", f"/{index_name}/_settings", {"json": {"index": {"refresh_interval": "1s"}}}),
+            ("POST", f"/{index_name}/_refresh", {}),
+        ):
+            try:
+                response = await request_with_retry(es_client, method, path, **kwargs)
+                response.raise_for_status()
+            except Exception as exc:
+                errors.append(f"{method} {path}: {exc}")
+
+    if errors:
+        message = "Could not restore Elasticsearch index settings/refresh: " + "; ".join(errors)
+        if suppress_errors:
+            logger.error(message)
+        else:
+            raise RuntimeError(message)
 
 
 async def init_indices(
@@ -215,7 +280,7 @@ async def sync_users(recreate_indices: bool = False, limit: int = 0) -> None:
     settings = get_settings()
     if limit < 0:
         raise ValueError("Sync limit cannot be negative.")
-    db_url = settings.DATABASE_URL
+    db_url = settings.MIGRATION_DATABASE_URL or settings.DATABASE_URL
     es_url = settings.ELASTICSEARCH_URL
     index_prefix = settings.ELASTICSEARCH_INDEX_PREFIX
     auth = None
@@ -317,7 +382,24 @@ async def sync_users(recreate_indices: bool = False, limit: int = 0) -> None:
         try:
             while synced_count < target_sync:
                 batch_limit = min(CHUNK_SIZE, target_sync - synced_count)
-                rows = await conn.fetch(keyset_query, last_created_at, last_id, batch_limit)
+                rows = None
+                for attempt in range(5):
+                    try:
+                        if conn.is_closed():
+                            conn = await asyncpg.connect(normalize_asyncpg_dsn(db_url), statement_cache_size=0)
+                        rows = await conn.fetch(keyset_query, last_created_at, last_id, batch_limit)
+                        break
+                    except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError, OSError) as exc:
+                        logger.warning("PostgreSQL connection lost (attempt %d/5): %s. Reconnecting...", attempt + 1, exc)
+                        await asyncio.sleep(1.0)
+                        try:
+                            await conn.close()
+                        except Exception:
+                            pass
+                        conn = await asyncpg.connect(normalize_asyncpg_dsn(db_url), statement_cache_size=0)
+                else:
+                    raise RuntimeError("Failed to reconnect to PostgreSQL after 5 attempts.")
+
                 if not rows:
                     break
 
@@ -399,22 +481,30 @@ async def sync_users(recreate_indices: bool = False, limit: int = 0) -> None:
                     bulk_lines.append(json.dumps({"index": {"_index": user_index, "_id": user_id}}))
                     bulk_lines.append(json.dumps(user_doc, default=serialize_doc))
 
-                ndjson_payload = "\n".join(bulk_lines) + "\n"
-                bulk_resp = await es_client.post(
-                    "/_bulk",
-                    content=ndjson_payload,
-                    headers={"Content-Type": "application/x-ndjson"},
-                )
-                bulk_resp.raise_for_status()
-                bulk_result = bulk_resp.json()
-                if bulk_result.get("errors"):
-                    failures = [
-                        item.get("index", {})
-                        for item in bulk_result.get("items", [])
-                        if item.get("index", {}).get("error")
-                    ]
-                    logger.error("Elasticsearch rejected %d documents; first errors: %s", len(failures), failures[:5])
-                    raise RuntimeError(f"Elasticsearch bulk indexing failed for {len(failures)} documents.")
+                lines_per_bulk = BULK_BATCH_SIZE * 4
+                for bulk_start in range(0, len(bulk_lines), lines_per_bulk):
+                    bulk_payload = "\n".join(bulk_lines[bulk_start : bulk_start + lines_per_bulk]) + "\n"
+                    bulk_resp = await request_with_retry(
+                        es_client,
+                        "POST",
+                        "/_bulk",
+                        content=bulk_payload,
+                        headers={"Content-Type": "application/x-ndjson"},
+                    )
+                    bulk_resp.raise_for_status()
+                    bulk_result = bulk_resp.json()
+                    if bulk_result.get("errors"):
+                        failures = [
+                            item.get("index", {})
+                            for item in bulk_result.get("items", [])
+                            if item.get("index", {}).get("error")
+                        ]
+                        logger.error(
+                            "Elasticsearch rejected %d documents; first errors: %s",
+                            len(failures),
+                            failures[:5],
+                        )
+                        raise RuntimeError(f"Elasticsearch bulk indexing failed for {len(failures)} documents.")
 
                 last_row = rows[-1]
                 last_created_at = last_row["created_at"]
@@ -427,17 +517,16 @@ async def sync_users(recreate_indices: bool = False, limit: int = 0) -> None:
                     target_sync,
                     (synced_count / target_sync) * 100,
                 )
-        finally:
-            # Restore normal refresh interval and force commit
+        except BaseException:
+            logger.info("Sync failed; attempting to restore Elasticsearch index settings.")
+            await restore_indices(es_client, [profile_index, user_index], suppress_errors=True)
+            raise
+        else:
             logger.info("Restoring refresh interval and refreshing indices...")
-            for index_name in (profile_index, user_index):
-                settings_resp = await es_client.put(
-                    f"/{index_name}/_settings",
-                    json={"index": {"refresh_interval": "1s"}},
-                )
-                settings_resp.raise_for_status()
-                refresh_resp = await es_client.post(f"/{index_name}/_refresh")
-                refresh_resp.raise_for_status()
+            await restore_indices(es_client, [profile_index, user_index], suppress_errors=False)
+        finally:
+            if conn and not conn.is_closed():
+                await conn.close()
 
         if synced_count != target_sync:
             raise RuntimeError(
