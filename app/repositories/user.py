@@ -393,8 +393,25 @@ class UserRepository:
                 d.id AS dept_id,
                 COALESCE(d.name, u.department) AS dept_name,
                 COALESCE(d.code, u.department) AS dept_code,
+                d.description AS dept_description,
                 r.id AS role_id,
                 COALESCE(r.name, u.role) AS role_name,
+                r.description AS role_description,
+                COALESCE(r.permissions, '{{}}') AS role_permissions,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'id', a.id,
+                            'account_number', a.account_number,
+                            'account_type', a.account_type,
+                            'balance_cents', a.balance_cents,
+                            'currency', a.currency,
+                            'status', a.status,
+                            'created_at', a.created_at
+                        )
+                    ) FILTER (WHERE a.id IS NOT NULL),
+                    '[]'::json
+                ) AS accounts_json,
                 COALESCE(SUM(a.balance_cents), 0)::bigint AS total_balance_cents,
                 COUNT(a.id)::int AS account_count,
                 COUNT(*) OVER() AS full_count
@@ -403,7 +420,7 @@ class UserRepository:
             LEFT JOIN departments d ON (LOWER(d.name) = LOWER(u.department) OR LOWER(d.code) = LOWER(u.department))
             LEFT JOIN roles r ON LOWER(r.name) = LOWER(u.role)
             {where_sql}
-            GROUP BY u.id, u.name, u.email, u.role, u.department, u.phone_encrypted, u.phone_blind_index, u.created_at, d.id, d.name, d.code, r.id, r.name
+            GROUP BY u.id, u.name, u.email, u.role, u.department, u.phone_encrypted, u.phone_blind_index, u.created_at, d.id, d.name, d.code, d.description, r.id, r.name, r.description, r.permissions
             {having_sql}
             ORDER BY {order_by_sql}
             LIMIT ${limit_idx} OFFSET ${offset_idx}
@@ -495,6 +512,10 @@ class UserRepository:
             [a.created_at or now for a in accounts],
             [a.updated_at or now for a in accounts],
         )
+
+    async def seed_users(self, count: int) -> None:
+        """Executes PostgreSQL bulk seeder function in a single raw database call without loops."""
+        await self.db.execute("SELECT seed_diverse_users($1::int)", count)
 
     async def list_departments(self) -> List[Department]:
         rows = await self.db.fetch("SELECT * FROM departments ORDER BY name ASC")

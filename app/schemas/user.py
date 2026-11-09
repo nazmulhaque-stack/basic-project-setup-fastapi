@@ -21,19 +21,19 @@ E164_REGEX = re.compile(r"^\+[1-9]\d{1,14}$")
 
 class DepartmentRead(BaseModel):
     """Department public contract."""
-    id: Optional[int] = None
+    id: int = 0
     name: str = ""
     code: str = ""
-    description: Optional[str] = None
+    description: Optional[str] = ""
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class RoleRead(BaseModel):
     """Role and permissions public contract."""
-    id: Optional[int] = None
+    id: int = 0
     name: str = ""
-    description: Optional[str] = None
+    description: Optional[str] = ""
     permissions: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
@@ -232,15 +232,15 @@ class UserProfileRead(BaseModel):
     name: str
     email: EmailStr
     role: str
-    department: Optional[DepartmentRead] = None
-    role_info: Optional[RoleRead] = None
+    department: DepartmentRead = Field(default_factory=DepartmentRead)
+    role_info: RoleRead = Field(default_factory=RoleRead)
     accounts: List[AccountRead] = Field(default_factory=list)
     total_balance_cents: int = 0
     account_count: int = 0
     phone_masked: Optional[str] = None
     created_at: Optional[datetime] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
 
 
 class SearchAggregations(BaseModel):
@@ -275,7 +275,7 @@ class UserSearchQuery(BaseModel):
 class UserSearchResult(BaseModel):
     """Rich complex search result with items, total count, pagination, and optional faceted aggregations."""
     total: int = Field(default=0, description="Total matching documents across entire index")
-    items: List[UserRead] = Field(default_factory=list, description="Matching users list")
+    items: List[UserProfileRead] = Field(default_factory=list, description="Matching user profiles list")
     limit: int = 20
     offset: int = 0
     aggregations: Optional[SearchAggregations] = None

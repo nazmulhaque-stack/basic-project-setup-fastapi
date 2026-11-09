@@ -10,7 +10,7 @@ Endpoints for User 5 CRUD operations and full-text Elasticsearch fuzzy search:
 """
 
 from datetime import datetime
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 import uuid
 
 from fastapi import APIRouter, Body, Query, status
@@ -193,6 +193,27 @@ async def create_user(
     service: UserServiceDep,
 ) -> UserRead:
     return await service.create_user(payload)
+
+
+# ------------------------------------------------------------------------------
+# 2b. SEED DIVERSE USERS (POST /users/seed)
+# ------------------------------------------------------------------------------
+@router.post(
+    "/seed",
+    status_code=status.HTTP_201_CREATED,
+    summary="Seed diverse users in bulk",
+    description="Generates and inserts high-volume diverse test users with multiple accounts across departments, roles, and currencies in a single raw SQL query.",
+)
+async def seed_users(
+    service: UserServiceDep,
+    count: Annotated[int, Query(ge=1, le=5000, description="Number of diverse users to generate and insert")] = 10,
+) -> Dict[str, Any]:
+    inserted_count = await service.seed_diverse_users(count)
+    return {
+        "status": "success",
+        "seeded_users": inserted_count,
+        "message": f"Successfully seeded {inserted_count} diverse users with accounts into PostgreSQL.",
+    }
 
 
 # ------------------------------------------------------------------------------

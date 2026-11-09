@@ -8,6 +8,7 @@ import uuid
 
 import asyncpg
 from fastapi import Depends, Request
+import orjson
 
 from app.api.deps import CryptoDep, ElasticsearchDep, RedisDep, SessionDep
 from app.core.cache_interface import ICacheService, NullCache
@@ -451,6 +452,17 @@ class UserService:
         await self._dispatch_outbox_sync(outbox_event)
 
     # --------------------------------------------------------------------------
+    # 5b. BULK SEED DIVERSE USERS (POST /users/seed)
+    # --------------------------------------------------------------------------
+    async def seed_diverse_users(self, count: int = 10) -> int:
+        """Seeds `count` diverse users into PostgreSQL using raw SQL without loops."""
+        safe_count = min(5000, max(1, count))
+        await self.repo.seed_users(safe_count)
+        await self.cache.invalidate_lists()
+        await self.db.commit()
+        return safe_count
+
+    # --------------------------------------------------------------------------
     # 6. COMPLEX SEARCH USERS (Elasticsearch CQRS with PostgreSQL Fallback)
     # --------------------------------------------------------------------------
     async def search_users(
@@ -640,28 +652,56 @@ class UserService:
                 total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
 
             if hits or total > 0 or not self.db:
-                parsed_items = [
-                    UserRead(
-                        id=h["_source"].get("id"),
-                        name=h["_source"].get("name", ""),
-                        email=h["_source"].get("email", ""),
-                        role=h["_source"].get("role", "user"),
-                        department=h["_source"].get("department_name") or h["_source"].get("department"),
-                        department_id=h["_source"].get("department_code") or h["_source"].get("department_id"),
-                        role_id=h["_source"].get("role_name") or h["_source"].get("role_id"),
-                        phone_masked=h["_source"].get("phone_masked"),
-                        total_balance_cents=h["_source"].get("total_balance_cents"),
-                        account_count=h["_source"].get("account_count"),
-                        accounts=[
-                            AccountRead(**acc)
-                            for acc in (h["_source"].get("accounts") or [])
-                            if isinstance(acc, dict) and "id" in acc
-                        ] or None,
-                        created_at=_parse_datetime(h["_source"].get("created_at")),
+                parsed_items: List[UserProfileRead] = []
+                for h in hits:
+                    src = h.get("_source", {})
+                    user_id = uuid.UUID(str(src["id"])) if isinstance(src.get("id"), (str, uuid.UUID)) else src.get("id")
+
+                    dept_data = src.get("department")
+                    if isinstance(dept_data, dict):
+                        dept = DepartmentRead(**dept_data)
+                    elif isinstance(dept_data, str) and dept_data.strip():
+                        dept = DepartmentRead(id=0, name=dept_data, code=src.get("department_code") or dept_data, description="")
+                    else:
+                        dept = DepartmentRead(id=0, name="", code="", description="")
+
+                    role_data = src.get("role_info")
+                    if isinstance(role_data, dict):
+                        role_info = RoleRead(**role_data)
+                    elif isinstance(role_data, str) and role_data.strip():
+                        role_info = RoleRead(id=0, name=role_data, description="", permissions=[])
+                    else:
+                        role_info = RoleRead(id=0, name=src.get("role", "user"), description="", permissions=[])
+
+                    accs = [
+                        AccountRead(
+                            id=uuid.UUID(str(acc["id"])),
+                            account_number=acc["account_number"],
+                            account_type=acc.get("account_type", "checking"),
+                            balance_cents=int(acc.get("balance_cents", 0)),
+                            currency=acc.get("currency", "USD"),
+                            status=acc.get("status", "active"),
+                            created_at=_parse_datetime(acc.get("created_at")),
+                        )
+                        for acc in (src.get("accounts") or [])
+                        if isinstance(acc, dict) and "id" in acc
+                    ]
+
+                    parsed_items.append(
+                        UserProfileRead(
+                            id=user_id,
+                            name=src.get("name", ""),
+                            email=src.get("email", ""),
+                            role=src.get("role", "user"),
+                            department=dept,
+                            role_info=role_info,
+                            accounts=accs,
+                            total_balance_cents=int(src.get("total_balance_cents") or 0),
+                            account_count=int(src.get("account_count") or len(accs)),
+                            phone_masked=src.get("phone_masked"),
+                            created_at=_parse_datetime(src.get("created_at")),
+                        )
                     )
-                    for h in hits
-                    if "_source" in h
-                ]
 
                 parsed_aggs: Optional[SearchAggregations] = None
                 if params.include_aggregations and "aggregations" in resp:
@@ -716,7 +756,7 @@ class UserService:
             offset=params.offset,
         )
 
-        fallback_items = []
+        fallback_items: List[UserProfileRead] = []
         for r in db_rows:
             masked_phone = r.get("phone_encrypted")
             if self.crypto is not None and r.get("phone_encrypted"):
@@ -726,18 +766,55 @@ class UserService:
                     masked_phone = self.crypto.mask_phone(plain)
                 except Exception:
                     masked_phone = "***"
+
+            dept_read = DepartmentRead(
+                id=r.get("dept_id") or 0,
+                name=r.get("dept_name") or r.get("department") or "",
+                code=r.get("dept_code") or r.get("department") or "",
+                description=r.get("dept_description") or "",
+            )
+
+            perms = r.get("role_permissions")
+            role_read = RoleRead(
+                id=r.get("role_id") or 0,
+                name=r.get("role_name") or r.get("role") or "",
+                description=r.get("role_description") or "",
+                permissions=list(perms) if perms else [],
+            )
+
+            raw_accs = r.get("accounts_json") or []
+            if isinstance(raw_accs, str):
+                try:
+                    raw_accs = orjson.loads(raw_accs)
+                except Exception:
+                    raw_accs = []
+
+            accounts_list = [
+                AccountRead(
+                    id=uuid.UUID(str(acc["id"])),
+                    account_number=acc["account_number"],
+                    account_type=acc.get("account_type", "checking"),
+                    balance_cents=int(acc.get("balance_cents", 0)),
+                    currency=acc.get("currency", "USD"),
+                    status=acc.get("status", "active"),
+                    created_at=_parse_datetime(acc.get("created_at")),
+                )
+                for acc in raw_accs
+                if isinstance(acc, dict) and "id" in acc
+            ]
+
             fallback_items.append(
-                UserRead(
+                UserProfileRead(
                     id=r["id"],
                     name=r["name"],
                     email=r["email"],
                     role=r["role"],
-                    department=r.get("dept_name") or r.get("department"),
-                    department_id=r.get("dept_code") or r.get("department"),
-                    role_id=r.get("role_name") or r.get("role"),
+                    department=dept_read,
+                    role_info=role_read,
+                    accounts=accounts_list,
+                    total_balance_cents=int(r.get("total_balance_cents") or 0),
+                    account_count=int(r.get("account_count") or len(accounts_list)),
                     phone_masked=masked_phone,
-                    total_balance_cents=r.get("total_balance_cents"),
-                    account_count=r.get("account_count"),
                     created_at=r.get("created_at"),
                 )
             )
@@ -799,23 +876,19 @@ class UserService:
             except DecryptionError:
                 masked_phone = "***"
 
-        dept_read: Optional[DepartmentRead] = None
-        if profile.department:
-            dept_read = DepartmentRead(
-                id=profile.department.id,
-                name=profile.department.name,
-                code=profile.department.code,
-                description=profile.department.description,
-            )
+        dept_read = DepartmentRead(
+            id=profile.department.id if profile.department else 0,
+            name=profile.department.name if profile.department else (user.department or ""),
+            code=profile.department.code if profile.department else (user.department or ""),
+            description=profile.department.description if profile.department else "",
+        )
 
-        role_read: Optional[RoleRead] = None
-        if profile.role_info:
-            role_read = RoleRead(
-                id=profile.role_info.id,
-                name=profile.role_info.name,
-                description=profile.role_info.description,
-                permissions=profile.role_info.permissions,
-            )
+        role_read = RoleRead(
+            id=profile.role_info.id if profile.role_info else 0,
+            name=profile.role_info.name if profile.role_info else user.role,
+            description=profile.role_info.description if profile.role_info else "",
+            permissions=profile.role_info.permissions if profile.role_info else [],
+        )
 
         accounts_read: List[AccountRead] = [
             AccountRead(
