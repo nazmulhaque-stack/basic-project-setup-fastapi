@@ -213,6 +213,29 @@ class UserRepository:
         items = [_row_to_user(r) for r in rows[:safe_limit]]
         return items, has_next
 
+    async def search(
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[User]:
+        """Hand-written asyncpg SQL search matching name, email, role, or department."""
+        safe_limit = min(100, max(1, limit))
+        safe_offset = max(0, offset)
+        pattern = f"%{query.strip()}%"
+
+        sql = """
+            SELECT * FROM users
+            WHERE name ILIKE $1 
+               OR email ILIKE $1 
+               OR role ILIKE $1 
+               OR department ILIKE $1
+            ORDER BY created_at DESC, id ASC
+            LIMIT $2 OFFSET $3
+        """
+        rows = await self.db.fetch(sql, pattern, safe_limit, safe_offset)
+        return [_row_to_user(r) for r in rows]
+
     # --------------------------------------------------------------------------
     # Complex Aggregated Query: User Profile (User + Department + Role + Accounts)
     # --------------------------------------------------------------------------

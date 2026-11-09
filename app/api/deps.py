@@ -8,7 +8,7 @@ Centralizes and standardizes core infrastructure dependencies:
 """
 
 from collections.abc import AsyncGenerator
-from typing import Annotated, Optional, Union
+from typing import Annotated, Any, Optional, Union
 
 from fastapi import Depends, Request
 from redis.asyncio import Redis, RedisCluster

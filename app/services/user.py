@@ -1,4 +1,4 @@
-"""User Service: Clean domain orchestration with direct Redis caching and Elasticsearch search (no OOP BaseService)."""
+"""User Service: Clean domain orchestration with direct Redis caching, Transactional Outbox, and Elasticsearch search."""
 
 import asyncio
 from datetime import datetime, timezone
@@ -16,29 +16,23 @@ from app.core.exceptions import ConflictError, DecryptionError, NotFoundError
 from app.core.security import CryptoService
 from app.db.pool import UnitOfWork
 from app.models.outbox import OutboxEvent
-from app.models.user import Department, Role, User, UserAccount, UserProfile
+from app.models.user import User, UserAccount
 from app.repositories.outbox import OutboxRepository
 from app.repositories.user import UserRepository
 from app.schemas.base import decode_cursor, encode_cursor
 from app.schemas.user import (
-    AccountCreate,
-    AccountRead,
-    DepartmentRead,
-    RoleRead,
     UserCreate,
     UserPage,
-    UserProfileRead,
     UserRead,
     UserUpdate,
 )
 from app.services.cache import DynamicRedisCache
-from app.services.executor import DynamicServiceExecutor
 
 logger = logging.getLogger(__name__)
 
 
 class UserService:
-    """User business logic, PII encryption, Redis caching, Transactional Outbox, and Elasticsearch search."""
+    """User domain service: PII cryptography, Redis L1 caching, Transactional Outbox, and Elasticsearch search."""
 
     def __init__(
         self,
@@ -47,7 +41,6 @@ class UserService:
         crypto: Optional[CryptoService] = None,
         elasticsearch: Optional[IElasticsearchService] = None,
         outbox_worker: Optional[Any] = None,
-        executor: Optional[DynamicServiceExecutor] = None,
         **_: Any,
     ) -> None:
         self.db = db
@@ -57,181 +50,14 @@ class UserService:
         self.crypto: Optional[CryptoService] = crypto
         self.es: IElasticsearchService = elasticsearch or NullElasticsearch()
         self.outbox_worker = outbox_worker
-        self.executor: DynamicServiceExecutor = executor or DynamicServiceExecutor(
-            db=db,
-            cache=self.cache,
-            elasticsearch=self.es,
-            outbox_repo=self.outbox_repo,
-            outbox_worker=outbox_worker,
-        )
 
-    def _to_read_schema(self, user: User) -> UserRead:
-        """Decrypts phone using AAD and returns safe masked representation."""
-        masked_phone = user.phone_encrypted
-        if self.crypto is not None and user.phone_encrypted:
-            aad = f"users.phone:{user.id}".encode("utf-8")
-            try:
-                plain_phone = self.crypto.decrypt(user.phone_encrypted, aad=aad)
-                masked_phone = self.crypto.mask_phone(plain_phone)
-            except DecryptionError:
-                masked_phone = "***"
-
-        return UserRead(
-            id=user.id,
-            name=user.name,
-            email=user.email,
-            role=user.role,
-            department=user.department,
-            department_id=user.department_id or user.department,
-            role_id=user.role_id or user.role,
-            phone_masked=masked_phone,
-            created_at=user.created_at or datetime.now(timezone.utc),
-        )
-
-    def _to_profile_read(self, profile: UserProfile) -> UserProfileRead:
-        """Transforms rich aggregated UserProfile domain dataclass into UserProfileRead schema."""
-        user = profile.user
-        masked_phone = user.phone_encrypted
-        if self.crypto is not None and user.phone_encrypted:
-            aad = f"users.phone:{user.id}".encode("utf-8")
-            try:
-                plain_phone = self.crypto.decrypt(user.phone_encrypted, aad=aad)
-                masked_phone = self.crypto.mask_phone(plain_phone)
-            except DecryptionError:
-                masked_phone = "***"
-
-        dept_read: Optional[DepartmentRead] = None
-        if profile.department:
-            dept_read = DepartmentRead(
-                id=profile.department.id,
-                name=profile.department.name,
-                code=profile.department.code,
-                description=profile.department.description,
-            )
-
-        role_read: Optional[RoleRead] = None
-        if profile.role_info:
-            role_read = RoleRead(
-                id=profile.role_info.id,
-                name=profile.role_info.name,
-                description=profile.role_info.description,
-                permissions=profile.role_info.permissions,
-            )
-
-        accounts_read: List[AccountRead] = [
-            AccountRead(
-                id=acc.id,
-                account_number=acc.account_number,
-                account_type=acc.account_type,
-                balance_cents=acc.balance_cents,
-                currency=acc.currency,
-                status=acc.status,
-                created_at=acc.created_at,
-            )
-            for acc in profile.accounts
-        ]
-
-        return UserProfileRead(
-            id=user.id,
-            name=user.name,
-            email=user.email,
-            role=user.role,
-            phone_masked=masked_phone,
-            department=dept_read,
-            role_info=role_read,
-            accounts=accounts_read,
-            total_balance_cents=profile.total_balance_cents,
-            account_count=len(profile.accounts),
-            created_at=user.created_at or datetime.now(timezone.utc),
-        )
-
+    
     # --------------------------------------------------------------------------
-    # Transactional Outbox & Elasticsearch Synchronization (Write Path)
-    # --------------------------------------------------------------------------
-    async def _build_user_es_payload(self, user_id: uuid.UUID) -> Dict[str, Any]:
-        """Constructs both User and UserProfile documents for Outbox payload."""
-        profile = await self.repo.get_profile(user_id)
-        if profile is None:
-            return {}
-
-        user = profile.user
-        user_doc = {
-            "id": str(user.id),
-            "name": user.name,
-            "email": user.email,
-            "role": user.role,
-            "department": user.department,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
-        }
-
-        profile_read = self._to_profile_read(profile)
-        profile_doc = profile_read.model_dump(mode="json")
-        profile_doc["department_name"] = profile_read.department.name if profile_read.department else None
-        profile_doc["department_code"] = profile_read.department.code if profile_read.department else None
-        profile_doc["role_name"] = profile_read.role_info.name if profile_read.role_info else None
-        profile_doc["account_numbers"] = [a.account_number for a in profile_read.accounts]
-
-        return {
-            "user": user_doc,
-            "profile": profile_doc,
-        }
-
-    async def _dispatch_outbox_sync(self, event: OutboxEvent) -> None:
-        """Dispatches outbox event synchronization to Elasticsearch."""
-        if self.outbox_worker is not None:
-            asyncio.create_task(self.outbox_worker.sync_now(event.id))
-        else:
-            try:
-                agg_id = str(event.aggregate_id)
-                if event.event_type in ("CREATE", "UPDATE", "ACCOUNT_ADDED"):
-                    user_doc = event.payload.get("user")
-                    if user_doc:
-                        await self.es.index_document(index="user", id_=agg_id, document=user_doc)
-                    profile_doc = event.payload.get("profile")
-                    if profile_doc:
-                        await self.es.index_document(index="user_profile", id_=agg_id, document=profile_doc)
-                elif event.event_type == "DELETE":
-                    await self.es.delete_document(index="user", id_=agg_id)
-                    await self.es.delete_document(index="user_profile", id_=agg_id)
-
-                now = datetime.now(timezone.utc)
-                await self.outbox_repo.mark_published(event.id, published_at=now)
-            except Exception as exc:
-                logger.warning("Direct outbox sync fallback failed: %s", exc)
-
-    async def list_outbox_events(
-        self,
-        limit: int = 50,
-        status: Optional[str] = None,
-    ) -> List[OutboxEvent]:
-        """Lists recent Transactional Outbox records tracking PostgreSQL -> ES sync status."""
-        return await self.outbox_repo.list_events(limit=limit, status=status)
-
-    async def _sync_user_to_es(self, user_id: uuid.UUID) -> None:
-        """Direct fallback sync for user entity and profile document to Elasticsearch."""
-        payload = await self._build_user_es_payload(user_id)
-        if not payload:
-            return
-        if "user" in payload:
-            await self.es.index_document(index="user", id_=str(user_id), document=payload["user"])
-        if "profile" in payload:
-            await self.es.index_document(index="user_profile", id_=str(user_id), document=payload["profile"])
-
-    async def sync_all_to_es(self) -> Dict[str, Any]:
-        """Bulk synchronizes all users and profiles from PostgreSQL into Elasticsearch."""
-        profiles = await self.repo.list_all_profiles()
-        count = 0
-        for profile in profiles:
-            await self._sync_user_to_es(profile.user.id)
-            count += 1
-        return {"status": "success", "synced_count": count}
-
-    # --------------------------------------------------------------------------
-    # User CRUD
+    # 1. CREATE USER (POST /users)
     # --------------------------------------------------------------------------
     async def create_user(self, payload: UserCreate) -> UserRead:
-        """Create a user with PII encryption, blind index, direct ES indexing, and Redis invalidation."""
-        # 1. Uniqueness check for email
+        """Create a user with PII encryption, HMAC blind index, Redis pre-warming, and Outbox ES sync."""
+        # Uniqueness check for email
         existing_email = await self.repo.get_by_email(str(payload.email))
         if existing_email:
             raise ConflictError("A user with this email address already exists.")
@@ -240,7 +66,7 @@ class UserService:
         phone_encrypted = payload.phone
         phone_blind_index = payload.phone
 
-        # 2. Cryptographic phone encryption & HMAC blind index
+        # Cryptographic phone encryption & HMAC blind index
         if self.crypto is not None:
             blind_index = self.crypto.blind_index(payload.phone)
             existing_phone = await self.repo.get_by_phone_blind_index(blind_index)
@@ -264,10 +90,9 @@ class UserService:
             created_at=datetime.now(timezone.utc),
         )
 
-        # 3. Insert into PostgreSQL
         created = await self.repo.create(user)
 
-        # 4. Insert optional initial accounts
+        # Optional initial accounts creation
         if payload.accounts:
             for acc_payload in payload.accounts:
                 account_model = UserAccount(
@@ -285,72 +110,67 @@ class UserService:
 
         read_model = self._to_read_schema(created)
 
-        # 5. Insert Transactional Outbox Event (BEFORE commit, inside same atomic transaction!)
-        es_payload = await self._build_user_es_payload(created.id)
+        # Stage Outbox Event BEFORE DB commit (Atomic consistency)
         outbox_event = await self.outbox_repo.create_event(
             aggregate_type="user",
             aggregate_id=str(created.id),
             event_type="CREATE",
-            payload=es_payload,
+            payload=self._build_user_es_doc(created),
         )
 
-        # 6. Cache synchronization:
-        #    - Invalidate list cache (O(1) version bump) to prevent stale paginated list reads.
-        #    - Pre-warm item cache (write-through) for instant sub-millisecond subsequent reads.
+        # Cache synchronization:
+        #   - Invalidate list cache (O(1) version bump) to prevent stale paginated list reads.
+        #   - Pre-warm item cache (write-through) for instant sub-millisecond subsequent reads.
         await self.cache.invalidate_lists()
         await self.cache.set_item(str(created.id), read_model.model_dump(mode="json"))
 
-        # 7. Commit Database Transaction (Atomic: User + Outbox event committed together)
+        # Atomic commit
         await self.db.commit()
 
-        # 8. Dispatch Outbox sync (Immediate execution + background auto-sync retry on failure)
+        # Dispatch Outbox synchronization to Elasticsearch
         await self._dispatch_outbox_sync(outbox_event)
 
         return read_model
 
-    async def get_user_by_id(self, user_id: uuid.UUID, revalidate: bool = False) -> UserRead:
-        """Fetch user by ID with 3-tier Self-Healing Fallback (Redis -> ES -> PostgreSQL) and revalidation.
-        1. Check Redis L1 cache (if revalidate=False).
-        2. Check Elasticsearch document (if revalidate=False).
-        3. Fallback to PostgreSQL (Authoritative Source of Truth) or force revalidate.
-        4. Self-Heal: Backfill both Redis and Elasticsearch.
-        5. Return response.
-        """
-        # 1. Level 1: Redis Cache-Aside & Level 2: Elasticsearch
-        if not revalidate:
-            try:
-                cached = await self.cache.get_item(str(user_id))
-                if cached is not None:
-                    if isinstance(cached, dict) and cached.get("__not_found__"):
-                        raise NotFoundError(f"User with ID '{user_id}' not found.")
-                    return UserRead(**cached)
-            except NotFoundError:
-                raise
-            except Exception as exc:
-                logger.warning("Redis read error in get_user_by_id: %s", exc)
+    # --------------------------------------------------------------------------
+    # 2. GET USER BY ID (GET /users/{user_id})
+    # --------------------------------------------------------------------------
+    async def get_user_by_id(self, user_id: uuid.UUID) -> UserRead:
+        """Fetch user by ID with 3-tier Self-Healing Fallback (Redis -> ES -> PostgreSQL)."""
+        # Level 1: Redis L1 Cache-Aside
+        try:
+            cached = await self.cache.get_item(str(user_id))
+            if cached is not None:
+                if isinstance(cached, dict) and cached.get("__not_found__"):
+                    raise NotFoundError(f"User with ID '{user_id}' not found.")
+                return UserRead(**cached)
+        except NotFoundError:
+            raise
+        except Exception as exc:
+            logger.warning("Redis read error in get_user_by_id: %s", exc)
 
-            # 2. Level 2: Elasticsearch (Direct return with Redis backfill)
-            try:
-                es_doc = await self.es.get_document(index="user", id_=str(user_id))
-                if es_doc is not None:
-                    user_read = UserRead(
-                        id=es_doc["id"],
-                        name=es_doc.get("name", ""),
-                        email=es_doc.get("email", ""),
-                        role=es_doc.get("role", "user"),
-                        department=es_doc.get("department"),
-                        phone_masked=None,
-                        created_at=datetime.fromisoformat(es_doc["created_at"]) if es_doc.get("created_at") else None,
-                    )
-                    try:
-                        await self.cache.set_item(str(user_id), user_read.model_dump(mode="json"))
-                    except Exception:
-                        pass
-                    return user_read
-            except Exception as exc:
-                logger.warning("Elasticsearch read error in get_user_by_id: %s", exc)
+        # Level 2: Elasticsearch L2
+        try:
+            es_doc = await self.es.get_document(index="user", id_=str(user_id))
+            if es_doc is not None:
+                user_read = UserRead(
+                    id=es_doc["id"],
+                    name=es_doc.get("name", ""),
+                    email=es_doc.get("email", ""),
+                    role=es_doc.get("role", "user"),
+                    department=es_doc.get("department"),
+                    phone_masked=None,
+                    created_at=datetime.fromisoformat(es_doc["created_at"]) if es_doc.get("created_at") else None,
+                )
+                try:
+                    await self.cache.set_item(str(user_id), user_read.model_dump(mode="json"))
+                except Exception:
+                    pass
+                return user_read
+        except Exception as exc:
+            logger.warning("Elasticsearch read error in get_user_by_id: %s", exc)
 
-        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store) or forced revalidation
+        # Level 3: Fallback to PostgreSQL (Authoritative Store)
         user = await self.repo.get(user_id)
         if user is None:
             try:
@@ -361,204 +181,22 @@ class UserService:
 
         read_model = self._to_read_schema(user)
 
-        # 4. Self-Heal / Backfill both Redis and Elasticsearch
+        # Self-Heal: Backfill both Redis and Elasticsearch
         try:
             await self.cache.set_item(str(user.id), read_model.model_dump(mode="json"))
         except Exception as exc:
             logger.warning("Failed to backfill Redis: %s", exc)
 
         try:
-            await self._sync_user_to_es(user_id)
+            await self.es.index_document(index="user", id_=str(user_id), document=self._build_user_es_doc(user))
         except Exception as exc:
             logger.warning("Failed to backfill Elasticsearch: %s", exc)
 
-        # 5. Return response
         return read_model
 
     # --------------------------------------------------------------------------
-    # Aggregated Profile with Redis Cache-Aside & Elasticsearch CQRS
+    # 3. LIST USERS (GET /users - Keyset Cursor Pagination)
     # --------------------------------------------------------------------------
-    async def get_user_profile(self, user_id: uuid.UUID, revalidate: bool = False) -> UserProfileRead:
-        """Self-Healing CQRS Profile Read:
-        1. Check Redis L1 cache (if revalidate=False).
-        2. Check Elasticsearch CQRS index (if revalidate=False).
-        3. Fallback to PostgreSQL (Source of Truth) or force revalidate.
-        4. Self-Heal: Backfill both Elasticsearch and Redis.
-        5. Return response.
-        """
-        cache_key = f"profile:{user_id}"
-
-        # 1. Level 1: Redis Cache-Aside & Level 2: Elasticsearch
-        if not revalidate:
-            try:
-                cached = await self.cache.get_item(cache_key)
-                if cached is not None:
-                    if isinstance(cached, dict) and cached.get("__not_found__"):
-                        raise NotFoundError(f"User with ID '{user_id}' not found.")
-                    return UserProfileRead(**cached)
-            except NotFoundError:
-                raise
-            except Exception as exc:
-                logger.warning("Redis read error in get_user_profile: %s", exc)
-
-            # 2. Level 2: Elasticsearch CQRS document
-            try:
-                es_doc = await self.es.get_document(index="user_profile", id_=str(user_id))
-                if es_doc is not None:
-                    profile_read = UserProfileRead(**es_doc)
-                    try:
-                        await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
-                    except Exception:
-                        pass
-                    return profile_read
-            except Exception as exc:
-                logger.warning("Elasticsearch read error in get_user_profile: %s", exc)
-
-        # 3. Level 3: Fallback to PostgreSQL (Authoritative Store) or forced revalidation
-        profile = await self.repo.get_profile(user_id)
-        if profile is None:
-            try:
-                await self.cache.set_negative_cache(cache_key)
-            except Exception:
-                pass
-            raise NotFoundError(f"User with ID '{user_id}' not found.")
-
-        profile_read = self._to_profile_read(profile)
-
-        # 4. Self-Heal / Backfill both Redis and Elasticsearch
-        try:
-            await self.cache.set_item(cache_key, profile_read.model_dump(mode="json"))
-        except Exception as exc:
-            logger.warning("Failed to backfill Redis: %s", exc)
-
-        try:
-            await self._sync_user_to_es(user_id)
-        except Exception as exc:
-            logger.warning("Failed to backfill Elasticsearch: %s", exc)
-
-        # 5. Return response
-        return profile_read
-
-    async def search_user_profiles(
-        self,
-        q: str,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> List[UserProfileRead]:
-        """Full-text fuzzy search across aggregated profiles with PostgreSQL fallback."""
-        try:
-            hits, total = await self.es.search(
-                index="user_profile",
-                query=q,
-                limit=limit,
-                offset=offset,
-            )
-            results: List[UserProfileRead] = []
-            for hit in hits:
-                try:
-                    results.append(UserProfileRead(**hit))
-                except Exception:
-                    pass
-            if results:
-                return results
-        except Exception as exc:
-            logger.warning("Elasticsearch profile search error (%s), falling back to PostgreSQL: %s", q, exc)
-
-        # Fallback to PostgreSQL if Elasticsearch has no documents or is unavailable
-        profiles = await self.repo.list_all_profiles()
-        matching: List[UserProfileRead] = []
-        q_lower = q.lower()
-        for p in profiles:
-            p_read = self._to_profile_read(p)
-            name_match = q_lower in p_read.name.lower()
-            email_match = q_lower in str(p_read.email).lower()
-            dept_match = p_read.department and (
-                q_lower in p_read.department.name.lower() or q_lower in p_read.department.code.lower()
-            )
-            role_match = p_read.role_info and q_lower in p_read.role_info.name.lower()
-            acc_match = any(q_lower in a.account_number.lower() for a in p_read.accounts)
-            if name_match or email_match or dept_match or role_match or acc_match:
-                matching.append(p_read)
-                try:
-                    await self._sync_user_to_es(p.user.id)
-                except Exception:
-                    pass
-
-        return matching[offset : offset + limit]
-
-    async def add_user_account(self, user_id: uuid.UUID, payload: AccountCreate) -> AccountRead:
-        """Adds account info to user, invalidates profile cache, updates ES, and commits transaction."""
-        user = await self.repo.get(user_id)
-        if user is None:
-            raise NotFoundError(f"User with ID '{user_id}' not found.")
-
-        account = UserAccount(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            account_number=payload.account_number,
-            account_type=payload.account_type,
-            balance_cents=payload.balance_cents,
-            currency=payload.currency,
-            status=payload.status,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
-        created = await self.repo.create_account(account)
-
-        # Insert Transactional Outbox Event (BEFORE commit!)
-        es_payload = await self._build_user_es_payload(user_id)
-        outbox_event = await self.outbox_repo.create_event(
-            aggregate_type="user",
-            aggregate_id=str(user_id),
-            event_type="ACCOUNT_ADDED",
-            payload=es_payload,
-        )
-
-        # Invalidate profile cache so next read fetches updated accounts
-        await self.cache.delete_item(f"profile:{user_id}")
-
-        # Commit DB transaction (Atomic: Account + Outbox event committed together)
-        await self.db.commit()
-
-        # Dispatch Outbox sync (Immediate execution + background auto-sync retry on failure)
-        await self._dispatch_outbox_sync(outbox_event)
-
-        return AccountRead(
-            id=created.id,
-            account_number=created.account_number,
-            account_type=created.account_type,
-            balance_cents=created.balance_cents,
-            currency=created.currency,
-            status=created.status,
-            created_at=created.created_at,
-        )
-
-    async def list_departments(self) -> List[DepartmentRead]:
-        """List all departments."""
-        depts = await self.repo.list_departments()
-        return [
-            DepartmentRead(
-                id=d.id,
-                name=d.name,
-                code=d.code,
-                description=d.description,
-            )
-            for d in depts
-        ]
-
-    async def list_roles(self) -> List[RoleRead]:
-        """List all roles and permission sets."""
-        roles = await self.repo.list_roles()
-        return [
-            RoleRead(
-                id=r.id,
-                name=r.name,
-                description=r.description,
-                permissions=r.permissions,
-            )
-            for r in roles
-        ]
-
     async def list_users(
         self,
         limit: int = 50,
@@ -602,41 +240,11 @@ class UserService:
         await self.cache.set_paginated(page_result, **filter_params)
         return UserPage(**page_result)
 
-    async def search_users(
-        self,
-        q: str,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> List[UserRead]:
-        """Full-text fuzzy search offloaded directly to Elasticsearch with graceful DB fallback."""
-        return await self.executor.execute_search(
-            es_index="user",
-            es_query=q,
-            limit=limit,
-            offset=offset,
-            to_schema=lambda h: UserRead(
-                id=h["id"],
-                name=h.get("name", ""),
-                email=h.get("email", ""),
-                role=h.get("role", "user"),
-                department=h.get("department"),
-                department_id=h.get("department_id"),
-                role_id=h.get("role_id"),
-                phone_masked=None,
-                created_at=datetime.fromisoformat(h["created_at"]) if h.get("created_at") else None,
-            ),
-            fallback_sql="""
-                SELECT id, name, email, role, department, created_at
-                FROM users
-                WHERE name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%'
-                ORDER BY created_at DESC
-                LIMIT $2 OFFSET $3
-            """,
-            fallback_params=[q, limit, offset],
-        )
-
+    # --------------------------------------------------------------------------
+    # 4. UPDATE USER (PATCH /users/{user_id})
+    # --------------------------------------------------------------------------
     async def update_user(self, user_id: uuid.UUID, payload: UserUpdate) -> UserRead:
-        """Partially update user fields with selective re-encryption and cache invalidation."""
+        """Partially update user fields with selective re-encryption, cache invalidation, and Outbox sync."""
         user = await self.repo.get(user_id)
         if user is None:
             raise NotFoundError(f"User with ID '{user_id}' not found.")
@@ -668,31 +276,32 @@ class UserService:
         updated = await self.repo.update(user)
         read_model = self._to_read_schema(updated)
 
-        # Insert Transactional Outbox Event (BEFORE commit!)
-        es_payload = await self._build_user_es_payload(updated.id)
+        # Stage Outbox Event BEFORE DB commit
         outbox_event = await self.outbox_repo.create_event(
             aggregate_type="user",
             aggregate_id=str(updated.id),
             event_type="UPDATE",
-            payload=es_payload,
+            payload=self._build_user_es_doc(updated),
         )
 
-        # Invalidate Redis item, profile, & list cache
+        # Invalidate Redis item & list cache
         await self.cache.delete_item(str(user_id))
         await self.cache.delete_item(f"profile:{user_id}")
         await self.cache.invalidate_lists()
 
-        # Commit DB transaction (Atomic: User update + Outbox event committed together)
+        # Atomic commit
         await self.db.commit()
 
-        # Dispatch Outbox sync (Immediate execution + background auto-sync retry on failure)
+        # Dispatch Outbox sync to Elasticsearch
         await self._dispatch_outbox_sync(outbox_event)
 
         return read_model
 
+    # --------------------------------------------------------------------------
+    # 5. DELETE USER (DELETE /users/{user_id})
+    # --------------------------------------------------------------------------
     async def delete_user(self, user_id: uuid.UUID) -> None:
-        """Delete user, purge Redis cache, and register delete event in Transactional Outbox."""
-        # Insert Outbox delete event BEFORE commit
+        """Delete user, purge Redis cache, and record DELETE event in Transactional Outbox."""
         outbox_event = await self.outbox_repo.create_event(
             aggregate_type="user",
             aggregate_id=str(user_id),
@@ -709,11 +318,123 @@ class UserService:
         await self.cache.delete_item(f"profile:{user_id}")
         await self.cache.invalidate_lists()
 
-        # Commit DB transaction (Atomic: Delete + Outbox event committed together)
+        # Atomic commit
         await self.db.commit()
 
         # Dispatch Outbox sync (Deletes from ES and marks outbox published)
         await self._dispatch_outbox_sync(outbox_event)
+
+    # --------------------------------------------------------------------------
+    # 6. SEARCH USERS (GET /users/search - Elasticsearch with PostgreSQL Fallback)
+    # --------------------------------------------------------------------------
+    async def search_users(
+        self,
+        q: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[UserRead]:
+        """Search users: Elasticsearch fuzzy search first; if no hits or ES unavailable, fallback to PostgreSQL."""
+        cleaned_q = (q or "").strip()
+        if not cleaned_q:
+            return []
+
+        safe_limit = min(100, max(1, limit))
+        safe_offset = max(0, offset)
+
+        # 1. Primary: Elasticsearch Full-Text Fuzzy Search
+        try:
+            hits, _ = await self.es.search(
+                index="user",
+                query=cleaned_q,
+                limit=safe_limit,
+                offset=safe_offset,
+            )
+            if hits:
+                return [
+                    UserRead(
+                        id=hit["id"],
+                        name=hit.get("name", ""),
+                        email=hit.get("email", ""),
+                        role=hit.get("role", "user"),
+                        department=hit.get("department"),
+                        department_id=hit.get("department_id") or hit.get("department"),
+                        role_id=hit.get("role_id") or hit.get("role"),
+                        phone_masked=hit.get("phone_masked"),
+                        created_at=(
+                            datetime.fromisoformat(hit["created_at"])
+                            if isinstance(hit.get("created_at"), str)
+                            else hit.get("created_at")
+                        ),
+                    )
+                    for hit in hits
+                ]
+        except Exception as exc:
+            logger.warning("Elasticsearch search failed for '%s': %s. Falling back to PostgreSQL.", cleaned_q, exc)
+
+        # 2. Secondary Fallback: PostgreSQL Direct Database Search
+        users = await self.repo.search(
+            query=cleaned_q,
+            limit=safe_limit,
+            offset=safe_offset,
+        )
+        return [self._to_read_schema(u) for u in users]
+
+    
+
+    # --------------------------------------------------------------------------
+    # Helper Mappings & CQRS Synchronization
+    # --------------------------------------------------------------------------
+    def _to_read_schema(self, user: User) -> UserRead:
+        """Decrypts phone using AAD and returns safe masked representation."""
+        masked_phone = user.phone_encrypted
+        if self.crypto is not None and user.phone_encrypted:
+            aad = f"users.phone:{user.id}".encode("utf-8")
+            try:
+                plain_phone = self.crypto.decrypt(user.phone_encrypted, aad=aad)
+                masked_phone = self.crypto.mask_phone(plain_phone)
+            except DecryptionError:
+                masked_phone = "***"
+
+        return UserRead(
+            id=user.id,
+            name=user.name,
+            email=user.email,
+            role=user.role,
+            department=user.department,
+            department_id=user.department_id or user.department,
+            role_id=user.role_id or user.role,
+            phone_masked=masked_phone,
+            created_at=user.created_at or datetime.now(timezone.utc),
+        )
+
+    def _build_user_es_doc(self, user: User) -> Dict[str, Any]:
+        """Constructs Elasticsearch document shape for User indexing."""
+        return {
+            "id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+            "department": user.department,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+
+    async def _dispatch_outbox_sync(self, event: OutboxEvent) -> None:
+        """Dispatches outbox event synchronization to Elasticsearch."""
+        if self.outbox_worker is not None:
+            asyncio.create_task(self.outbox_worker.sync_now(event.id))
+        else:
+            try:
+                agg_id = str(event.aggregate_id)
+                if event.event_type in ("CREATE", "UPDATE"):
+                    if event.payload:
+                        await self.es.index_document(index="user", id_=agg_id, document=event.payload)
+                elif event.event_type == "DELETE":
+                    await self.es.delete_document(index="user", id_=agg_id)
+
+                now = datetime.now(timezone.utc)
+                await self.outbox_repo.mark_published(event.id, published_at=now)
+            except Exception as exc:
+                logger.warning("Direct outbox sync fallback failed: %s", exc)
 
 
 # ------------------------------------------------------------------------------
