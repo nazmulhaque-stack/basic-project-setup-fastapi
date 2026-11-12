@@ -1,20 +1,23 @@
 """Unit and integration tests for User API endpoints, cursor pagination, profile schemas, and E.164 validation."""
 
 from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import AsyncMock
 import uuid
 import pytest
 from pydantic import ValidationError
 
+from app.models.outbox import OutboxEvent
 from app.schemas.base import decode_cursor, encode_cursor
 from app.schemas.outbox import OutboxEventRead
 from app.schemas.user import (
-    AccountCreate,
     AccountRead,
     DepartmentRead,
     RoleRead,
     UserCreate,
     UserProfileRead,
 )
+from app.services.user import UserService
 
 
 def test_cursor_encoding_and_decoding() -> None:
@@ -162,5 +165,99 @@ def test_outbox_event_schema() -> None:
     assert event.status == "PUBLISHED"
     assert event.published_at == now
     assert event.payload["user"]["name"] == "Test User"
+
+
+def _make_mocked_user_service(crypto: Any) -> UserService:
+    """Create a UserService backed by async mocks for create_user unit tests."""
+    db = AsyncMock()
+    db.commit = AsyncMock()
+
+    cache = AsyncMock()
+    cache.invalidate_lists = AsyncMock(return_value=True)
+    cache.set_item = AsyncMock(return_value=True)
+    cache.delete_item = AsyncMock(return_value=True)
+
+    es = AsyncMock()
+    es.index_document = AsyncMock(return_value=True)
+
+    service = UserService(db=db, cache=cache, crypto=crypto, elasticsearch=es)
+    service.repo = AsyncMock()
+    service.repo.get_by_email = AsyncMock(return_value=None)
+    service.repo.get_by_phone_blind_index = AsyncMock(return_value=None)
+    service.repo.get_existing_account_numbers = AsyncMock(return_value=[])
+    service.repo.create = AsyncMock(side_effect=lambda u: u)
+    service.repo.get_profile = AsyncMock(return_value=None)
+    service.repo.get = AsyncMock()
+
+    service.outbox_repo = AsyncMock()
+    service.outbox_repo.create_event = AsyncMock(
+        side_effect=lambda **kw: OutboxEvent(
+            id=uuid.uuid4(),
+            aggregate_type=kw["aggregate_type"],
+            aggregate_id=kw["aggregate_id"],
+            event_type=kw["event_type"],
+            payload=kw["payload"],
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    service.outbox_repo.mark_published = AsyncMock(return_value=True)
+    return service
+
+
+@pytest.mark.asyncio
+async def test_create_user_commits_before_cache_and_uses_outbox_fallback(
+    test_crypto_service: Any,
+) -> None:
+    """Verifies DB commit happens before Redis sync and outbox payload avoids redundant repo.get."""
+    call_order: list[str] = []
+    service = _make_mocked_user_service(test_crypto_service)
+
+    async def _commit() -> None:
+        call_order.append("db.commit")
+
+    async def _invalidate_lists() -> bool:
+        call_order.append("cache.invalidate_lists")
+        return True
+
+    service.db.commit = AsyncMock(side_effect=_commit)
+    service.cache.invalidate_lists = AsyncMock(side_effect=_invalidate_lists)
+
+    payload = UserCreate(
+        name="Alice Smith",
+        email="alice.smith@example.com",
+        phone="+14155552671",
+        role="user",
+    )
+    result = await service.create_user(payload)
+
+    assert result.email == "alice.smith@example.com"
+    assert result.phone_masked == "+1******2671"
+    assert call_order.index("db.commit") < call_order.index("cache.invalidate_lists")
+    service.repo.get.assert_not_awaited()
+    staged_payload = service.outbox_repo.create_event.await_args.kwargs["payload"]
+    assert staged_payload["user"]["phone_masked"] == "+1******2671"
+
+
+@pytest.mark.asyncio
+async def test_create_user_survives_post_commit_redis_failure(
+    test_crypto_service: Any,
+) -> None:
+    """Verifies a transient Redis failure after DB commit does not fail user creation."""
+    service = _make_mocked_user_service(test_crypto_service)
+    service.cache.invalidate_lists = AsyncMock(side_effect=RuntimeError("Redis connection lost"))
+
+    result = await service.create_user(
+        UserCreate(
+            name="Bob Jones",
+            email="bob.jones@example.com",
+            phone="+14155550199",
+            role="user",
+        )
+    )
+
+    assert result.email == "bob.jones@example.com"
+    assert result.phone_masked == "+1******0199"
+    service.db.commit.assert_awaited_once()
+
 
 

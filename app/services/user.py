@@ -78,7 +78,7 @@ class UserService:
     # --------------------------------------------------------------------------
     async def create_user(self, payload: UserCreate) -> UserRead:
         """Create a user with PII encryption, HMAC blind index, Redis pre-warming, and Outbox ES sync."""
-        # Uniqueness check for email
+        # Step 1: Fast-fail email uniqueness check before generating IDs or running crypto.
         existing_email = await self.repo.get_by_email(str(payload.email))
         if existing_email:
             raise ConflictError("A user with this email address already exists.")
@@ -87,7 +87,11 @@ class UserService:
         phone_encrypted = payload.phone
         phone_blind_index = payload.phone
 
-        # Cryptographic phone encryption & HMAC blind index
+        # Step 2: Cryptographic PII protection (when CryptoService is configured).
+        #   - HMAC-SHA256 blind index enables deterministic duplicate phone detection
+        #     without decrypting existing database records.
+        #   - AES-256-GCM binds ciphertext to `users.phone:{user_id}` AAD so an encrypted
+        #     phone value cannot be transplanted onto a different user row.
         if self.crypto is not None:
             blind_index = self.crypto.blind_index(payload.phone)
             existing_phone = await self.repo.get_by_phone_blind_index(blind_index)
@@ -111,17 +115,20 @@ class UserService:
             created_at=datetime.now(timezone.utc),
         )
 
-        # Validate accounts uniqueness upfront
+        # Step 3: Batch-validate initial account numbers in a single SQL round-trip
+        # before opening the write path (prevents partial inserts or N+1 checks).
         if payload.accounts:
             acc_numbers = [acc.account_number for acc in payload.accounts]
             existing_accounts = await self.repo.get_existing_account_numbers(acc_numbers)
             if existing_accounts:
                 raise ConflictError(f"Account number '{existing_accounts[0]}' already exists.")
 
+        # Step 4: Persist the user and optional initial accounts inside the open UnitOfWork
+        # transaction; catch UniqueViolationError to handle concurrent insert races cleanly.
         try:
             created = await self.repo.create(user)
 
-            # Optional initial accounts creation in a single batch (no loop)
+            # Batch-insert all initial accounts in one executemany/UNNEST call (no loop).
             accounts_read: Optional[List[AccountRead]] = None
             total_balance_cents: Optional[int] = None
             account_count: Optional[int] = None
@@ -159,6 +166,8 @@ class UserService:
         except asyncpg.exceptions.UniqueViolationError as exc:
             raise ConflictError(f"Unique constraint violation: {exc.detail or exc}")
 
+        # Step 5: Build the external read DTO with masked phone PII (+1******2671)
+        # so plaintext or raw ciphertext never leaks past the service boundary.
         read_model = self._to_read_schema(
             created,
             accounts=accounts_read,
@@ -166,8 +175,15 @@ class UserService:
             account_count=account_count,
         )
 
-        # Stage Outbox Event BEFORE DB commit (Syncs both User and UserProfile to Elasticsearch)
-        es_payload = await self._build_user_es_payload(created.id)
+        # Step 6: Stage the Transactional Outbox event inside the SAME UnitOfWork transaction
+        # before commit so PostgreSQL user/account writes and ES sync intent are atomic.
+        # Pass already-created `created` & `read_model` as fallback to avoid redundant DB/crypto work
+        # if profile join metadata is unavailable.
+        es_payload = await self._build_user_es_payload(
+            created.id,
+            fallback_user=created,
+            read_model=read_model,
+        )
         outbox_event = await self.outbox_repo.create_event(
             aggregate_type="user",
             aggregate_id=str(created.id),
@@ -175,17 +191,22 @@ class UserService:
             payload=es_payload,
         )
 
-        # Cache synchronization:
-        #   - Invalidate list cache (O(1) version bump) to prevent stale paginated list reads.
-        #   - Pre-warm item cache (write-through) for instant sub-millisecond subsequent reads.
-        await self.cache.invalidate_lists()
-        await self.cache.set_item(str(created.id), read_model.model_dump(mode="json"))
-        await self.cache.delete_item(f"profile:{created.id}")
-
-        # Atomic commit
+        # Step 7: Commit PostgreSQL FIRST so Redis/Elasticsearch never observe uncommitted state
+        # if the database transaction fails or rolls back.
         await self.db.commit()
 
-        # Dispatch Outbox synchronization to Elasticsearch
+        # Step 8: Best-effort post-commit Redis cache synchronization:
+        #   - Invalidate list cache (O(1) version bump) to prevent stale paginated reads.
+        #   - Pre-warm item cache (write-through) for sub-millisecond subsequent GET /users/{id}.
+        #   - Purge any stale negative/profile cache key for this user ID.
+        try:
+            await self.cache.invalidate_lists()
+            await self.cache.set_item(str(created.id), read_model.model_dump(mode="json"))
+            await self.cache.delete_item(f"profile:{created.id}")
+        except Exception as exc:
+            logger.warning("Post-commit Redis sync failed in create_user(%s): %s", created.id, exc)
+
+        # Step 9: Dispatch asynchronous Elasticsearch indexing (via OutboxWorker or direct fallback).
         await self._dispatch_outbox_sync(outbox_event)
 
         return read_model
@@ -488,6 +509,8 @@ class UserService:
         use_cache: bool = True
     ) -> UserSearchResult:
         """Complex search orchestrating multi-field full-text, faceted filters, numeric ranges, aggregations, and DB fallback."""
+        # Normalize input: accept either a pre-validated UserSearchQuery DTO (from FastAPI routes)
+        # or individual keyword arguments for programmatic service-layer calls.
         if isinstance(query, UserSearchQuery):
             params = query
         else:
@@ -511,7 +534,8 @@ class UserService:
             )
 
         # ----------------------------------------------------------------------
-        # Direct PostgreSQL Search (No Caching)
+        # Search Routing Config: `use_cache=False` forces direct PostgreSQL SQL
+        # (used by /users/search-no-cache) and bypasses Elasticsearch & Redis.
         # ----------------------------------------------------------------------
         if not use_cache:
             return await self.search_users_db_only(params)
@@ -524,6 +548,12 @@ class UserService:
                 must_clauses: List[Dict[str, Any]] = []
                 filter_clauses: List[Dict[str, Any]] = []
 
+                # Full-text search configuration:
+                #   - Field boosts prioritize name (^3), email (^2), and account numbers (^2)
+                #     above department/role labels (^1.5) in BM25 relevance scoring.
+                #   - `fuzziness="AUTO"` tolerates typos; `prefix_length=2` requires the first
+                #     2 characters to match to keep fuzzy term expansion bounded.
+                #   - When `q` is empty, `match_all` allows pure faceted filtering & sorting.
                 if params.q and params.q.strip():
                     cleaned_q = params.q.strip()
                     must_clauses.append({
@@ -546,6 +576,10 @@ class UserService:
                 else:
                     must_clauses.append({"match_all": {}})
 
+                # Structured filter clauses run in Elasticsearch's non-scoring `filter` context
+                # (eligible for ES filter-cache reuse without distorting `_score`).
+                # Department & role match either exact `.keyword` fields or analyzed text fields
+                # (`minimum_should_match=1`) to support both codes ("ENG") and full names.
                 if params.department:
                     dept_val = params.department.strip()
                     filter_clauses.append({
@@ -575,6 +609,7 @@ class UserService:
                         }
                     })
 
+                # Account type (normalized lowercase) & currency (uppercase ISO-4217) exact filters.
                 if params.account_type:
                     filter_clauses.append({
                         "term": {"account_types.keyword": params.account_type.strip().lower()}
@@ -585,6 +620,7 @@ class UserService:
                         "term": {"currencies.keyword": params.currency.strip().upper()}
                     })
 
+                # Numeric & ISO-8601 timestamp range filters on aggregated profile fields.
                 balance_range: Dict[str, Any] = {}
                 if params.min_balance_cents is not None:
                     balance_range["gte"] = params.min_balance_cents
@@ -616,6 +652,11 @@ class UserService:
                     }
                 }
 
+                # Sort configuration:
+                #   - `_score` / `relevance`: sort by BM25 match score.
+                #   - Numeric / date fields: sort directly on mapped scalar field.
+                #   - `name` / `email`: sort on `.keyword` subfield with `unmapped_type="keyword"`
+                #     so empty or freshly initialized ES indexes never raise search_phase errors.
                 sort_field = params.sort_by or "created_at"
                 sort_order = (params.sort_order or "desc").lower()
 
@@ -629,6 +670,8 @@ class UserService:
                 else:
                     es_sort.append({"created_at": {"order": "desc"}})
 
+                # Faceted aggregations configuration (only attached when `include_aggregations=True`
+                # to avoid extra shard aggregation overhead on standard list searches).
                 es_aggs: Dict[str, Any] = {}
                 if params.include_aggregations:
                     es_aggs = {
@@ -648,12 +691,14 @@ class UserService:
                 if es_aggs:
                     search_body["aggs"] = es_aggs
 
-                # First try against `user_profile` index (has accounts and balances)
+                # Dual-index search strategy:
+                #   1) Try `user_profile` first (denormalized docs with accounts, dept, role, totals).
+                #   2) Fall back to the lightweight `user` index ONLY when `user_profile` yields
+                #      0 hits and no account/balance filters were requested.
                 resp = await self.es.search_raw(index="user_profile", body=search_body)
                 hits = resp.get("hits", {}).get("hits", [])
                 total = int(resp.get("hits", {}).get("total", {}).get("value", 0))
 
-                # If user_profile returned 0 results, check if basic `user` index has hits (e.g. users without accounts)
                 if not hits and not (params.account_type or params.currency or params.min_balance_cents or params.max_balance_cents or params.min_accounts):
                     resp = await self.es.search_raw(index="user", body=search_body)
                     hits = resp.get("hits", {}).get("hits", [])
@@ -791,6 +836,10 @@ class UserService:
                 include_aggregations=include_aggregations,
             )
 
+        # Direct PostgreSQL fallback / uncached search configuration:
+        #   - Executes parameterized ILIKE + HAVING + window-free pagination via `search_complex`.
+        #   - Decrypts & masks `phone_encrypted` per row using `users.phone:{id}` AAD.
+        #   - Returns `aggregations=None` (faceted aggregations are served by Elasticsearch only).
         db_rows, db_total = await self.repo.search_complex(
             q=params.q,
             department=params.department,
@@ -993,13 +1042,39 @@ class UserService:
             "created_at": user.created_at.isoformat() if user.created_at else None,
         }
 
-    async def _build_user_es_payload(self, user_id: uuid.UUID) -> Dict[str, Any]:
-        """Constructs both User and UserProfile documents for Outbox payload."""
+    async def _build_user_es_payload(
+        self,
+        user_id: uuid.UUID,
+        *,
+        fallback_user: Optional[User] = None,
+        read_model: Optional[UserRead] = None,
+    ) -> Dict[str, Any]:
+        """Constructs both User and UserProfile documents for Outbox payload.
+
+        Prefers the full joined `get_profile` record (including department/role descriptions
+        and permissions). If `get_profile` returns None, builds from `fallback_user` and
+        `read_model` without issuing an extra `repo.get()` query or re-decrypting PII.
+        """
         profile = await self.repo.get_profile(user_id)
         if profile is None:
-            user = await self.repo.get(user_id)
+            user = fallback_user or await self.repo.get(user_id)
             if not user:
                 return {}
+            if read_model is not None:
+                user_doc = {
+                    "id": str(user.id),
+                    "name": user.name,
+                    "email": user.email,
+                    "role": user.role,
+                    "department": user.department,
+                    "department_id": user.department_id or user.department,
+                    "role_id": user.role_id or user.role,
+                    "phone_masked": read_model.phone_masked,
+                    "account_count": read_model.account_count or 0,
+                    "total_balance_cents": read_model.total_balance_cents or 0,
+                    "created_at": user.created_at.isoformat() if user.created_at else None,
+                }
+                return {"user": user_doc}
             return {"user": self._build_user_es_doc(user)}
 
         user = profile.user
